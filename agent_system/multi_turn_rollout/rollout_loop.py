@@ -15,6 +15,7 @@
 
 import torch
 import numpy as np
+import re
 from verl import DataProto
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.model import compute_position_id_with_mask
@@ -23,7 +24,7 @@ from transformers import PreTrainedTokenizer
 import uuid
 from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
 from agent_system.environments import EnvironmentManagerBase
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
 class TrajectoryCollector:
@@ -40,15 +41,104 @@ class TrajectoryCollector:
         self.tokenizer = tokenizer
         self.processor = processor
 
+    @staticmethod
+    def _object_array(values: List[Any]) -> np.ndarray:
+        array = np.empty(len(values), dtype=object)
+        for idx, value in enumerate(values):
+            array[idx] = value
+        return array
+
+    @staticmethod
+    def _to_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8", errors="ignore")
+            except Exception:
+                return str(value)
+        if isinstance(value, torch.Tensor):
+            value = torch_to_numpy(value, is_object=True)
+        if isinstance(value, np.ndarray):
+            try:
+                value = value.tolist()
+            except Exception:
+                pass
+        return str(value)
+
+    @staticmethod
+    def _get_indexed(values: Any, index: int, default: Any = None) -> Any:
+        if values is None:
+            return default
+        try:
+            return values[index]
+        except Exception:
+            return default
+
+    @staticmethod
+    def _extract_tag(text: str, tag: str) -> str:
+        match = re.search(rf"<{re.escape(tag)}>(.*?)</{re.escape(tag)}>", text, re.DOTALL | re.IGNORECASE)
+        return match.group(1).strip() if match else ""
+
+    def _extract_response_action_text(self, response_text: str) -> str:
+        text = str(response_text or "")
+        return self._extract_tag(text, "search") or self._extract_tag(text, "action") or text.strip()
+
+    def _env_aux_metadata_enabled(self) -> bool:
+        try:
+            actor_config = self.config.actor_rollout_ref.actor
+        except Exception:
+            return False
+        collect_only = bool(actor_config.get("collect_env_aux_data", False))
+        sp_coef = float(actor_config.get("sp_coef", 0.0) or 0.0)
+        id_coef = float(actor_config.get("id_coef", 0.0) or 0.0)
+        return collect_only or sp_coef > 0.0 or id_coef > 0.0
+
+    def _extract_observation_text(self, obs: Dict[str, Any], index: int) -> str:
+        for key in ("anchor", "text_base", "text"):
+            value = self._get_indexed(obs.get(key), index)
+            text = self._to_text(value).strip()
+            if text:
+                return text
+        return ""
+
+    def _extract_admissible_actions(self, info: Any) -> List[str]:
+        if not isinstance(info, dict):
+            return []
+
+        for key in ("admissible_commands", "admissible_actions", "valid", "possible_actions"):
+            actions = info.get(key)
+            if actions is not None:
+                if isinstance(actions, str):
+                    return [line.strip(" '-,") for line in actions.splitlines() if line.strip()]
+                if isinstance(actions, (list, tuple, np.ndarray)):
+                    return [self._to_text(action).strip() for action in actions if self._to_text(action).strip()]
+                return [self._to_text(actions).strip()]
+
+        available_actions = info.get("available_actions")
+        if isinstance(available_actions, dict):
+            actions = []
+            if available_actions.get("has_search_bar"):
+                actions.append("search[<your query>]")
+            for clickable in available_actions.get("clickables", []) or []:
+                actions.append(f"click[{clickable}]")
+            return actions
+        if available_actions is not None:
+            return [self._to_text(available_actions).strip()]
+
+        return []
+
     def build_text_prompt_sample(
         self,
         obs_content: str,
         data_source: Optional[str] = None,
+        max_prompt_length: Optional[int] = None,
     ) -> Dict:
         """
         Build a text-only prompt sample using the same chat-template path as rollout.
         This is used by OPID teacher scoring to reconstruct prompt-enhanced inputs.
         """
+        prompt_length = int(max_prompt_length or self.config.data.max_prompt_length)
         apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
         chat = np.array([{
             "content": obs_content,
@@ -63,7 +153,7 @@ class TrajectoryCollector:
         input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
             prompt=prompt_with_chat_template,
             tokenizer=self.tokenizer,
-            max_length=self.config.data.max_prompt_length,
+            max_length=prompt_length,
             pad_token_id=self.tokenizer.pad_token_id,
             left_pad=True,
             truncation=self.config.data.truncation,
@@ -71,18 +161,18 @@ class TrajectoryCollector:
         position_ids = compute_position_id_with_mask(attention_mask)
 
         raw_prompt_ids = self.tokenizer.encode(prompt_with_chat_template, add_special_tokens=False)
-        if len(raw_prompt_ids) > self.config.data.max_prompt_length:
+        if len(raw_prompt_ids) > prompt_length:
             if self.config.data.truncation == "left":
-                raw_prompt_ids = raw_prompt_ids[-self.config.data.max_prompt_length :]
+                raw_prompt_ids = raw_prompt_ids[-prompt_length:]
             elif self.config.data.truncation == "right":
-                raw_prompt_ids = raw_prompt_ids[: self.config.data.max_prompt_length]
+                raw_prompt_ids = raw_prompt_ids[:prompt_length]
             elif self.config.data.truncation == "middle":
-                left_half = self.config.data.max_prompt_length // 2
-                right_half = self.config.data.max_prompt_length - left_half
+                left_half = prompt_length // 2
+                right_half = prompt_length - left_half
                 raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
             elif self.config.data.truncation == "error":
                 raise RuntimeError(
-                    f"Prompt length {len(raw_prompt_ids)} is longer than {self.config.data.max_prompt_length}."
+                    f"Prompt length {len(raw_prompt_ids)} is longer than {prompt_length}."
                 )
 
         return {
@@ -99,6 +189,7 @@ class TrajectoryCollector:
         obs_contents: List[str],
         data_sources: Optional[List[Optional[str]]] = None,
         meta_info: Optional[Dict] = None,
+        max_prompt_length: Optional[int] = None,
     ) -> DataProto:
         """
         Build a batch of text-only prompts. Used for OPID teacher scoring.
@@ -107,7 +198,11 @@ class TrajectoryCollector:
         for sample_idx, obs_content in enumerate(obs_contents):
             data_source = None if data_sources is None else data_sources[sample_idx]
             processed_samples.append(
-                self.build_text_prompt_sample(obs_content=obs_content, data_source=data_source)
+                self.build_text_prompt_sample(
+                    obs_content=obs_content,
+                    data_source=data_source,
+                    max_prompt_length=max_prompt_length,
+                )
             )
         batch = collate_fn(processed_samples)
         return DataProto.from_single_dict(data=batch, meta_info=meta_info)
@@ -421,6 +516,8 @@ class TrajectoryCollector:
         episode_lengths = np.zeros(batch_size, dtype=np.float32)
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
+        collect_env_aux_data = self._env_aux_metadata_enabled()
+        env_aux_histories = [[] for _ in range(batch_size)] if collect_env_aux_data else None
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):
             active_masks = np.logical_not(is_done)
@@ -461,12 +558,23 @@ class TrajectoryCollector:
                 ],
                 dtype=object,
             )
+            if collect_env_aux_data:
+                batch.non_tensor_batch["history"] = self._object_array(
+                    [list(env_aux_histories[i]) for i in range(batch_size)]
+                )
+                batch.non_tensor_batch["admissibles"] = self._object_array(
+                    [self._extract_admissible_actions(infos[i]) for i in range(batch_size)]
+                )
 
             batch = batch.union(batch_output)
             
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
             
             next_obs, rewards, dones, infos = envs.step(text_actions)
+            if collect_env_aux_data:
+                batch.non_tensor_batch["next_obs"] = self._object_array(
+                    [self._extract_observation_text(next_obs, i) for i in range(batch_size)]
+                )
 
             
             if len(rewards.shape) == 2:
@@ -497,6 +605,20 @@ class TrajectoryCollector:
             for i in range(batch_size):
                 total_batch_list[i].append(batch_list[i])
                 total_infos[i].append(infos[i])
+
+            if collect_env_aux_data:
+                for i in range(batch_size):
+                    if active_masks[i]:
+                        current_obs = self._get_indexed(batch.non_tensor_batch.get("anchor_obs"), i)
+                        current_obs_text = self._to_text(current_obs).strip()
+                        if not current_obs_text:
+                            current_obs_text = self._to_text(self._get_indexed(batch.non_tensor_batch.get("obs_text"), i)).strip()
+                        env_aux_histories[i].append(
+                            {
+                                "text_obs": current_obs_text,
+                                "action": self._extract_response_action_text(text_actions[i]),
+                            }
+                        )
 
             # Update done states
             is_done = np.logical_or(is_done, dones)

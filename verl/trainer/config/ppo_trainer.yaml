@@ -54,9 +54,21 @@ actor_rollout_ref:
     clip_ratio_high: 0.2
     clip_ratio_c: 3.0 # lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729
     loss_agg_mode: "token-mean" # / "seq-mean-token-sum" / "seq-mean-token-mean"
-    opd_loss_coef: 0.0 # OPID auxiliary OPD distillation loss; 0 disables it
-    opd_loss_weight_mode: "delta" # "delta" or "importance"
-    opd_loss_clip: null # null disables clipping; otherwise clamps the OPD token weight magnitude
+    sdar_loss_coef: 0.0 # SDAR-style gated auxiliary distillation loss; 0 disables it. For OPID, enabling this uses teacher/OPD signals as loss instead of teacher advantage.
+    sdar_gate_beta: 5.0 # sigmoid sharpness for SDAR teacher-student gap gating
+    skill_gen_loss_coef: 0.0 # OPID skill-generation reward-weighted LM loss; 0 disables it.
+    skill_gen_micro_batch_size_per_gpu: null # per-GPU micro batch size for long policy-vllm skill generation samples
+    skill_gen_micro_batch_size: 1 # deprecated alias for skill_gen_micro_batch_size_per_gpu
+    sp_coef: 0.0 # EnvRL-style state prediction auxiliary LM loss; 0 disables it
+    id_coef: 0.0 # EnvRL-style inverse dynamics auxiliary LM loss; 0 disables it
+    sp_coef_min: 0.0
+    id_coef_min: 0.0
+    aux_coef_decay: cos # cos / linear / none
+    aux_data_ratio: 1.0
+    aux_max_length: null
+    aux_history_length: null
+    aux_micro_batch_size: 8
+    collect_env_aux_data: False # collect SP/ID transition metadata without enabling the losses
     entropy_coeff: 0.001
     use_invalid_action_penalty: True
     invalid_action_penalty_coef: 0.1
@@ -257,8 +269,8 @@ algorithm:
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
   opid:
     step_advantage_w: 0.0 # OPID uses episode-level advantage only.
-    episode_skill_teacher_advantage_w: 1.0 # separate weight for episode-skill teacher signal
-    step_skill_teacher_advantage_w: 0.0 # separate weight for step-skill-only teacher signal
+    episode_skill_teacher_advantage_w: 1.0 # separate weight for episode-skill teacher advantage; ignored when actor.sdar_loss_coef > 0
+    step_skill_teacher_advantage_w: 0.0 # separate weight for step-skill-only teacher advantage; ignored when actor.sdar_loss_coef > 0
     skill_teacher_mode: "step_priority" # "step_priority" uses episode skills only where no step skill is active; "additive" scores both prompts and adds both advantages
     opd_start_after_steps: null # null -> enable OPID teacher/OPD signal from the first training step; otherwise enable after this many completed steps
     opd_stop_after_steps: null # null -> keep OPID teacher/OPD signal enabled; otherwise disable after this many completed steps
@@ -272,8 +284,18 @@ algorithm:
     failure_success_threshold: 1.0 # when episode_success is unavailable, episode_rewards >= this value counts as success
     analysis_backend: "openai"
     analysis_num_workers: 8
+    analysis_context_length: 16384
     analysis_max_completion_tokens: 1024
     analysis_max_step_skills_per_traj: 1 # number of critical step_skills to add alongside the episode_skill
+    skill_gen:
+      enable: False
+      max_samples: all # all/null/none/unlimited means optimize every generated skill; positive integer caps samples
+      downstream_gain_coef: 1.0
+      valid_json_bonus: 0.0
+      non_empty_skill_bonus: 0.0
+      too_long_penalty: 0.0
+      max_output_chars: 1200
+      reward_clip: 2.0
     save_analysis: True
     analysis_dump_dir: null # null -> ${trainer.default_local_dir}/opid_analysis
     save_augmented_observations: True

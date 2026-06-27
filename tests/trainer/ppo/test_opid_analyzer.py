@@ -1,3 +1,5 @@
+import pytest
+
 from opid.analysis import OPIDEpisodeAnalyzer
 
 
@@ -69,6 +71,16 @@ def test_opid_prompt_for_failed_episode_emphasizes_avoidance():
     assert "episode_success: failure" in user_prompt
     assert "interpreted_outcome" not in user_prompt
     assert "Because this is a failed episode" not in user_prompt
+
+
+def test_opid_policy_vllm_backend_defers_generation_to_trainer():
+    analyzer = OPIDEpisodeAnalyzer(backend="policy_vllm")
+
+    assert analyzer.backend == "policy_vllm"
+    with pytest.raises(ValueError, match="does not use an OpenAI client"):
+        analyzer._get_openai_client()
+    with pytest.raises(ValueError, match="only implemented for openai"):
+        analyzer.analyze_episode(steps=_sample_steps())
 
 
 def test_opid_parse_uses_episode_skill_and_step_skills():

@@ -53,9 +53,8 @@ actor_rollout_ref:
     clip_ratio_high: 0.2
     clip_ratio_c: 3.0 # lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729
     loss_agg_mode: "token-mean" # / "seq-mean-token-sum" / "seq-mean-token-mean"
-    opd_loss_coef: 0.0 # OPID auxiliary OPD distillation loss; 0 disables it
-    opd_loss_weight_mode: "delta" # "delta" or "importance"
-    opd_loss_clip: null # null disables clipping; otherwise clamps the OPD token weight magnitude
+    sdar_loss_coef: 0.0 # SDAR-style gated auxiliary distillation loss; 0 disables it
+    sdar_gate_beta: 5.0 # sigmoid sharpness for SDAR teacher-student gap gating
     # NOTE: "token-mean" is the default behavior
     entropy_coeff: 0
     use_kl_loss: False # True for GRPO
@@ -311,6 +310,7 @@ algorithm:
     failure_success_threshold: 1.0 # when episode_success is unavailable, episode_rewards >= this value counts as success
     analysis_backend: "openai"
     analysis_num_workers: 8
+    analysis_context_length: 16384
     analysis_max_completion_tokens: 1024
     analysis_max_step_skills_per_traj: 1
     save_analysis: False

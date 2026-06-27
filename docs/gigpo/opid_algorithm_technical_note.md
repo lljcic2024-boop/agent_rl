@@ -20,7 +20,6 @@ log-prob 差值构成 token-level teacher advantage。
 - `algorithm.opid.step_advantage_w=0.0`
 - `algorithm.opid.episode_skill_teacher_advantage_w=0.001`
 - `algorithm.opid.step_skill_teacher_advantage_w=0.001`
-- `actor_rollout_ref.actor.opd_loss_coef=0.0`
 
 因此，当前训练主要由 episode outcome relative advantage 驱动，LLM
 hindsight teacher signal 作为小权重的 shaping 项进入 PPO advantage。
@@ -436,11 +435,10 @@ $$
 - `actor_rollout_ref.actor.kl_loss_coef=0.01`
 - `actor_rollout_ref.actor.kl_loss_type=low_var_kl`
 
-此外，代码中存在 auxiliary OPD loss 路径，但当前脚本设置
-`actor_rollout_ref.actor.opd_loss_coef=0.0`，因此该辅助 loss 不生效。若启用，
-其实现见
+此外，旧的 signed auxiliary OPD loss 路径已移除。若需要额外的
+distillation loss，当前实现使用 SDAR-style gated auxiliary loss：
 [`verl/trainer/ppo/core_algos.py`](../../verl/trainer/ppo/core_algos.py) 的
-`compute_opd_loss`，以及
+`compute_sdar_loss`，以及
 [`verl/workers/actor/dp_actor.py`](../../verl/workers/actor/dp_actor.py) 的
 actor update。
 
@@ -497,7 +495,7 @@ Input:
 7. Update actor with PPO.
    Use A_OPID in the clipped PPO objective.
    Add KL loss if configured.
-   Add auxiliary OPD loss only if opd_loss_coef > 0.
+   Add SDAR-style auxiliary distillation loss only if sdar_loss_coef > 0.
 ```
 
 ## 13. 当前 AlfWorld 配置解读
@@ -520,7 +518,7 @@ Input:
 | `algorithm.opid.failed_only` | `False` | 成功和失败轨迹都分析 |
 | `algorithm.opid.opd_start_after_steps` | `null` | 从训练开始即允许 teacher signal |
 | `algorithm.opid.opd_stop_after_steps` | `null` | 不设置 teacher signal 停止步数 |
-| `actor_rollout_ref.actor.opd_loss_coef` | `0.0` | 不使用 auxiliary OPD loss |
+| `actor_rollout_ref.actor.sdar_loss_coef` | `0.0` | 默认不使用 SDAR-style auxiliary distillation loss |
 
 ## 14. 实现映射
 

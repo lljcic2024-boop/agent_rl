@@ -492,104 +492,88 @@ def compute_policy_loss(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
-def compute_opd_loss(
+def compute_sdar_loss(
     log_prob: torch.Tensor,
-    old_log_prob: torch.Tensor,
     teacher_log_prob: torch.Tensor,
     response_mask: torch.Tensor,
-    opd_step_mask: torch.Tensor,
-    weight_mode: str = "delta",
-    opd_clip=None,
+    sdar_step_mask: torch.Tensor = None,
+    gate_beta: float = 5.0,
     loss_agg_mode: str = "token-mean",
 ):
     """
-    Compute the auxiliary OPID OPD distillation loss.
+    Compute SDAR-style confidence-gated teacher distillation loss.
+
+    This keeps the teacher log-probs and the gate detached, so gradients flow
+    only through the current policy log-probs:
+        gate = sigmoid(beta * (teacher_log_prob - log_prob.detach()))
+        loss = gate * (teacher_log_prob - log_prob)
 
     Args:
         log_prob: Current policy log-probabilities, shape (batch_size, response_length).
-        old_log_prob: Old policy log-probabilities, shape (batch_size, response_length).
         teacher_log_prob: Teacher/enhanced-prompt log-probabilities, shape (batch_size, response_length).
         response_mask: Mask for valid response tokens, shape (batch_size, response_length).
-        opd_step_mask: Sample-level or token-level mask selecting OPD-supervised steps.
-        weight_mode: "delta" or "importance".
-        opd_clip: Optional clipping value for OPD weights.
+        sdar_step_mask: Optional sample-level or token-level mask selecting SDAR-supervised steps.
+        gate_beta: Sigmoid sharpness for the teacher-student gap gate.
         loss_agg_mode: Aggregation mode for `agg_loss`.
 
     Returns:
-        opd_loss, opd_active_token_ratio, opd_weight_abs_mean,
-        opd_log_ratio_abs_mean, opd_importance_ratio_mean,
-        opd_importance_ratio_max
+        sdar_loss, sdar_active_token_ratio, sdar_gate_mean,
+        sdar_gate_active_ratio, sdar_teacher_gap_mean
     """
-    if log_prob.shape != old_log_prob.shape:
-        raise ValueError(f"log_prob shape {tuple(log_prob.shape)} does not match old_log_prob shape {tuple(old_log_prob.shape)}")
     if log_prob.shape != teacher_log_prob.shape:
         raise ValueError(f"log_prob shape {tuple(log_prob.shape)} does not match teacher_log_prob shape {tuple(teacher_log_prob.shape)}")
     if log_prob.shape != response_mask.shape:
         raise ValueError(f"log_prob shape {tuple(log_prob.shape)} does not match response_mask shape {tuple(response_mask.shape)}")
 
-    opd_step_mask = opd_step_mask.to(device=log_prob.device, dtype=response_mask.dtype)
-    if opd_step_mask.dim() == 1:
-        if opd_step_mask.shape[0] != response_mask.shape[0]:
-            raise ValueError(f"opd_step_mask batch size {opd_step_mask.shape[0]} does not match response_mask batch size {response_mask.shape[0]}")
-        opd_mask = response_mask * opd_step_mask.unsqueeze(-1)
-    elif opd_step_mask.dim() == 2:
-        if opd_step_mask.shape != response_mask.shape:
-            raise ValueError(f"opd_step_mask shape {tuple(opd_step_mask.shape)} does not match response_mask shape {tuple(response_mask.shape)}")
-        opd_mask = response_mask * opd_step_mask
+    if sdar_step_mask is None:
+        sdar_mask = response_mask
     else:
-        raise ValueError(f"opd_step_mask must be 1D or 2D, got shape {tuple(opd_step_mask.shape)}")
+        sdar_step_mask = sdar_step_mask.to(device=log_prob.device, dtype=response_mask.dtype)
+        if sdar_step_mask.dim() == 1:
+            if sdar_step_mask.shape[0] != response_mask.shape[0]:
+                raise ValueError(f"sdar_step_mask batch size {sdar_step_mask.shape[0]} does not match response_mask batch size {response_mask.shape[0]}")
+            sdar_mask = response_mask * sdar_step_mask.unsqueeze(-1)
+        elif sdar_step_mask.dim() == 2:
+            if sdar_step_mask.shape != response_mask.shape:
+                raise ValueError(f"sdar_step_mask shape {tuple(sdar_step_mask.shape)} does not match response_mask shape {tuple(response_mask.shape)}")
+            sdar_mask = response_mask * sdar_step_mask
+        else:
+            raise ValueError(f"sdar_step_mask must be 1D or 2D, got shape {tuple(sdar_step_mask.shape)}")
 
-    opd_loss = log_prob.new_tensor(0.0)
-    opd_active_token_ratio = log_prob.new_tensor(0.0)
-    opd_weight_abs_mean = log_prob.new_tensor(0.0)
-    opd_log_ratio_abs_mean = log_prob.new_tensor(0.0)
-    opd_importance_ratio_mean = log_prob.new_tensor(0.0)
-    opd_importance_ratio_max = log_prob.new_tensor(0.0)
-    if not torch.any(opd_mask > 0):
+    sdar_loss = log_prob.new_tensor(0.0)
+    sdar_active_token_ratio = log_prob.new_tensor(0.0)
+    sdar_gate_mean = log_prob.new_tensor(0.0)
+    sdar_gate_active_ratio = log_prob.new_tensor(0.0)
+    sdar_teacher_gap_mean = log_prob.new_tensor(0.0)
+    if not torch.any(sdar_mask > 0):
         return (
-            opd_loss,
-            opd_active_token_ratio,
-            opd_weight_abs_mean,
-            opd_log_ratio_abs_mean,
-            opd_importance_ratio_mean,
-            opd_importance_ratio_max,
+            sdar_loss,
+            sdar_active_token_ratio,
+            sdar_gate_mean,
+            sdar_gate_active_ratio,
+            sdar_teacher_gap_mean,
         )
 
     teacher_log_prob = teacher_log_prob.detach()
-    teacher_delta = (teacher_log_prob - old_log_prob).detach()
-    if weight_mode == "delta":
-        opd_weight = teacher_delta
-        if opd_clip is not None:
-            opd_weight = torch.clamp(opd_weight, min=-float(opd_clip), max=float(opd_clip))
-        opd_loss_mat = -opd_weight * log_prob
-    elif weight_mode == "importance":
-        log_ratio = log_prob - old_log_prob.detach()
-        importance_ratio = torch.exp(log_ratio)
-        opd_weight = teacher_delta * importance_ratio
-        if opd_clip is not None:
-            opd_weight = torch.clamp(opd_weight, min=-float(opd_clip), max=float(opd_clip))
-        opd_loss_mat = -opd_weight
-        opd_log_ratio_abs_mean = verl_F.masked_mean(log_ratio.abs(), opd_mask)
-        opd_importance_ratio_mean = verl_F.masked_mean(importance_ratio, opd_mask)
-        opd_importance_ratio_max = torch.masked_select(importance_ratio, opd_mask.bool()).max()
-    else:
-        raise ValueError(f"Unsupported opd_loss_weight_mode: {weight_mode}")
+    teacher_gap = (teacher_log_prob - log_prob.detach()).detach()
+    sdar_gate = torch.sigmoid(float(gate_beta) * teacher_gap).detach()
+    sdar_loss_mat = sdar_gate * (teacher_log_prob - log_prob)
 
-    opd_weight_abs_mean = verl_F.masked_mean(opd_weight.abs(), opd_mask)
-
-    opd_loss = agg_loss(
-        loss_mat=opd_loss_mat,
-        loss_mask=opd_mask,
+    sdar_loss = agg_loss(
+        loss_mat=sdar_loss_mat,
+        loss_mask=sdar_mask,
         loss_agg_mode=loss_agg_mode,
     )
-    opd_active_token_ratio = (opd_mask > 0).float().mean()
+    sdar_active_token_ratio = (sdar_mask > 0).float().mean()
+    sdar_gate_mean = verl_F.masked_mean(sdar_gate, sdar_mask)
+    sdar_gate_active_ratio = verl_F.masked_mean((sdar_gate > 0.5).float(), sdar_mask)
+    sdar_teacher_gap_mean = verl_F.masked_mean(teacher_gap, sdar_mask)
     return (
-        opd_loss,
-        opd_active_token_ratio,
-        opd_weight_abs_mean,
-        opd_log_ratio_abs_mean,
-        opd_importance_ratio_mean,
-        opd_importance_ratio_max,
+        sdar_loss,
+        sdar_active_token_ratio,
+        sdar_gate_mean,
+        sdar_gate_active_ratio,
+        sdar_teacher_gap_mean,
     )
 
 

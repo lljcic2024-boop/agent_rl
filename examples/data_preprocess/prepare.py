@@ -34,13 +34,17 @@ if __name__ == '__main__':
     args.local_dir = os.path.join(args.local_dir, args.mode)
 
     data_source = 'examples/data_preprocess/geometry3k'
+    hf_data_source = 'hiyouga/geometry3k'
     """
     **NOTE**: This is a frequently asked question.
     We do NOT use the data in 'hiyouga/geometry3k', instead we only use it to indicate the modality and the data size.
     See details: https://github.com/langfengQ/verl-agent?tab=readme-ov-file#2-data-preparation
     """
 
-    dataset = datasets.load_from_disk(data_source)
+    if os.path.isdir(data_source):
+        dataset = datasets.load_from_disk(data_source)
+    else:
+        dataset = datasets.load_dataset(hf_data_source)
 
 
     train_dataset = dataset['train'].select(range(args.train_data_size))

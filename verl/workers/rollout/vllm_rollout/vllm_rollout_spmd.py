@@ -290,6 +290,10 @@ class vLLMRollout(BaseRollout):
             elif not isinstance(input_data["prompt_token_ids"], list):
                 raise TypeError(f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
 
+        meta_sampling_params = prompts.meta_info.get("sampling_params")
+        if meta_sampling_params:
+            kwargs.update(dict(meta_sampling_params))
+
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
         if not do_sample:
@@ -309,6 +313,11 @@ class vLLMRollout(BaseRollout):
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
+
+        target_response_length = max(
+            int(self.config.response_length),
+            int(kwargs.get("max_tokens", self.config.response_length) or self.config.response_length),
+        )
 
         lora_requests = None
         if self.lora_kwargs:
@@ -340,8 +349,8 @@ class vLLMRollout(BaseRollout):
                         curr_log_prob.append(logprob[response_ids[i]].logprob)
                     rollout_log_probs.append(curr_log_prob)
 
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
-            rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
+            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=target_response_length).to(idx.device)
+            rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=target_response_length).to(idx.device)
             rollout_log_probs = rollout_log_probs.to(torch.float32)
 
             if self.sampling_params.n > 1 and do_sample:

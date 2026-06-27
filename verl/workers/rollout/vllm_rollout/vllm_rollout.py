@@ -201,6 +201,10 @@ class vLLMRollout(BaseRollout):
         for i in range(batch_size):
             idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
 
+        meta_sampling_params = prompts.meta_info.get("sampling_params")
+        if meta_sampling_params:
+            kwargs.update(dict(meta_sampling_params))
+
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
         if not do_sample:
@@ -220,6 +224,11 @@ class vLLMRollout(BaseRollout):
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
+
+        target_response_length = max(
+            int(self.config.response_length),
+            int(kwargs.get("max_tokens", self.config.response_length) or self.config.response_length),
+        )
 
         lora_requests = None
         if self.lora_kwargs:
@@ -243,9 +252,9 @@ class vLLMRollout(BaseRollout):
             response = output[0].to(idx.device)
             log_probs = output[1].to(idx.device)
 
-            if response.shape[1] < self.config.response_length:
-                response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
-                log_probs = pad_sequence_to_length(log_probs, self.config.response_length, self.pad_token_id)
+            if response.shape[1] < target_response_length:
+                response = pad_sequence_to_length(response, target_response_length, self.pad_token_id)
+                log_probs = pad_sequence_to_length(log_probs, target_response_length, self.pad_token_id)
 
             # utilize current sampling params
             if self.sampling_params.n > 1 and do_sample:

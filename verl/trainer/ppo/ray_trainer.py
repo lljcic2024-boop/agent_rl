@@ -29,7 +29,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Sequence, Type
 
 import numpy as np
 import ray
@@ -71,6 +71,7 @@ from opid.prompting import (
     build_augmented_observation_text,
     select_skill_teacher_sources,
 )
+from opid.skill_gen import SkillGenRewardConfig, compute_skill_gen_reward
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
@@ -614,7 +615,198 @@ class RayPPOTrainer:
             self._opid_analysis_last_enabled_state = enabled
         return enabled
 
-    def _is_opid_teacher_adv_enabled(self) -> bool:
+    def _is_opid_policy_vllm_backend(self) -> bool:
+        backend = OmegaConf.select(self.config, "algorithm.opid.analysis_backend")
+        return str(backend or "") == "policy_vllm"
+
+    def _is_opid_sdar_loss_enabled(self) -> bool:
+        sdar_loss_coef = OmegaConf.select(self.config, "actor_rollout_ref.actor.sdar_loss_coef")
+        return float(sdar_loss_coef or 0.0) > 0.0
+
+    def _is_opid_skill_gen_enabled(self) -> bool:
+        enabled = OmegaConf.select(self.config, "algorithm.opid.skill_gen.enable")
+        loss_coef = OmegaConf.select(self.config, "actor_rollout_ref.actor.skill_gen_loss_coef")
+        if isinstance(enabled, str):
+            enabled = enabled.lower() in ("1", "true", "yes", "on")
+        return bool(enabled) and float(loss_coef or 0.0) > 0.0
+
+    def _get_opid_skill_gen_reward_config(self) -> SkillGenRewardConfig:
+        def _select(name: str, default):
+            value = OmegaConf.select(self.config, f"algorithm.opid.skill_gen.{name}")
+            return default if value is None else value
+
+        reward_clip = _select("reward_clip", 2.0)
+        return SkillGenRewardConfig(
+            downstream_gain_coef=float(_select("downstream_gain_coef", 1.0)),
+            valid_json_bonus=float(_select("valid_json_bonus", 0.2)),
+            non_empty_skill_bonus=float(_select("non_empty_skill_bonus", 0.2)),
+            too_long_penalty=float(_select("too_long_penalty", 0.2)),
+            max_output_chars=int(_select("max_output_chars", 1200)),
+            reward_clip=None if reward_clip is None else float(reward_clip),
+        )
+
+    def _collect_opid_skill_gen_samples(
+        self,
+        episode_analysis: Dict[object, Dict[str, object]],
+        analysis_tasks: Dict[object, Dict[str, object]],
+        metrics: Dict[str, float],
+    ) -> List[Dict[str, object]]:
+        if not self._is_opid_skill_gen_enabled():
+            metrics["opid/skill_gen_enabled"] = 0.0
+            metrics["opid/skill_gen_samples_collected"] = 0.0
+            return []
+
+        metrics["opid/skill_gen_enabled"] = 1.0
+        if not self._is_opid_policy_vllm_backend():
+            metrics["opid/skill_gen_skipped_non_policy_vllm"] = 1.0
+            metrics["opid/skill_gen_samples_collected"] = 0.0
+            return []
+
+        samples: List[Dict[str, object]] = []
+        for traj_uid, analysis in episode_analysis.items():
+            generated_sample = analysis.get("_skill_gen_sample")
+            if not isinstance(generated_sample, dict):
+                continue
+            task = analysis_tasks.get(traj_uid, {})
+            steps = task.get("steps", [])
+            sample = {
+                "traj_uid": traj_uid,
+                "input_ids": generated_sample["input_ids"],
+                "attention_mask": generated_sample["attention_mask"],
+                "position_ids": generated_sample["position_ids"],
+                "responses": generated_sample["responses"],
+                "raw_output": analysis.get("llm_raw_output", ""),
+                "episode_skill": analysis.get("episode_skill", ""),
+                "step_skills": analysis.get("step_skills", {}),
+                "valid_json": not bool(analysis.get("analysis_error")),
+                "response_texts": [
+                    str(step.get("response", ""))
+                    for step in steps
+                ],
+                "episode_success": task.get("episode_success"),
+            }
+            samples.append(sample)
+
+        max_samples_value = OmegaConf.select(self.config, "algorithm.opid.skill_gen.max_samples")
+        if max_samples_value is None:
+            max_samples = 0
+        elif isinstance(max_samples_value, str) and max_samples_value.lower() in (
+            "all",
+            "none",
+            "null",
+            "unlimited",
+        ):
+            max_samples = 0
+        else:
+            max_samples = int(max_samples_value)
+        if max_samples > 0 and len(samples) > max_samples:
+            samples = samples[:max_samples]
+
+        metrics["opid/skill_gen_samples_collected"] = float(len(samples))
+        metrics["opid/skill_gen_skipped_non_policy_vllm"] = 0.0
+        return samples
+
+    @staticmethod
+    def _stack_skill_gen_tensors(samples: List[Dict[str, object]], key: str, pad_value: int = 0) -> torch.Tensor:
+        tensors = [sample[key].detach().cpu() if isinstance(sample[key], torch.Tensor) else torch.as_tensor(sample[key]) for sample in samples]
+        shapes = {tuple(tensor.shape) for tensor in tensors}
+        if len(shapes) == 1:
+            return torch.stack(tensors, dim=0)
+        if not all(tensor.dim() == 1 for tensor in tensors):
+            raise ValueError(f"Cannot pad OPID skill_gen tensor key={key!r} with shapes={sorted(shapes)}.")
+        max_len = max(int(tensor.size(0)) for tensor in tensors)
+        padded = []
+        for tensor in tensors:
+            if int(tensor.size(0)) == max_len:
+                padded.append(tensor)
+                continue
+            pad = tensor.new_full((max_len - int(tensor.size(0)),), pad_value)
+            padded.append(torch.cat([tensor, pad], dim=0))
+        return torch.stack(padded, dim=0)
+
+    def _build_opid_skill_gen_payload(
+        self,
+        batch: DataProto,
+        samples: Optional[List[Dict[str, object]]],
+    ) -> Optional[Dict[str, object]]:
+        if not self._is_opid_skill_gen_enabled() or not samples:
+            return None
+
+        traj_uids = list(batch.non_tensor_batch.get("traj_uid", []))
+        if not traj_uids:
+            return None
+
+        traj_to_indices: Dict[object, List[int]] = defaultdict(list)
+        for sample_idx, traj_uid in enumerate(traj_uids):
+            traj_to_indices[traj_uid].append(sample_idx)
+
+        response_mask = compute_response_mask(batch).detach().cpu().bool()
+        if "teacher_signal_mask" in batch.batch.keys():
+            teacher_mask = batch.batch["teacher_signal_mask"].detach().cpu().bool()
+        elif "critical_step_mask" in batch.batch.keys():
+            teacher_mask = batch.batch["critical_step_mask"].detach().cpu().bool()
+        else:
+            teacher_mask = torch.zeros(len(batch), dtype=torch.bool)
+        if "teacher_log_prob" in batch.batch.keys() and "old_log_probs" in batch.batch.keys():
+            teacher_gap = (batch.batch["teacher_log_prob"] - batch.batch["old_log_probs"]).detach().cpu()
+        else:
+            teacher_gap = torch.zeros_like(response_mask, dtype=torch.float32)
+
+        success_threshold = self._get_opid_failure_success_threshold()
+        reward_config = self._get_opid_skill_gen_reward_config()
+        rewards = []
+        reward_components: Dict[str, List[float]] = defaultdict(list)
+        kept_samples: List[Dict[str, object]] = []
+
+        for sample in samples:
+            traj_uid = sample.get("traj_uid")
+            sample_indices = traj_to_indices.get(traj_uid, [])
+            downstream_gain = 0.0
+            if sample_indices:
+                index_tensor = torch.as_tensor(sample_indices, dtype=torch.long)
+                active_token_mask = response_mask.index_select(0, index_tensor) & teacher_mask.index_select(0, index_tensor).unsqueeze(-1)
+                active_gaps = teacher_gap.index_select(0, index_tensor)[active_token_mask]
+                if active_gaps.numel() > 0:
+                    downstream_gain = float(active_gaps.mean().item())
+
+            episode_success = sample.get("episode_success")
+            if episode_success is not None:
+                episode_success = 1.0 if float(episode_success) >= success_threshold else 0.0
+
+            reward_info = compute_skill_gen_reward(
+                downstream_logprob_gain=downstream_gain,
+                episode_success=episode_success,
+                valid_json=bool(sample.get("valid_json")),
+                episode_skill=sample.get("episode_skill", ""),
+                step_skills=sample.get("step_skills", {}),
+                raw_output=sample.get("raw_output", ""),
+                config=reward_config,
+            )
+            rewards.append(float(reward_info["reward"]))
+            kept_samples.append(sample)
+            for key, value in reward_info.items():
+                reward_components[key].append(float(value))
+
+        if not kept_samples:
+            return None
+
+        payload_metrics = {
+            f"skill_gen/{key}_mean": float(np.mean(values))
+            for key, values in reward_components.items()
+            if values
+        }
+        payload_metrics["skill_gen/samples"] = float(len(kept_samples))
+
+        return {
+            "input_ids": self._stack_skill_gen_tensors(kept_samples, "input_ids", pad_value=self.tokenizer.pad_token_id or 0),
+            "attention_mask": self._stack_skill_gen_tensors(kept_samples, "attention_mask", pad_value=0),
+            "position_ids": self._stack_skill_gen_tensors(kept_samples, "position_ids", pad_value=0),
+            "responses": self._stack_skill_gen_tensors(kept_samples, "responses", pad_value=self.tokenizer.pad_token_id or 0),
+            "rewards": torch.tensor(rewards, dtype=torch.float32),
+            "metrics": payload_metrics,
+        }
+
+    def _is_opid_teacher_signal_enabled(self) -> bool:
         start_after_steps = self._get_opid_opd_start_after_steps()
         stop_after_steps = self._get_opid_opd_stop_after_steps()
 
@@ -636,19 +828,19 @@ class RayPPOTrainer:
                     schedule_parts.append(f"until step {stop_after_steps}")
                 schedule_text = f" ({', '.join(schedule_parts)})" if schedule_parts else ""
                 module_logger.info(
-                    "OPID teacher advantage is enabled at global_step=%s%s.",
+                    "OPID teacher/OPD signal is enabled at global_step=%s%s.",
                     self.global_steps,
                     schedule_text,
                 )
             elif disabled_reason == "before_start":
                 module_logger.info(
-                    "OPID teacher advantage is disabled at global_step=%s until after step %s.",
+                    "OPID teacher/OPD signal is disabled at global_step=%s until after step %s.",
                     self.global_steps,
                     start_after_steps,
                 )
             else:
                 module_logger.info(
-                    "OPID teacher advantage is disabled at global_step=%s because opd_stop_after_steps=%s.",
+                    "OPID teacher/OPD signal is disabled at global_step=%s because opd_stop_after_steps=%s.",
                     self.global_steps,
                     stop_after_steps,
                 )
@@ -777,6 +969,14 @@ class RayPPOTrainer:
         batch.batch["critical_step_mask"] = critical_step_mask
         batch.batch["step_skill_mask"] = step_skill_mask
         batch.batch["teacher_signal_mask"] = teacher_signal_mask
+        skill_gen_payload = self._build_opid_skill_gen_payload(
+            batch=batch,
+            samples=teacher_signal_batch.meta_info.get("opid_skill_gen_samples"),
+        )
+        if skill_gen_payload is not None:
+            batch.meta_info["opid_skill_gen"] = skill_gen_payload
+        else:
+            batch.meta_info.pop("opid_skill_gen", None)
         batch.non_tensor_batch.pop("_batch_source_idx", None)
         return batch
 
@@ -826,6 +1026,38 @@ class RayPPOTrainer:
                 f"algorithm.opid.skill_teacher_mode must be one of {SKILL_TEACHER_MODES}, got {skill_teacher_mode!r}."
             )
         if config.algorithm.adv_estimator == AdvantageEstimator.OPID or str(config.algorithm.adv_estimator) == AdvantageEstimator.OPID.value:
+            analysis_backend = str(OmegaConf.select(config, "algorithm.opid.analysis_backend") or "openai")
+            analysis_enabled_config = OmegaConf.select(config, "algorithm.opid.enable_analysis")
+            if analysis_enabled_config is None:
+                analysis_enabled = True
+            elif isinstance(analysis_enabled_config, str):
+                analysis_enabled = analysis_enabled_config.lower() in ("1", "true", "yes", "on")
+            else:
+                analysis_enabled = bool(analysis_enabled_config)
+            if analysis_backend not in {"openai", "policy_vllm"}:
+                raise ValueError("algorithm.opid.analysis_backend must be 'openai' or 'policy_vllm'.")
+            if analysis_backend == "policy_vllm" and analysis_enabled:
+                if str(config.actor_rollout_ref.rollout.name) != "vllm":
+                    raise ValueError("algorithm.opid.analysis_backend=policy_vllm requires actor_rollout_ref.rollout.name=vllm.")
+                analysis_context_length = int(
+                    OmegaConf.select(config, "algorithm.opid.analysis_context_length") or 16384
+                )
+                analysis_max_completion_tokens = int(
+                    OmegaConf.select(config, "algorithm.opid.analysis_max_completion_tokens") or 4096
+                )
+                effective_max_model_len = int(
+                    OmegaConf.select(config, "actor_rollout_ref.rollout.max_model_len")
+                    or (
+                        int(config.actor_rollout_ref.rollout.prompt_length)
+                        + int(config.actor_rollout_ref.rollout.response_length)
+                    )
+                )
+                required_max_model_len = analysis_context_length + analysis_max_completion_tokens
+                if effective_max_model_len < required_max_model_len:
+                    raise ValueError(
+                        "policy_vllm OPID analysis requires actor_rollout_ref.rollout.max_model_len "
+                        f">= {required_max_model_len}, got {effective_max_model_len}."
+                    )
             if float(OmegaConf.select(config, "algorithm.opid.step_advantage_w") or 0.0) != 0.0:
                 raise ValueError(
                     "Episode-level OPID OPD requires algorithm.opid.step_advantage_w=0.0."
@@ -1677,6 +1909,148 @@ class RayPPOTrainer:
                 traj_success[traj_uid] = float(episode_success_np[sample_idx])
         return traj_success
 
+    def _opid_prompt_dict_to_text(self, prompt: Dict[str, Any]) -> str:
+        messages = prompt.get("messages", []) if isinstance(prompt, dict) else []
+        if len(messages) == 1 and messages[0].get("role") == "user":
+            return str(messages[0].get("content", ""))
+        return "\n\n".join(
+            f"{message.get('role', 'user')}: {message.get('content', '')}"
+            for message in messages
+        )
+
+    def _finalize_policy_vllm_opid_analysis(
+        self,
+        analyzer,
+        *,
+        content: str,
+        prompt: Dict[str, Any],
+        steps: List[Dict[str, object]],
+        candidate_step_indices: Sequence[int],
+        analysis_mode: str,
+        task_description: Optional[str],
+    ) -> Dict[str, object]:
+        candidate_list = [int(idx) for idx in candidate_step_indices]
+        parse_error = None
+        try:
+            parsed = analyzer._parse_analysis_response(content)
+        except ValueError as exc:
+            parse_error = str(exc)
+            parsed = {
+                "episode_summary": "",
+                "episode_skill": "",
+                "step_skills": {},
+            }
+
+        candidate_step_set = set(candidate_list)
+        filtered_step_skills = {
+            step_idx: skill
+            for step_idx, skill in parsed.get("step_skills", {}).items()
+            if step_idx in candidate_step_set
+        }
+        parsed["step_skills"] = dict(
+            list(filtered_step_skills.items())[: analyzer.max_step_skills_per_traj]
+        )
+
+        parsed["analysis_backend_requested"] = analyzer.requested_backend
+        parsed["analysis_backend_used"] = "policy_vllm"
+        parsed["analysis_error"] = parse_error
+        parsed["analysis_mode"] = analysis_mode
+        parsed["task_description"] = task_description or analyzer._infer_task_description(steps)
+        parsed["llm_prompt"] = prompt
+        parsed["llm_raw_output"] = content
+        return parsed
+
+    def _analyze_opid_episodes_with_policy_vllm(self, analyzer, analysis_tasks: Dict[object, Dict[str, object]]):
+        traj_uids = list(analysis_tasks.keys())
+        prompt_texts = []
+        prompt_by_traj: Dict[object, Dict[str, Any]] = {}
+        for traj_uid in traj_uids:
+            task = analysis_tasks[traj_uid]
+            candidate_step_indices = [int(idx) for idx in task["candidate_step_indices"]]
+            prompt = analyzer._build_episode_analysis_prompt(
+                steps=task["steps"],
+                candidate_step_indices=candidate_step_indices,
+                analysis_mode=task["analysis_mode"],
+                episode_success=task.get("episode_success"),
+                task_description=task.get("task_description"),
+            )
+            prompt_by_traj[traj_uid] = prompt
+            prompt_texts.append(self._opid_prompt_dict_to_text(prompt))
+
+        analysis_context_length = int(
+            OmegaConf.select(self.config, "algorithm.opid.analysis_context_length") or 16384
+        )
+        max_completion_tokens = int(self.config.algorithm.opid.analysis_max_completion_tokens)
+        prompt_batch = self.traj_collector.build_text_prompt_batch(
+            obs_contents=prompt_texts,
+            data_sources=[None] * len(prompt_texts),
+            meta_info={
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": True,
+                "validate": False,
+                "sampling_params": {
+                    "n": 1,
+                    "temperature": 0,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "max_tokens": max_completion_tokens,
+                },
+            },
+            max_prompt_length=analysis_context_length,
+        )
+        prompt_lengths = prompt_batch.batch["attention_mask"].sum(dim=-1).detach().cpu().numpy()
+        module_logger.info(
+            "OPID policy_vllm analysis prompt lengths: min=%s, mean=%.2f, max=%s, max_completion_tokens=%s",
+            int(prompt_lengths.min()),
+            float(prompt_lengths.mean()),
+            int(prompt_lengths.max()),
+            max_completion_tokens,
+        )
+
+        gen_meta_info = deepcopy(prompt_batch.meta_info)
+        gen_prompt_batch = prompt_batch.pop(
+            batch_keys=["input_ids", "attention_mask", "position_ids"],
+            non_tensor_batch_keys=["raw_prompt_ids"],
+        )
+        gen_prompt_batch.meta_info = gen_meta_info
+        gen_prompt_batch_padded, pad_size = pad_dataproto_to_divisor(
+            gen_prompt_batch,
+            self.actor_rollout_wg.world_size,
+        )
+        gen_output_padded = self.actor_rollout_wg.generate_sequences(gen_prompt_batch_padded)
+        gen_output = unpad_dataproto(gen_output_padded, pad_size=pad_size)
+        response_mask = compute_response_mask(gen_output).detach().cpu()
+        responses = gen_output.batch["responses"].detach().cpu()
+
+        results = {}
+        for output_idx, traj_uid in enumerate(traj_uids):
+            valid_len = int(response_mask[output_idx].sum().item())
+            content = self.tokenizer.decode(
+                responses[output_idx][:valid_len],
+                skip_special_tokens=True,
+            )
+            task = analysis_tasks[traj_uid]
+            analysis = self._finalize_policy_vllm_opid_analysis(
+                analyzer,
+                content=content,
+                prompt=prompt_by_traj[traj_uid],
+                steps=task["steps"],
+                candidate_step_indices=task["candidate_step_indices"],
+                analysis_mode=task["analysis_mode"],
+                task_description=task.get("task_description"),
+            )
+            analysis["_skill_gen_sample"] = {
+                "input_ids": gen_output.batch["input_ids"][output_idx].detach().cpu().clone(),
+                "attention_mask": gen_output.batch["attention_mask"][output_idx].detach().cpu().clone(),
+                "position_ids": gen_output.batch["position_ids"][output_idx].detach().cpu().clone(),
+                "responses": gen_output.batch["responses"][output_idx].detach().cpu().clone(),
+                "valid_response_len": valid_len,
+            }
+            results[traj_uid] = analysis
+        return results, 1
+
     def _analyze_opid_episodes(self, analyzer, analysis_tasks: Dict[object, Dict[str, object]]):
         """
         Analyze multiple trajectories for OPID. Azure-backed analysis is run with
@@ -1697,7 +2071,13 @@ class RayPPOTrainer:
         )
         print(f"OPID analysis backend: {backend}, configured_workers: {configured_workers}, max_workers: {max_workers}")
 
-        assert backend in ["openai", "heuristic"], f"Unsupported OPID analysis backend: {backend}"
+        if backend == "policy_vllm":
+            return self._analyze_opid_episodes_with_policy_vllm(
+                analyzer=analyzer,
+                analysis_tasks=analysis_tasks,
+            )
+        if backend != "openai":
+            raise ValueError(f"Unsupported OPID analysis backend: {backend}")
 
         results = {}
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="opid-analysis") as executor:
@@ -1900,6 +2280,15 @@ class RayPPOTrainer:
             }
         analyzed, analysis_workers = self._analyze_opid_episodes(analyzer=analyzer, analysis_tasks=analysis_tasks)
         episode_analysis.update(analyzed)
+        skill_gen_samples = self._collect_opid_skill_gen_samples(
+            episode_analysis=episode_analysis,
+            analysis_tasks=analysis_tasks,
+            metrics=metrics,
+        )
+        if skill_gen_samples:
+            batch.meta_info["opid_skill_gen_samples"] = skill_gen_samples
+        else:
+            batch.meta_info.pop("opid_skill_gen_samples", None)
 
         def _has_successful_analysis(traj_uid: object, analysis: Dict[str, object]) -> bool:
             if analysis.get("analysis_error"):
@@ -2013,17 +2402,20 @@ class RayPPOTrainer:
         augmented_observation_dump_entries: List[Dict[str, object]] = []
         critical_preview = []
         step_skill_guided_steps = 0
+        sdar_loss_enabled = self._is_opid_sdar_loss_enabled()
         episode_skill_teacher_weight = float(
             OmegaConf.select(self.config, "algorithm.opid.episode_skill_teacher_advantage_w") or 0.0
         )
-        episode_skill_teacher_enabled = episode_skill_teacher_weight > 0.0
+        episode_skill_teacher_enabled = episode_skill_teacher_weight > 0.0 or sdar_loss_enabled
         step_skill_teacher_enabled = (
             float(OmegaConf.select(self.config, "algorithm.opid.step_skill_teacher_advantage_w") or 0.0) > 0.0
+            or sdar_loss_enabled
         )
         skill_teacher_mode = str(
             OmegaConf.select(self.config, "algorithm.opid.skill_teacher_mode") or "step_priority"
         )
         metrics["opid/episode_skill_teacher/enabled"] = 1.0 if episode_skill_teacher_enabled else 0.0
+        metrics["opid/sdar_loss_enabled"] = 1.0 if sdar_loss_enabled else 0.0
         metrics["opid/episode_skill_teacher_skipped_zero_weight"] = (
             0.0 if episode_skill_teacher_enabled else 1.0
         )
@@ -2124,10 +2516,12 @@ class RayPPOTrainer:
             response_masks: torch.Tensor,
             data_sources: List[object],
         ) -> torch.Tensor:
+            teacher_meta_info = deepcopy(batch.meta_info)
+            teacher_meta_info.pop("opid_skill_gen_samples", None)
             teacher_prompt_batch = self.traj_collector.build_text_prompt_batch(
                 obs_contents=obs_texts,
                 data_sources=data_sources,
-                meta_info=deepcopy(batch.meta_info),
+                meta_info=teacher_meta_info,
             )
             prompt_lengths = teacher_prompt_batch.batch["attention_mask"].sum(dim=-1).detach().cpu().numpy()
             module_logger.info(
@@ -2154,7 +2548,7 @@ class RayPPOTrainer:
                     "attention_mask": teacher_attention_mask,
                     "position_ids": teacher_position_ids,
                 },
-                meta_info=deepcopy(batch.meta_info),
+                meta_info=teacher_meta_info,
             )
             teacher_batch_padded, teacher_pad_size = pad_dataproto_to_divisor(
                 teacher_batch,
@@ -2415,10 +2809,15 @@ class RayPPOTrainer:
 
                 with _timer("step", timing_raw):
                     opid_teacher_future = None
+                    opid_teacher_snapshot = None
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.OPID:
-                        opid_teacher_schedule_enabled = self._is_opid_teacher_adv_enabled()
+                        opid_teacher_schedule_enabled = self._is_opid_teacher_signal_enabled()
                         opid_analysis_enabled = self._is_opid_analysis_enabled()
-                        opid_teacher_adv_enabled = opid_teacher_schedule_enabled and opid_analysis_enabled
+                        opid_sdar_loss_enabled = self._is_opid_sdar_loss_enabled()
+                        opid_skill_gen_enabled = self._is_opid_skill_gen_enabled()
+                        opid_teacher_signal_enabled = opid_teacher_schedule_enabled and opid_analysis_enabled
+                        opid_teacher_adv_enabled = opid_teacher_signal_enabled and not opid_sdar_loss_enabled
+                        opid_policy_vllm_backend = self._is_opid_policy_vllm_backend()
                     # generate a batch
                     with _timer("gen", timing_raw):
                         # if not self.async_rollout_mode:
@@ -2465,7 +2864,11 @@ class RayPPOTrainer:
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.OPID:
-                        metrics["opid/teacher_enabled"] = 1.0 if opid_teacher_adv_enabled else 0.0
+                        metrics["opid/teacher_enabled"] = 1.0 if opid_teacher_signal_enabled else 0.0
+                        metrics["opid/teacher_signal_enabled"] = 1.0 if opid_teacher_signal_enabled else 0.0
+                        metrics["opid/teacher_advantage_enabled"] = 1.0 if opid_teacher_adv_enabled else 0.0
+                        metrics["opid/sdar_loss_enabled"] = 1.0 if opid_sdar_loss_enabled else 0.0
+                        metrics["opid/skill_gen_enabled"] = 1.0 if opid_skill_gen_enabled else 0.0
                         metrics["opid/teacher_disabled_by_schedule"] = 0.0 if opid_teacher_schedule_enabled else 1.0
                         metrics["opid/teacher_disabled_by_analysis"] = (
                             1.0 if opid_teacher_schedule_enabled and not opid_analysis_enabled else 0.0
@@ -2473,11 +2876,14 @@ class RayPPOTrainer:
                         metrics["opid/analysis_enabled"] = 1.0 if opid_analysis_enabled else 0.0
                         metrics["opid/analysis_disabled"] = 0.0 if opid_analysis_enabled else 1.0
                         if opid_analysis_enabled:
-                            opid_teacher_future = self._lazy_init_opid_teacher_signal_executor().submit(
-                                self._prepare_opid_teacher_signals_async_task,
-                                self._build_opid_teacher_signal_snapshot(batch),
-                                opid_teacher_adv_enabled,
-                            )
+                            opid_teacher_snapshot = self._build_opid_teacher_signal_snapshot(batch)
+                            if not opid_policy_vllm_backend:
+                                opid_teacher_future = self._lazy_init_opid_teacher_signal_executor().submit(
+                                    self._prepare_opid_teacher_signals_async_task,
+                                    opid_teacher_snapshot,
+                                    opid_teacher_signal_enabled,
+                                )
+                                opid_teacher_snapshot = None
                     
                     batch = adjust_batch(
                         self.config,
@@ -2559,7 +2965,7 @@ class RayPPOTrainer:
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.OPID:
                         with _timer("opid_teacher", timing_raw):
-                            if opid_teacher_future is None:
+                            if opid_teacher_future is None and opid_teacher_snapshot is None:
                                 module_logger.info(
                                     "OPID analysis is disabled; using zero teacher signals for this batch."
                                 )
@@ -2570,6 +2976,16 @@ class RayPPOTrainer:
                                 metrics["opid/analysis_num_workers"] = 0.0
                                 metrics["opid/teacher_skipped_analysis_disabled"] = 1.0
                                 batch.non_tensor_batch.pop("_batch_source_idx", None)
+                            elif opid_teacher_snapshot is not None:
+                                teacher_signal_batch, teacher_signal_metrics = self._prepare_opid_teacher_signals_async_task(
+                                    opid_teacher_snapshot,
+                                    opid_teacher_signal_enabled,
+                                )
+                                metrics.update(teacher_signal_metrics)
+                                batch = self._merge_async_opid_teacher_signals(
+                                    batch=batch,
+                                    teacher_signal_batch=teacher_signal_batch,
+                                )
                             else:
                                 try:
                                     teacher_signal_batch, teacher_signal_metrics = opid_teacher_future.result()
@@ -2675,6 +3091,7 @@ class RayPPOTrainer:
                         # update actor
                         with _timer("update_actor", timing_raw):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            batch.meta_info["global_step"] = self.global_steps
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

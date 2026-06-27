@@ -219,7 +219,8 @@ class OPIDEpisodeAnalyzer:
     """
     Analyze trajectories for reusable episode-level and critical-step skills.
 
-    The analyzer uses an OpenAI-compatible JSON analysis backend.
+    The analyzer uses an OpenAI-compatible JSON analysis backend or the
+    on-policy rollout model when the trainer selects ``policy_vllm``.
     ``azure`` remains a legacy alias for ``openai``.
     """
 
@@ -233,7 +234,7 @@ class OPIDEpisodeAnalyzer:
         if backend == "azure":
             logger.warning("OPID backend='azure' is deprecated; using the OpenAI-compatible backend instead.")
             backend = "openai"
-        elif backend != "openai":
+        elif backend not in {"openai", "policy_vllm"}:
             raise ValueError(f"Unsupported OPID backend: {backend}")
 
         self.backend = backend
@@ -252,6 +253,8 @@ class OPIDEpisodeAnalyzer:
         )
 
     def _get_openai_client(self):
+        if self.backend != "openai":
+            raise ValueError(f"OPID backend {self.backend!r} does not use an OpenAI client.")
         if self.client is None:
             self.client = create_openai_client(
                 api_key=os.environ.get("OPENAI_API_KEY"),
@@ -267,6 +270,8 @@ class OPIDEpisodeAnalyzer:
         episode_success: Optional[float] = None,
         task_description: Optional[str] = None,
     ) -> Dict[str, object]:
+        if self.backend != "openai":
+            raise ValueError(f"analyze_episode is only implemented for openai, got {self.backend!r}.")
         return self._analyze_episode_with_openai(
             steps=steps,
             candidate_step_indices=candidate_step_indices,

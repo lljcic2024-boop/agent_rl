@@ -129,6 +129,7 @@ ENV/
 
 # data
 *.parquet
+examples/data_preprocess/geometry3k/
 
 
 # local logs
