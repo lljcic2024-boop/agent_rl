@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from gigpo import core_gigpo
+from opid.prompting import validate_skill_mode
 from utils import build_prompt_dict, chat_completion_with_retry, create_openai_client
 
 
@@ -229,6 +230,7 @@ class OPIDEpisodeAnalyzer:
         backend: str = "openai",
         max_completion_tokens: int = 4096,
         max_step_skills_per_traj: int = 1,
+        skill_mode: str = "episode_step",
     ):
         self.requested_backend = backend
         if backend == "azure":
@@ -240,16 +242,18 @@ class OPIDEpisodeAnalyzer:
         self.backend = backend
         self.max_completion_tokens = max_completion_tokens
         self.max_step_skills_per_traj = max(int(max_step_skills_per_traj), 0)
+        self.skill_mode = validate_skill_mode(skill_mode)
         self.client = None
         self.model = os.environ.get("OPENAI_MODEL", "gemini-2.5-flash")
 
         logger.info(
-            "Initialized OPIDEpisodeAnalyzer with requested_backend=%s, resolved_backend=%s, model=%s, max_completion_tokens=%s, max_step_skills_per_traj=%s",
+            "Initialized OPIDEpisodeAnalyzer with requested_backend=%s, resolved_backend=%s, model=%s, max_completion_tokens=%s, max_step_skills_per_traj=%s, skill_mode=%s",
             self.requested_backend,
             self.backend,
             self.model,
             self.max_completion_tokens,
             self.max_step_skills_per_traj,
+            self.skill_mode,
         )
 
     def _get_openai_client(self):
@@ -279,6 +283,11 @@ class OPIDEpisodeAnalyzer:
             analysis_mode=analysis_mode,
             episode_success=episode_success,
         )
+
+    def _analysis_has_required_skill(self, parsed: Dict[str, object]) -> bool:
+        if self.skill_mode == "step_only":
+            return bool(parsed.get("step_skills"))
+        return bool(str(parsed.get("episode_skill", "")).strip())
 
     def _analyze_episode_with_openai(
         self,
@@ -332,8 +341,9 @@ class OPIDEpisodeAnalyzer:
                     exc,
                 )
                 continue
-            if not str(parsed.get("episode_skill", "")).strip():
-                last_error = ValueError("OPID analyzer response missing required field: episode_skill")
+            if not self._analysis_has_required_skill(parsed):
+                missing_field = "step_skills" if self.skill_mode == "step_only" else "episode_skill"
+                last_error = ValueError(f"OPID analyzer response missing required field: {missing_field}")
                 logger.warning(
                     "OPID analyzer JSON parse failed on attempt %s/%s: %s",
                     parse_attempt + 1,
@@ -399,7 +409,18 @@ class OPIDEpisodeAnalyzer:
                 original_user_prompt = str(message.get("content", ""))
                 break
         invalid_preview = str(invalid_response or "")[-2000:]
-        schema_text = """{
+        if self.skill_mode == "step_only":
+            schema_text = """{
+  "episode_summary": "string",
+  "step_skills": {}
+}"""
+        elif self.skill_mode == "episode_only":
+            schema_text = """{
+  "episode_summary": "string",
+  "episode_skill": "string"
+}"""
+        else:
+            schema_text = """{
   "episode_summary": "string",
   "episode_skill": "string",
   "step_skills": {}
@@ -472,6 +493,69 @@ Return ONLY one valid JSON object with this exact shape:
             "from the candidate set as entries in step_skills; use the full episode to infer the skill, "
             "but phrase each skill as advice the policy can act on at that step."
         )
+        if self.skill_mode == "step_only":
+            prompt_text = f"""Analyze the following agent episode and return ONLY valid JSON.
+
+You need to complete two fields:
+1. {summary_instruction}
+2. {selection_instruction}
+
+Important constraints:
+- Step indexing is 0-based: step 0 is the first step of the trajectory.
+- Use the task description together with the episode context to judge progress and mistakes.
+- Use the full episode context to identify what each critical step should have done better.
+- Each step_skills value should be one short imperative sentence for the policy at that step.
+- Write step_skills as policy-facing skills, not as retrospective explanation of the trajectory.
+- Return only these top-level fields: episode_summary, step_skills.
+- The chosen steps are exactly the keys present in step_skills.
+- Do not return episode_skill.
+
+Return format:
+{{
+  "episode_summary": "string",
+  "step_skills": {{
+    "0": "skill for step 0",
+    "2": "skill for step 2"
+  }}
+}}
+
+Episode context:
+- Task description: {task_description or "(not available)"}
+- episode_success: {outcome_label}
+- Candidate step indices: {list(candidate_step_indices)}
+- Interaction trajectory: {self._format_episode_steps(steps)}
+"""
+            return build_prompt_dict(user_prompt=prompt_text)
+
+        if self.skill_mode == "episode_only":
+            prompt_text = f"""Analyze the following agent episode and return ONLY valid JSON.
+
+You need to complete two fields:
+1. {summary_instruction}
+2. {episode_skill_instruction}
+
+Important constraints:
+- Step indexing is 0-based: step 0 is the first step of the trajectory.
+- Use the task description together with the episode context to judge progress and mistakes.
+- Write episode_skill as one short policy-facing skill, not as retrospective explanation of the trajectory.
+- This episode_skill will be applied to every selected step in the trajectory.
+- Return only these top-level fields: episode_summary, episode_skill.
+- Do not return step_skills.
+
+Return format:
+{{
+  "episode_summary": "string",
+  "episode_skill": "string"
+}}
+
+Episode context:
+- Task description: {task_description or "(not available)"}
+- episode_success: {outcome_label}
+- Candidate step indices: {list(candidate_step_indices)}
+- Interaction trajectory: {self._format_episode_steps(steps)}
+"""
+            return build_prompt_dict(user_prompt=prompt_text)
+
         prompt_text = f"""Analyze the following agent episode and return ONLY valid JSON.
 
 You need to complete all three fields:
@@ -516,9 +600,11 @@ Episode context:
                     step_skills[int(step_idx)] = str(skill)
                 except (TypeError, ValueError):
                     continue
+        if self.skill_mode == "episode_only":
+            step_skills = {}
         return {
             "episode_summary": str(parsed.get("episode_summary", "")),
-            "episode_skill": str(parsed.get("episode_skill", "")),
+            "episode_skill": "" if self.skill_mode == "step_only" else str(parsed.get("episode_skill", "")),
             "step_skills": step_skills,
         }
 
@@ -538,8 +624,9 @@ Episode context:
                 if error is not None:
                     last_error = error
 
+        preferred_field = "step_skills" if self.skill_mode == "step_only" else "episode_skill"
         for obj in decoded_objects:
-            if "episode_skill" in obj:
+            if preferred_field in obj:
                 return obj
         if decoded_objects:
             return decoded_objects[0]

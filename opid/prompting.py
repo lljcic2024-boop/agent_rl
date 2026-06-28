@@ -2,7 +2,15 @@ import re
 from typing import Any, Sequence, Tuple
 
 
+SKILL_MODES = ("episode_step", "step_only", "episode_only")
 SKILL_TEACHER_MODES = ("step_priority", "additive")
+
+
+def validate_skill_mode(mode: str) -> str:
+    mode = str(mode or "episode_step")
+    if mode not in SKILL_MODES:
+        raise ValueError(f"Unsupported OPID skill_mode: {mode}")
+    return mode
 
 
 def select_skill_teacher_sources(
@@ -11,12 +19,19 @@ def select_skill_teacher_sources(
     episode_skill_enabled: bool,
     step_skill_enabled: bool,
     mode: str = "step_priority",
+    skill_mode: str = "episode_step",
 ) -> Tuple[bool, bool]:
     """Return whether to score the episode-skill and step-skill prompts."""
+    skill_mode = validate_skill_mode(skill_mode)
     if mode not in SKILL_TEACHER_MODES:
         raise ValueError(f"Unsupported OPID skill_teacher_mode: {mode}")
 
     use_step_skill = bool(str(step_skill).strip()) and step_skill_enabled
+    if skill_mode == "step_only":
+        return False, use_step_skill
+    if skill_mode == "episode_only":
+        return episode_skill_enabled, False
+
     use_episode_skill = episode_skill_enabled and (mode == "additive" or not use_step_skill)
     return use_episode_skill, use_step_skill
 

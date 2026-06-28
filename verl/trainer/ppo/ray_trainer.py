@@ -67,9 +67,11 @@ from gigpo import core_gigpo
 from opid import analysis as core_opid
 
 from opid.prompting import (
+    SKILL_MODES,
     SKILL_TEACHER_MODES,
     build_augmented_observation_text,
     select_skill_teacher_sources,
+    validate_skill_mode,
 )
 from opid.skill_gen import SkillGenRewardConfig, compute_skill_gen_reward
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
@@ -1016,7 +1018,12 @@ class RayPPOTrainer:
         step_skill_teacher_advantage_w = float(
             OmegaConf.select(config, "algorithm.opid.step_skill_teacher_advantage_w") or 0.0
         )
+        skill_mode = str(OmegaConf.select(config, "algorithm.opid.skill_mode") or "episode_step")
         skill_teacher_mode = str(OmegaConf.select(config, "algorithm.opid.skill_teacher_mode") or "step_priority")
+        if skill_mode not in SKILL_MODES:
+            raise ValueError(
+                f"algorithm.opid.skill_mode must be one of {SKILL_MODES}, got {skill_mode!r}."
+            )
         if episode_skill_teacher_advantage_w < 0:
             raise ValueError("algorithm.opid.episode_skill_teacher_advantage_w must be non-negative.")
         if step_skill_teacher_advantage_w < 0:
@@ -1346,6 +1353,7 @@ class RayPPOTrainer:
                     "traj_uid": str(traj_uid),
                     "selector": selector,
                     "analysis_mode": analysis.get("analysis_mode"),
+                    "skill_mode": analysis.get("skill_mode", self._get_opid_skill_mode()),
                     "analysis_backend_requested": analysis.get(
                         "analysis_backend_requested",
                         self.config.algorithm.opid.analysis_backend,
@@ -1885,12 +1893,16 @@ class RayPPOTrainer:
                 backend=self.config.algorithm.opid.analysis_backend,
                 max_completion_tokens=self.config.algorithm.opid.analysis_max_completion_tokens,
                 max_step_skills_per_traj=max_step_skills_per_traj,
+                skill_mode=self._get_opid_skill_mode(),
             )
         return self._opid_analyzer
 
     def _get_opid_failure_success_threshold(self) -> float:
         threshold = OmegaConf.select(self.config, "algorithm.opid.failure_success_threshold")
         return 1.0 if threshold is None else float(threshold)
+
+    def _get_opid_skill_mode(self) -> str:
+        return validate_skill_mode(OmegaConf.select(self.config, "algorithm.opid.skill_mode") or "episode_step")
 
     def _build_opid_traj_success_map(self, batch: DataProto) -> Dict[object, float]:
         if "episode_success" in batch.non_tensor_batch:
@@ -1955,6 +1967,7 @@ class RayPPOTrainer:
         parsed["analysis_backend_used"] = "policy_vllm"
         parsed["analysis_error"] = parse_error
         parsed["analysis_mode"] = analysis_mode
+        parsed["skill_mode"] = analyzer.skill_mode
         parsed["task_description"] = task_description or analyzer._infer_task_description(steps)
         parsed["llm_prompt"] = prompt
         parsed["llm_raw_output"] = content
@@ -2293,6 +2306,8 @@ class RayPPOTrainer:
         def _has_successful_analysis(traj_uid: object, analysis: Dict[str, object]) -> bool:
             if analysis.get("analysis_error"):
                 return False
+            if self._get_opid_skill_mode() == "step_only":
+                return bool(analysis.get("step_skills"))
             return bool(str(analysis.get("episode_skill", "")).strip())
 
         successful_episode_analysis = {
@@ -2403,14 +2418,19 @@ class RayPPOTrainer:
         critical_preview = []
         step_skill_guided_steps = 0
         sdar_loss_enabled = self._is_opid_sdar_loss_enabled()
+        skill_mode = self._get_opid_skill_mode()
         episode_skill_teacher_weight = float(
             OmegaConf.select(self.config, "algorithm.opid.episode_skill_teacher_advantage_w") or 0.0
         )
         episode_skill_teacher_enabled = episode_skill_teacher_weight > 0.0 or sdar_loss_enabled
+        if skill_mode == "step_only":
+            episode_skill_teacher_enabled = False
         step_skill_teacher_enabled = (
             float(OmegaConf.select(self.config, "algorithm.opid.step_skill_teacher_advantage_w") or 0.0) > 0.0
             or sdar_loss_enabled
         )
+        if skill_mode == "episode_only":
+            step_skill_teacher_enabled = False
         skill_teacher_mode = str(
             OmegaConf.select(self.config, "algorithm.opid.skill_teacher_mode") or "step_priority"
         )
@@ -2419,6 +2439,8 @@ class RayPPOTrainer:
         metrics["opid/episode_skill_teacher_skipped_zero_weight"] = (
             0.0 if episode_skill_teacher_enabled else 1.0
         )
+        metrics["opid/skill_mode_step_only"] = 1.0 if skill_mode == "step_only" else 0.0
+        metrics["opid/skill_mode_episode_only"] = 1.0 if skill_mode == "episode_only" else 0.0
         metrics["opid/skill_teacher_mode_additive"] = 1.0 if skill_teacher_mode == "additive" else 0.0
 
         for sample_idx in critical_indices:
@@ -2441,6 +2463,7 @@ class RayPPOTrainer:
                 episode_skill_enabled=episode_skill_teacher_enabled,
                 step_skill_enabled=step_skill_teacher_enabled,
                 mode=skill_teacher_mode,
+                skill_mode=skill_mode,
             )
             if use_episode_skill:
                 episode_enhanced_obs = build_augmented_observation_text(

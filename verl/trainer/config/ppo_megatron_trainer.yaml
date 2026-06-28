@@ -297,6 +297,7 @@ algorithm:
     step_advantage_w: 0.0 # OPID uses episode-level advantage only.
     episode_skill_teacher_advantage_w: 1.0
     step_skill_teacher_advantage_w: 0.0
+    skill_mode: "episode_step" # "episode_step" generates episode_skill + step_skills; "step_only" uses step_skills only; "episode_only" applies episode_skill to all selected steps
     skill_teacher_mode: "step_priority"
     opd_start_after_steps: null
     opd_stop_after_steps: null

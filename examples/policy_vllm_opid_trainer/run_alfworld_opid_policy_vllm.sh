@@ -21,6 +21,7 @@ OPID_MODE=${OPID_MODE:-mean_std_norm}
 OPID_STEP_ADV_W=${OPID_STEP_ADV_W:-0.0}
 OPID_EPISODE_SKILL_TEACHER_ADV_W=${OPID_EPISODE_SKILL_TEACHER_ADV_W:-0.0}
 OPID_STEP_SKILL_TEACHER_ADV_W=${OPID_STEP_SKILL_TEACHER_ADV_W:-0.0}
+OPID_SKILL_MODE=${OPID_SKILL_MODE:-episode_step}
 OPID_SKILL_TEACHER_MODE=${OPID_SKILL_TEACHER_MODE:-step_priority}
 OPID_OPD_START_AFTER_STEPS=${OPID_OPD_START_AFTER_STEPS:-null}
 OPID_OPD_STOP_AFTER_STEPS=${OPID_OPD_STOP_AFTER_STEPS:-null}
@@ -99,6 +100,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.opid.step_advantage_w=$OPID_STEP_ADV_W \
     algorithm.opid.episode_skill_teacher_advantage_w=$OPID_EPISODE_SKILL_TEACHER_ADV_W \
     algorithm.opid.step_skill_teacher_advantage_w=$OPID_STEP_SKILL_TEACHER_ADV_W \
+    algorithm.opid.skill_mode=$OPID_SKILL_MODE \
     algorithm.opid.skill_teacher_mode=$OPID_SKILL_TEACHER_MODE \
     algorithm.opid.opd_start_after_steps=$OPID_OPD_START_AFTER_STEPS \
     algorithm.opid.opd_stop_after_steps=$OPID_OPD_STOP_AFTER_STEPS \

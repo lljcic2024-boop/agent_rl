@@ -72,6 +72,46 @@ def test_additive_uses_only_episode_skill_without_step_skill():
     ) == (True, False)
 
 
+def test_step_only_uses_step_skill_without_episode_fallback():
+    assert select_skill_teacher_sources(
+        step_skill="Check the receptacle first.",
+        episode_skill_enabled=True,
+        step_skill_enabled=True,
+        mode="additive",
+        skill_mode="step_only",
+    ) == (False, True)
+
+
+def test_step_only_skips_when_step_skill_missing():
+    assert select_skill_teacher_sources(
+        step_skill="",
+        episode_skill_enabled=True,
+        step_skill_enabled=True,
+        mode="step_priority",
+        skill_mode="step_only",
+    ) == (False, False)
+
+
+def test_episode_only_uses_episode_skill_even_when_step_skill_available():
+    assert select_skill_teacher_sources(
+        step_skill="Check the receptacle first.",
+        episode_skill_enabled=True,
+        step_skill_enabled=True,
+        mode="additive",
+        skill_mode="episode_only",
+    ) == (True, False)
+
+
+def test_episode_only_uses_episode_skill_without_step_skill():
+    assert select_skill_teacher_sources(
+        step_skill="",
+        episode_skill_enabled=True,
+        step_skill_enabled=True,
+        mode="step_priority",
+        skill_mode="episode_only",
+    ) == (True, False)
+
+
 def test_skill_teacher_mode_rejects_unknown_mode():
     with pytest.raises(ValueError, match="Unsupported OPID skill_teacher_mode"):
         select_skill_teacher_sources(
