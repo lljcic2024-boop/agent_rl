@@ -8,19 +8,19 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 # Model, data, and rollout scale.
 MODELS_ROOT=${MODELS_ROOT:?Please set MODELS_ROOT}
-MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-3B-Instruct}
+MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-7B-Instruct}
 TRAIN_DATA_SIZE=16
 VAL_DATA_SIZE=128
 GROUP_SIZE=8
 NUM_CPUS_PER_ENV_WORKER=0.1
 
 # GiGPO advantage.
-GIGPO_MODE=mean_norm
+GIGPO_MODE=mean_std_norm
 GIGPO_STEP_ADV_W=${GIGPO_STEP_ADV_W:-0.0}
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_alfworld
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen2.5_3b_alfworld}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen2.5_7b_alfworld_mean-std-norm}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.

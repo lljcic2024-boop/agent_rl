@@ -21,7 +21,7 @@ export OPID_SKILL_GEN_FAILED_REWARD_MODE=${OPID_SKILL_GEN_FAILED_REWARD_MODE:-ne
 
 export EXPERIMENT_NAME=${EXPERIMENT_NAME:-opid-sdar-skill-gen-grpo_qwen2.5_3b_alfworld_policy-vllm_negate_exp3}
 
-exec "$SCRIPT_DIR/../policy_vllm_opid_trainer/run_alfworld_opid_policy_vllm.sh" \
+exec "$SCRIPT_DIR/run_alfworld_opid_policy_vllm.sh" \
     actor_rollout_ref.actor.skill_gen_loss_coef=$OPID_SKILL_GEN_LOSS_COEF \
     actor_rollout_ref.actor.skill_gen_micro_batch_size_per_gpu=$OPID_SKILL_GEN_MICRO_BATCH_SIZE_PER_GPU \
     algorithm.opid.skill_mode=$OPID_SKILL_MODE \

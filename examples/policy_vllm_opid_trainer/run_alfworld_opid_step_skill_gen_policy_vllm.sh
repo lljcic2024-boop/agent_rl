@@ -7,4 +7,4 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export OPID_SKILL_MODE=${OPID_SKILL_MODE:-step_only}
 export EXPERIMENT_NAME=${EXPERIMENT_NAME:-opid-sdar-step-skill-gen-grpo_qwen2.5_3b_alfworld_policy-vllm_exp2}
 
-exec "$SCRIPT_DIR/../policy_vllm_opid_skill_gen_trainer/run_alfworld_opid_skill_gen_policy_vllm.sh" "$@"
+exec "$SCRIPT_DIR/run_alfworld_opid_skill_gen_policy_vllm.sh" "$@"
