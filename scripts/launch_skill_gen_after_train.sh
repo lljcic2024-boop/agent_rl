@@ -42,7 +42,7 @@ done
 source .env
 unset PYTORCH_CUDA_ALLOC_CONF
 echo "[$(date)] Starting skill_gen training. conda=${CONDA_DEFAULT_ENV:-unknown}, cwd=$(pwd)"
-bash examples/policy_vllm_opid_skill_gen_trainer/run_alfworld_opid_skill_gen_policy_vllm.sh
+bash examples/policy_vllm_opid_trainer/run_alfworld_opid_skill_gen_policy_vllm.sh
 status=$?
 echo "[$(date)] skill_gen training exited with status $status"
 exit "$status"

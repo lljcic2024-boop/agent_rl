@@ -2232,6 +2232,7 @@ class RayPPOTrainer:
             traj_index=batch.non_tensor_batch["traj_uid"],
             step_indices=step_indices,
             step_rewards=batch.batch["step_rewards"] if "step_rewards" in batch.batch.keys() else None,
+            action_valids=batch.non_tensor_batch.get("is_action_valid"),
         )
         if episodes:
             episode_lengths = [len(steps) for steps in episodes.values()]

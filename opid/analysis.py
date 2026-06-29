@@ -168,6 +168,7 @@ def build_episode_records(
     step_indices: Sequence,
     step_rewards: Optional[torch.Tensor] = None,
     obs_raws: Optional[Sequence] = None,
+    action_valids: Optional[Sequence] = None,
 ) -> Dict[object, List[Dict[str, object]]]:
     """Decode trajectories into step records for analysis.
 
@@ -209,6 +210,8 @@ def build_episode_records(
             step_record["task_description"] = task_description
         if reward_np is not None:
             step_record["step_reward"] = float(reward_np[sample_idx])
+        if action_valids is not None:
+            step_record["action_valid"] = bool(action_valids[sample_idx])
         episodes[traj_uid].append(step_record)
 
     for traj_uid in episodes:
@@ -502,13 +505,11 @@ You need to complete two fields:
 
 Important constraints:
 - Step indexing is 0-based: step 0 is the first step of the trajectory.
-- Use the task description together with the episode context to judge progress and mistakes.
 - Use the full episode context to identify what each critical step should have done better.
 - Each step_skills value should be one short imperative sentence for the policy at that step.
 - Write step_skills as policy-facing skills, not as retrospective explanation of the trajectory.
 - Return only these top-level fields: episode_summary, step_skills.
 - The chosen steps are exactly the keys present in step_skills.
-- Do not return episode_skill.
 
 Return format:
 {{
@@ -535,12 +536,8 @@ You need to complete two fields:
 2. {episode_skill_instruction}
 
 Important constraints:
-- Step indexing is 0-based: step 0 is the first step of the trajectory.
-- Use the task description together with the episode context to judge progress and mistakes.
 - Write episode_skill as one short policy-facing skill, not as retrospective explanation of the trajectory.
-- This episode_skill will be applied to every selected step in the trajectory.
 - Return only these top-level fields: episode_summary, episode_skill.
-- Do not return step_skills.
 
 Return format:
 {{
@@ -551,7 +548,6 @@ Return format:
 Episode context:
 - Task description: {task_description or "(not available)"}
 - episode_success: {outcome_label}
-- Candidate step indices: {list(candidate_step_indices)}
 - Interaction trajectory: {self._format_episode_steps(steps)}
 """
             return build_prompt_dict(user_prompt=prompt_text)
@@ -565,7 +561,6 @@ You need to complete all three fields:
 
 Important constraints:
 - Step indexing is 0-based: step 0 is the first step of the trajectory.
-- Use the task description together with the episode context to judge progress and mistakes.
 - Use the full episode context to identify what each critical step should have done better.
 - Each step_skills value should be one short imperative sentence for the policy at that step.
 - Write step_skills as policy-facing skills, not as retrospective explanation of the trajectory.
@@ -715,12 +710,12 @@ Episode context:
     def _format_episode_steps(self, steps: List[Dict[str, object]]) -> str:
         step_lines = []
         for step in steps:
-            reward_str = ""
-            if "step_reward" in step:
-                reward_str = f"\nReturn: {step['step_reward']:.6f}"
+            action_valid_str = ""
+            if "action_valid" in step:
+                action_valid_str = f"\nAction valid: {str(bool(step['action_valid'])).lower()}"
             step_lines.append(
                 f"Step {step['step_index']}\n"
                 f"Observation: {step['observation']}\n"
-                f"Response: {step['response']}{reward_str}\n"
+                f"Response: {step['response']}{action_valid_str}\n"
             )
         return "".join(step_lines)
