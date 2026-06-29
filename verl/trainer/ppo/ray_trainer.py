@@ -645,6 +645,7 @@ class RayPPOTrainer:
             too_long_penalty=float(_select("too_long_penalty", 0.2)),
             max_output_chars=int(_select("max_output_chars", 1200)),
             reward_clip=None if reward_clip is None else float(reward_clip),
+            failed_reward_mode=str(_select("failed_reward_mode", "zero")),
         )
 
     def _collect_opid_skill_gen_samples(

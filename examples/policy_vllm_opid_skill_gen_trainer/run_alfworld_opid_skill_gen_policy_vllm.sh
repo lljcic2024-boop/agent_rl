@@ -17,8 +17,9 @@ export OPID_SKILL_GEN_NON_EMPTY_SKILL_BONUS=${OPID_SKILL_GEN_NON_EMPTY_SKILL_BON
 export OPID_SKILL_GEN_TOO_LONG_PENALTY=${OPID_SKILL_GEN_TOO_LONG_PENALTY:-0.0}
 export OPID_SKILL_GEN_MAX_OUTPUT_CHARS=${OPID_SKILL_GEN_MAX_OUTPUT_CHARS:-1200}
 export OPID_SKILL_GEN_REWARD_CLIP=${OPID_SKILL_GEN_REWARD_CLIP:-2.0}
+export OPID_SKILL_GEN_FAILED_REWARD_MODE=${OPID_SKILL_GEN_FAILED_REWARD_MODE:-negate}
 
-export EXPERIMENT_NAME=${EXPERIMENT_NAME:-opid-sdar-skill-gen-grpo_qwen2.5_3b_alfworld_policy-vllm_exp3}
+export EXPERIMENT_NAME=${EXPERIMENT_NAME:-opid-sdar-skill-gen-grpo_qwen2.5_3b_alfworld_policy-vllm_negate_exp3}
 
 exec "$SCRIPT_DIR/../policy_vllm_opid_trainer/run_alfworld_opid_policy_vllm.sh" \
     actor_rollout_ref.actor.skill_gen_loss_coef=$OPID_SKILL_GEN_LOSS_COEF \
@@ -31,4 +32,5 @@ exec "$SCRIPT_DIR/../policy_vllm_opid_trainer/run_alfworld_opid_policy_vllm.sh" 
     algorithm.opid.skill_gen.too_long_penalty=$OPID_SKILL_GEN_TOO_LONG_PENALTY \
     algorithm.opid.skill_gen.max_output_chars=$OPID_SKILL_GEN_MAX_OUTPUT_CHARS \
     algorithm.opid.skill_gen.reward_clip=$OPID_SKILL_GEN_REWARD_CLIP \
+    algorithm.opid.skill_gen.failed_reward_mode=$OPID_SKILL_GEN_FAILED_REWARD_MODE \
     "$@"
