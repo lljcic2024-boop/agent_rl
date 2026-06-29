@@ -41,7 +41,31 @@ def test_skill_gen_reward_zeros_downstream_gain_for_failed_episode():
     )
 
     assert reward["downstream_logprob_gain_on_success_steps"] == 0.0
+    assert reward["raw_downstream_logprob_gain"] == 1.0
+    assert reward["effective_downstream_logprob_gain"] == 0.0
     assert reward["reward"] == 0.0
+
+
+def test_skill_gen_reward_can_negate_downstream_gain_for_failed_episode():
+    reward = compute_skill_gen_reward(
+        downstream_logprob_gain=-0.4,
+        episode_success=0.0,
+        valid_json=True,
+        episode_skill="Avoid repeating the failed action.",
+        step_skills={},
+        raw_output="{}",
+        config=SkillGenRewardConfig(
+            valid_json_bonus=0.0,
+            non_empty_skill_bonus=0.0,
+            failed_reward_mode="negate",
+            reward_clip=None,
+        ),
+    )
+
+    assert reward["raw_downstream_logprob_gain"] == pytest.approx(-0.4)
+    assert reward["effective_downstream_logprob_gain"] == pytest.approx(0.4)
+    assert reward["downstream_logprob_gain_on_success_steps"] == pytest.approx(0.4)
+    assert reward["reward"] == pytest.approx(0.4)
 
 
 def test_skill_gen_reward_penalizes_too_long():

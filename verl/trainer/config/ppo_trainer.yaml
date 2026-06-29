@@ -297,6 +297,7 @@ algorithm:
       too_long_penalty: 0.0
       max_output_chars: 1200
       reward_clip: 2.0
+      failed_reward_mode: zero # "zero" ignores failed rollout gain; "negate" rewards skills that reduce failed-action logprob
     save_analysis: True
     analysis_dump_dir: null # null -> ${trainer.default_local_dir}/opid_analysis
     save_augmented_observations: True

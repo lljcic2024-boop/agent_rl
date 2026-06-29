@@ -10,6 +10,14 @@ class SkillGenRewardConfig:
     too_long_penalty: float = 0.2
     max_output_chars: int = 1200
     reward_clip: Optional[float] = 2.0
+    failed_reward_mode: str = "zero"
+
+
+def normalize_failed_reward_mode(mode: object) -> str:
+    mode = str(mode or "zero").lower()
+    if mode not in {"zero", "negate"}:
+        raise ValueError(f"Unsupported skill_gen failed_reward_mode: {mode}")
+    return mode
 
 
 def has_non_empty_skill(episode_skill: object, step_skills: object) -> bool:
@@ -44,9 +52,11 @@ def compute_skill_gen_reward(
     config: SkillGenRewardConfig,
 ) -> Dict[str, float]:
     success = episode_success is None or float(episode_success) >= 1.0
-    gain = float(downstream_logprob_gain)
+    raw_gain = float(downstream_logprob_gain)
+    gain = raw_gain
     if not success:
-        gain = 0.0
+        failed_reward_mode = normalize_failed_reward_mode(config.failed_reward_mode)
+        gain = -raw_gain if failed_reward_mode == "negate" else 0.0
 
     non_empty_skill = has_non_empty_skill(episode_skill, step_skills)
     raw_output_chars = len(str(raw_output or ""))
@@ -69,6 +79,8 @@ def compute_skill_gen_reward(
     return {
         "reward": float(reward),
         "downstream_logprob_gain_on_success_steps": float(downstream_component),
+        "raw_downstream_logprob_gain": float(raw_gain),
+        "effective_downstream_logprob_gain": float(gain),
         "valid_json_bonus": float(valid_json_component),
         "non_empty_skill_bonus": float(non_empty_component),
         "too_long_penalty": float(too_long_component),
