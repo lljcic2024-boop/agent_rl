@@ -15,12 +15,12 @@ GROUP_SIZE=8
 NUM_CPUS_PER_ENV_WORKER=0.1
 
 # GiGPO advantage.
-GIGPO_MODE=mean_norm
+GIGPO_MODE=mean_std_norm
 GIGPO_STEP_ADV_W=${GIGPO_STEP_ADV_W:-0.0}
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_webshop
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen2.5_3b_webshop}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen2.5_3b_webshop_mean-std-norm}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.

@@ -17,7 +17,7 @@ TRAIN_DATA="$HOME/data/searchR1_processed_direct/train.parquet"
 VAL_DATA="$HOME/data/searchR1_processed_direct/test.parquet"
 
 # GiGPO advantage.
-GIGPO_MODE=mean_norm
+GIGPO_MODE=mean_std_norm
 GIGPO_STEP_ADV_W=${GIGPO_STEP_ADV_W:-0.0}
 GIGPO_ENABLE_SIMILARITY=True
 GIGPO_SIMILARITY_THRESH=0.9

@@ -17,14 +17,14 @@ TRAIN_DATA="$HOME/data/searchR1_processed_direct/train.parquet"
 VAL_DATA="$HOME/data/searchR1_processed_direct/test.parquet"
 
 # GiGPO advantage.
-GIGPO_MODE=mean_norm
+GIGPO_MODE=mean_std_norm
 GIGPO_STEP_ADV_W=${GIGPO_STEP_ADV_W:-0.0}
 GIGPO_ENABLE_SIMILARITY=True
 GIGPO_SIMILARITY_THRESH=0.9
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_search
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen2.5_3b_search}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen2.5_3b_search_mean-std-norm}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.

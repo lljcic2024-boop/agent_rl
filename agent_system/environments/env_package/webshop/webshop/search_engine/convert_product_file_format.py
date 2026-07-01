@@ -1,12 +1,16 @@
 import sys
 import json
+import inspect
 from tqdm import tqdm
 sys.path.insert(0, '../')
 
 from web_agent_site.utils import DEFAULT_FILE_PATH, DEFAULT_ATTR_PATH
 from web_agent_site.engine.engine import load_products
 
-all_products, *_ = load_products(filepath=DEFAULT_FILE_PATH, attrpath=DEFAULT_ATTR_PATH)
+load_products_kwargs = {"filepath": DEFAULT_FILE_PATH}
+if "attrpath" in inspect.signature(load_products).parameters:
+    load_products_kwargs["attrpath"] = DEFAULT_ATTR_PATH
+all_products, *_ = load_products(**load_products_kwargs)
 
 
 docs = []

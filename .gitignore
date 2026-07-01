@@ -1,6 +1,5 @@
 gpu.sh
 ret.sh
-run.sh
 dl.sh
 test_api.py
 test_webshop.py

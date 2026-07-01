@@ -24,42 +24,43 @@ fi
 # Install Python Dependencies
 pip install -r requirements.txt;
 
-conda install mkl
-conda install -c conda-forge faiss-cpu
+conda install -y mkl
+conda install -y -c conda-forge faiss-cpu
 
 # Install Environment Dependencies via `conda`
 # conda install -c pytorch faiss-cpu;
-conda install -c conda-forge openjdk=11;
+conda install -y -c conda-forge openjdk=11;
 
-# # Download dataset into `data` folder via `gdown` command
-# mkdir -p data;
-# cd data;
-# if [ "$data" == "small" ]; then
-#   gdown https://drive.google.com/uc?id=1EgHdxQ_YxqIQlvvq5iKlCrkEKR6-j0Ib; # items_shuffle_1000 - product scraped info
-#   gdown https://drive.google.com/uc?id=1IduG0xl544V_A_jv3tHXC0kyFi7PnyBu; # items_ins_v2_1000 - product attributes
-# elif [ "$data" == "all" ]; then
-#   gdown https://drive.google.com/uc?id=1EgHdxQ_YxqIQlvvq5iKlCrkEKR6-j0Ib; # items_shuffle_1000 - product scraped info
-#   gdown https://drive.google.com/uc?id=1IduG0xl544V_A_jv3tHXC0kyFi7PnyBu; # items_ins_v2_1000 - product attributes
-#   gdown https://drive.google.com/uc?id=1A2whVgOO0euk5O13n2iYDM0bQRkkRduB; # items_shuffle
-#   gdown https://drive.google.com/uc?id=1s2j6NgHljiZzQNL3veZaAiyW_qDEgBNi; # items_ins_v2
-# else
-#   echo "[ERROR]: argument for `-d` flag not recognized"
-#   helpFunction
-# fi
-# gdown https://drive.google.com/uc?id=14Kb5SPBk_jfdLZ_CDBNitW98QLDlKR5O # items_human_ins
-# cd ..
+# Download dataset into `data` folder via `gdown` command
+mkdir -p data;
+cd data;
+if [ "$data" == "small" ]; then
+  gdown https://drive.google.com/uc?id=1EgHdxQ_YxqIQlvvq5iKlCrkEKR6-j0Ib; # items_shuffle_1000 - product scraped info
+  gdown https://drive.google.com/uc?id=1IduG0xl544V_A_jv3tHXC0kyFi7PnyBu; # items_ins_v2_1000 - product attributes
+elif [ "$data" == "all" ]; then
+  gdown https://drive.google.com/uc?id=1EgHdxQ_YxqIQlvvq5iKlCrkEKR6-j0Ib; # items_shuffle_1000 - product scraped info
+  gdown https://drive.google.com/uc?id=1IduG0xl544V_A_jv3tHXC0kyFi7PnyBu; # items_ins_v2_1000 - product attributes
+  gdown https://drive.google.com/uc?id=1A2whVgOO0euk5O13n2iYDM0bQRkkRduB; # items_shuffle
+  gdown https://drive.google.com/uc?id=1s2j6NgHljiZzQNL3veZaAiyW_qDEgBNi; # items_ins_v2
+else
+  echo "[ERROR]: argument for `-d` flag not recognized"
+  helpFunction
+fi
+gdown https://drive.google.com/uc?id=14Kb5SPBk_jfdLZ_CDBNitW98QLDlKR5O # items_human_ins
+cd ..
 
-# # Download spaCy large NLP model
-# python -m spacy download en_core_web_lg
-# python -m spacy download en_core_web_sm
+# Install spaCy NLP models directly to avoid version-resolution download URLs.
+SPACY_MODEL_VERSION="${SPACY_MODEL_VERSION:-3.7.1}"
+python -m pip install "https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-${SPACY_MODEL_VERSION}/en_core_web_lg-${SPACY_MODEL_VERSION}-py3-none-any.whl"
+python -m pip install "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-${SPACY_MODEL_VERSION}/en_core_web_sm-${SPACY_MODEL_VERSION}-py3-none-any.whl"
 
-# # Build search engine index
-# cd search_engine
-# mkdir -p resources resources_100 resources_1k resources_100k
-# python convert_product_file_format.py # convert items.json => required doc format
-# mkdir -p indexes
-# ./run_indexing.sh
-# cd ..
+# Build search engine index
+cd search_engine
+mkdir -p resources resources_100 resources_1k resources_100k
+python convert_product_file_format.py # convert items.json => required doc format
+mkdir -p indexes
+./run_indexing.sh
+cd ..
 
 # Create logging folder + samples of log data
 # get_human_trajs () {
