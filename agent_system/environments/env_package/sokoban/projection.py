@@ -19,7 +19,7 @@ from typing import List
 import re
 
 
-def sokoban_projection(actions: List[str]):
+def sokoban_projection(actions: List[str], require_think: bool = True):
     """
     A function to process the actions.
     actions: the list of actions to be processed, it is a list of strings.
@@ -76,10 +76,11 @@ def sokoban_projection(actions: List[str]):
             # randomly choose an action from the action list if illegal
             actions[i] = 0
 
-        # check <think>...</think>
-        think_start_idx = original_str.find("<think>")
-        think_end_idx = original_str.find("</think>")
-        if think_start_idx == -1 or think_end_idx == -1:
-            valids[i] = 0
+        if require_think:
+            # check <think>...</think>
+            think_start_idx = original_str.find("<think>")
+            think_end_idx = original_str.find("</think>")
+            if think_start_idx == -1 or think_end_idx == -1:
+                valids[i] = 0
 
     return actions, valids

@@ -19,7 +19,7 @@ from typing import List
 import re
 
 
-def appworld_projection(actions: List[str]):
+def appworld_projection(actions: List[str], require_think: bool = True):
     """
     An function to process the actions
     actions: the list of actions to be processeed, it is a list of strings.
@@ -53,10 +53,11 @@ def appworld_projection(actions: List[str]):
             valids[i] = 0
             actions[i] = extracted_action
 
-        # check <think>...</think>
-        think_start_idx = original_str.find("<think>")
-        think_end_idx = original_str.find("</think>")
-        if think_start_idx == -1 or think_end_idx == -1:
-            valids[i] = 0
+        if require_think:
+            # check <think>...</think>
+            think_start_idx = original_str.find("<think>")
+            think_end_idx = original_str.find("</think>")
+            if think_start_idx == -1 or think_end_idx == -1:
+                valids[i] = 0
 
     return actions, valids

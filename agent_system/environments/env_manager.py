@@ -42,6 +42,73 @@ def set_gamefile(infos, gamefile):
     return infos
 
 
+def _config_select(config, key, default=None):
+    try:
+        value = OmegaConf.select(config, key)
+    except Exception:
+        return default
+    return default if value is None else value
+
+
+def _path_or_config_suggests_qwen3(model_path) -> bool:
+    if not model_path:
+        return False
+
+    model_path = str(model_path)
+    if "qwen3" in model_path.lower():
+        return True
+
+    config_path = os.path.join(os.path.expanduser(model_path), "config.json")
+    if not os.path.isfile(config_path):
+        return False
+
+    try:
+        import json
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            model_config = json.load(f)
+    except Exception:
+        return False
+
+    fields = [
+        model_config.get("model_type"),
+        model_config.get("tokenizer_class"),
+        *(model_config.get("architectures") or []),
+    ]
+    return any("qwen3" in str(field).lower() for field in fields if field)
+
+
+def _is_qwen3_policy_model(config) -> bool:
+    model_paths = [
+        _config_select(config, "actor_rollout_ref.model.path"),
+        _config_select(config, "data.tokenizer"),
+    ]
+    return any(_path_or_config_suggests_qwen3(path) for path in model_paths)
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _projection_requires_think(config) -> bool:
+    explicit = _config_select(config, "env.projection_require_think")
+    if explicit is None:
+        explicit = _config_select(config, "env.require_think")
+    if explicit is not None:
+        return _as_bool(explicit)
+
+    if not _is_qwen3_policy_model(config):
+        return True
+
+    enable_thinking = _config_select(config, "data.apply_chat_template_kwargs.enable_thinking")
+    if enable_thinking is None:
+        return True
+
+    return _as_bool(enable_thinking)
+
+
 class SearchEnvironmentManager(EnvironmentManagerBase):
     """
     EnvironmentManager for SearchEnv.
@@ -1005,6 +1072,7 @@ def make_envs(config):
         raise ValueError("config.env.rollout.n should be an integer")
     group_n = config.env.rollout.n if config.env.rollout.n > 0 else 1
     resources_per_worker = OmegaConf.to_container(config.env.resources_per_worker, resolve=True)
+    projection_require_think = _projection_requires_think(config)
 
     if "search" in config.env.env_name.lower():
         from agent_system.environments.env_package.search import build_search_envs, search_projection
@@ -1039,7 +1107,7 @@ def make_envs(config):
         _envs = build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
         _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
         
-        projection_f = partial(alfworld_projection)
+        projection_f = partial(alfworld_projection, require_think=projection_require_think)
         envs = AlfWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AlfWorldEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
@@ -1054,7 +1122,7 @@ def make_envs(config):
         _envs = build_sokoban_envs(config.env.seed, config.data.train_batch_size, group_n, mode=config.env.sokoban.mode, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
         _val_envs = build_sokoban_envs(config.env.seed + 1000, config.data.val_batch_size, 1, mode=config.env.sokoban.mode, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
         
-        projection_f = partial(sokoban_projection)
+        projection_f = partial(sokoban_projection, require_think=projection_require_think)
         envs = SokobanEnvironmentManager(_envs, projection_f, config)
         val_envs = SokobanEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
@@ -1076,7 +1144,7 @@ def make_envs(config):
         _envs = build_webshop_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
         _val_envs = build_webshop_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
 
-        projection_f = partial(webshop_projection)
+        projection_f = partial(webshop_projection, require_think=projection_require_think)
         envs = WebshopEnvironmentManager(_envs, projection_f, config)
         val_envs = WebshopEnvironmentManager(_val_envs, projection_f, config)
         import time
@@ -1087,7 +1155,7 @@ def make_envs(config):
         _envs = build_appworld_envs(dataset_name='train', seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, start_server_id=0, resources_per_worker=resources_per_worker)
         _val_envs = build_appworld_envs(dataset_name='test_normal', seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, start_server_id=config.data.train_batch_size*group_n, resources_per_worker=resources_per_worker)
         
-        projection_f = partial(appworld_projection)
+        projection_f = partial(appworld_projection, require_think=projection_require_think)
         envs = AppWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AppWorldEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
@@ -1131,7 +1199,7 @@ def make_envs(config):
         )
 
         # Create projection function
-        projection_f = partial(sciworld_projection)
+        projection_f = partial(sciworld_projection, require_think=projection_require_think)
 
         # Create environment managers
         envs = SciWorldEnvironmentManager(_envs, projection_f, config)

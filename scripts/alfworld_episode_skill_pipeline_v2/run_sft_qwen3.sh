@@ -22,10 +22,10 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 MICRO_BATCH_SIZE_PER_GPU="${MICRO_BATCH_SIZE_PER_GPU:-1}"
 ULYSSES_SEQUENCE_PARALLEL_SIZE="${ULYSSES_SEQUENCE_PARALLEL_SIZE:-1}"
 EXPORT_MODEL_AFTER_TRAIN="${EXPORT_MODEL_AFTER_TRAIN:-true}"
-EXPORT_MODEL_NAME="${EXPORT_MODEL_NAME:-Qwen2.5-3B-Instruct-alfworld-episode-skill-sft}"
+EXPORT_MODEL_NAME="${EXPORT_MODEL_NAME:-Qwen3-1.7B-alfworld-episode-skill-sft}"
 TRAINER_LOGGER="${TRAINER_LOGGER:-['console','wandb']}"
 
-DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/alfworld_episode_skill_pipeline_v2_qwen25_3b}"
+DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/alfworld_episode_skill_pipeline_v2_qwen3_1_7b}"
 TRAIN_DATA="${TRAIN_DATA:-$DATA_DIR/sft_episode_skill_train.parquet}"
 VAL_DATA="${VAL_DATA:-$DATA_DIR/sft_episode_skill_val.parquet}"
 
@@ -34,15 +34,15 @@ if [[ -z "${MODEL_PATH:-}" ]]; then
         echo "Please set MODELS_ROOT in $ENV_FILE, or set MODEL_PATH explicitly." >&2
         exit 1
     fi
-    MODEL_PATH="$MODELS_ROOT/Qwen2.5-3B-Instruct"
+    MODEL_PATH="$MODELS_ROOT/Qwen3-1.7B"
 fi
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 PROJECT_NAME="${PROJECT_NAME:-alfworld-episode-skill-sft}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen25-3b-alfworld-episode-skill-sft-v2-ep${TOTAL_EPOCHS}}"
-OUTPUT_DIR="${OUTPUT_DIR:-$MODELS_ROOT/outputs/sft/alfworld_episode_skill_analyzer_v2_qwen25_3b_ep${TOTAL_EPOCHS}_${RUN_ID}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3-1.7b-alfworld-episode-skill-sft-v2-ep${TOTAL_EPOCHS}}"
+OUTPUT_DIR="${OUTPUT_DIR:-$MODELS_ROOT/outputs/sft/alfworld_episode_skill_analyzer_v2_qwen3_1_7b_ep${TOTAL_EPOCHS}_${RUN_ID}}"
 LOG_DIR="${LOG_DIR:-$MODELS_ROOT/logs/sft}"
-LOG_FILE="${LOG_FILE:-$LOG_DIR/alfworld_episode_skill_analyzer_v2_qwen25_3b_ep${TOTAL_EPOCHS}_${RUN_ID}.log}"
+LOG_FILE="${LOG_FILE:-$LOG_DIR/alfworld_episode_skill_analyzer_v2_qwen3_1_7b_ep${TOTAL_EPOCHS}_${RUN_ID}.log}"
 if [[ "$EXPORT_MODEL_AFTER_TRAIN" == "true" ]]; then
     if [[ -z "${MODELS_ROOT:-}" && -z "${EXPORT_MODEL_DIR:-}" ]]; then
         echo "Please set MODELS_ROOT in $ENV_FILE, or set EXPORT_MODEL_DIR explicitly." >&2
@@ -67,7 +67,7 @@ fi
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 cd "$PROJECT_ROOT"
 
-echo "Running ALFWorld episode-skill SFT v2"
+echo "Running ALFWorld episode-skill SFT v2 for Qwen3"
 echo "  conda env:      $CONDA_ENV"
 echo "  model:          $MODEL_PATH"
 echo "  train data:     $TRAIN_DATA"
@@ -80,6 +80,7 @@ echo "  nproc:          $NPROC_PER_NODE"
 echo "  sp size:        $ULYSSES_SEQUENCE_PARALLEL_SIZE"
 echo "  logger:         $TRAINER_LOGGER"
 echo "  wandb mode:     ${WANDB_MODE:-unset}"
+echo "  qwen3 thinking: disabled"
 echo "  export model:   $EXPORT_MODEL_AFTER_TRAIN"
 if [[ "$EXPORT_MODEL_AFTER_TRAIN" == "true" ]]; then
     echo "  export dir:     $EXPORT_MODEL_DIR"
@@ -100,6 +101,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
     data.response_dict_keys=[] \
     data.max_length="$MAX_LENGTH" \
     data.truncation=error \
+    +data.apply_chat_template_kwargs.enable_thinking=False \
     model.partial_pretrain="$MODEL_PATH" \
     model.enable_gradient_checkpointing=True \
     optim.lr="$LR" \
