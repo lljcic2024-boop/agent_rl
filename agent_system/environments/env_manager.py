@@ -24,6 +24,23 @@ from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory
 from omegaconf import OmegaConf
 
+def _config_bool(config, key: str, default: bool = False) -> bool:
+    value = OmegaConf.select(config, key)
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+def _lhop_enabled(config) -> bool:
+    return _config_bool(config, "algorithm.lhop.enable", False)
+
+def _lhop_teacher_history_length(config):
+    value = OmegaConf.select(config, "algorithm.lhop.teacher_history_length")
+    if value is None:
+        return None
+    return int(value)
+
 def parse_gamefile(infos):
     gamefile = []
     for info in infos:
@@ -317,7 +334,16 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             self.retrieved_memories = None
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
-        return {'text': full_text_obs, 'text_base': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
+        observations = {'text': full_text_obs, 'text_base': full_text_obs, 'image': image_obs, 'anchor': text_obs}
+        if _lhop_enabled(self.config):
+            teacher_history_length = _lhop_teacher_history_length(self.config)
+            observations['text_teacher'] = self.build_text_obs(
+                text_obs,
+                self.envs.get_admissible_commands,
+                init=True,
+                history_length=teacher_history_length,
+            )
+        return observations, infos
     
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
@@ -326,6 +352,14 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.pre_text_obs = text_obs
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
+        teacher_text_obs = None
+        if _lhop_enabled(self.config):
+            teacher_history_length = _lhop_teacher_history_length(self.config)
+            teacher_text_obs = self.build_text_obs(
+                text_obs,
+                self.envs.get_admissible_commands,
+                history_length=teacher_history_length,
+            )
         if infos[0].get("extra.gamefile") is None:
             infos = set_gamefile(infos, self.gamefile)
 
@@ -334,6 +368,8 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             info['is_action_valid'] = to_numpy(valids[i])
 
         next_observations = {'text': full_text_obs, 'text_base': full_text_obs, 'image': image_obs, 'anchor': text_obs}
+        if teacher_text_obs is not None:
+            next_observations['text_teacher'] = teacher_text_obs
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
@@ -349,16 +385,23 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 raise ValueError("Task description not found in text observation.")
         
 
-    def build_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
+    def build_text_obs(
+        self,
+        text_obs: List[str],
+        admissible_actions: List[List[str]],
+        init: bool = False,
+        history_length: int = None,
+    ) -> List[str]:
         """
         This function builds the text observation for the agent.
         """
         postprocess_text_obs = []
         memory_contexts = [""] * len(text_obs)
         valid_lens = [0] * len(text_obs)
-        if not init and self.config.env.history_length > 0:
+        effective_history_length = self.config.env.history_length if history_length is None else int(history_length)
+        if not init and effective_history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(
-                    self.config.env.history_length,
+                    effective_history_length,
                     obs_key="text_obs",
                     action_key="action")
 
@@ -389,7 +432,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
-            elif init or self.config.env.history_length <= 0:
+            elif init or effective_history_length <= 0:
                 obs = ALFWORLD_TEMPLATE_NO_HIS.format(
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions

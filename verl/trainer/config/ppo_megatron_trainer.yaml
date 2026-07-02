@@ -293,6 +293,11 @@ algorithm:
     mode: "mean_norm"
     enable_similarity: False
     similarity_thresh: 0.95
+  lhop:
+    enable: False
+    teacher_history_length: null
+    max_prompt_length: null
+    skip_if_same_prompt: True
   opid:
     step_advantage_w: 0.0 # OPID uses episode-level advantage only.
     episode_skill_teacher_advantage_w: 1.0

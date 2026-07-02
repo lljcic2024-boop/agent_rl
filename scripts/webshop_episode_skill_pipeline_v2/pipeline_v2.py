@@ -62,6 +62,7 @@ OUTPUT_FILES = [
     "sft_episode_skill_all.jsonl",
     "sft_episode_skill_train.parquet",
     "sft_episode_skill_val.parquet",
+    "sft_filter_metrics.json",
     "metrics.json",
     "progress.json",
     "run_config.json",
@@ -125,6 +126,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skill-extra-body-json", default=None)
     parser.add_argument("--skill-gen-workers", type=int, default=128)
     parser.add_argument("--sft-val-ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--sft-min-source-score",
+        type=float,
+        default=0.0,
+        help=(
+            "Keep parseable SFT examples whose source final_task_score is at least this value. "
+            "Successful examples can still be kept by --sft-include-success."
+        ),
+    )
+    parser.add_argument(
+        "--sft-include-success",
+        type=lambda value: coerce_bool(value, default=True),
+        default=True,
+        help="Whether to always keep parseable examples from successful source rollouts.",
+    )
+    parser.add_argument(
+        "--sft-max-zero-score-failures",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap for parseable failed examples with source_final_task_score <= 0. "
+            "Use 0 to drop all zero-score failures."
+        ),
+    )
+    parser.add_argument(
+        "--sft-max-records",
+        type=int,
+        default=None,
+        help="Optional cap on exported SFT records after sorting by success, score, and length.",
+    )
     return parser.parse_args()
 
 
@@ -147,6 +178,7 @@ def prepare_output_dir(
             "sft_episode_skill_all.jsonl",
             "sft_episode_skill_train.parquet",
             "sft_episode_skill_val.parquet",
+            "sft_filter_metrics.json",
             "metrics.json",
         ):
             path = output_dir / name
@@ -807,20 +839,67 @@ def build_sft_exports_from_candidates(
     output_dir: Path,
     sft_val_ratio: float,
     seed: int,
+    sft_min_source_score: float,
+    sft_include_success: bool,
+    sft_max_zero_score_failures: Optional[int],
+    sft_max_records: Optional[int],
 ) -> List[Dict[str, Any]]:
     sft_records: List[Dict[str, Any]] = []
+    filter_counts: Counter[str] = Counter()
+    source_score_bins_before: Counter[str] = Counter()
+    source_score_bins_after: Counter[str] = Counter()
+    zero_score_failures_kept = 0
+
+    def score_bucket(score: float) -> str:
+        if score >= 1.0:
+            return ">=1.0"
+        if score >= 0.8:
+            return "0.8-1.0"
+        if score >= 0.6:
+            return "0.6-0.8"
+        if score >= 0.4:
+            return "0.4-0.6"
+        if score > 0.0:
+            return "0.0-0.4"
+        return "0.0"
+
     for candidate in candidate_skills:
         if not candidate.get("parse_ok"):
+            filter_counts["drop_parse_error"] += 1
             continue
         prompt = candidate.get("analysis_prompt", {})
         messages = prompt.get("messages", []) if isinstance(prompt, dict) else []
         if not messages:
+            filter_counts["drop_missing_prompt"] += 1
             continue
+
+        source_success = bool(candidate.get("source_success", False))
+        source_score = float(candidate.get("source_final_task_score", 0.0))
+        source_num_steps = int(candidate.get("source_num_steps", 0))
+        source_bucket = score_bucket(source_score)
+        source_score_bins_before[source_bucket] += 1
+
+        keep_reason = ""
+        if source_success and sft_include_success:
+            keep_reason = "success"
+        elif source_score >= float(sft_min_source_score):
+            keep_reason = "score_threshold"
+        elif source_score <= 0.0 and sft_max_zero_score_failures is not None:
+            if zero_score_failures_kept < max(0, int(sft_max_zero_score_failures)):
+                zero_score_failures_kept += 1
+                keep_reason = "zero_score_failure_cap"
+
+        if not keep_reason:
+            filter_counts["drop_low_score"] += 1
+            continue
+
         response_payload = {
             "episode_summary": candidate.get("episode_summary", ""),
             "episode_skill": candidate.get("episode_skill", ""),
         }
-        sft_records.append(
+        source_score_bins_after[source_bucket] += 1
+        filter_counts[f"keep_{keep_reason}"] += 1
+        record = (
             {
                 "prompt": str(messages[-1].get("content", "")),
                 "response": json.dumps(response_payload, ensure_ascii=False),
@@ -828,12 +907,44 @@ def build_sft_exports_from_candidates(
                 "task_id": candidate["task_id"],
                 "task_type": candidate.get("task_type", "webshop"),
                 "goal_idx": int(candidate.get("goal_idx", -1)),
-                "source_success": bool(candidate.get("source_success", False)),
-                "source_num_steps": int(candidate.get("source_num_steps", 0)),
-                "source_final_task_score": float(candidate.get("source_final_task_score", 0.0)),
+                "source_success": source_success,
+                "source_num_steps": source_num_steps,
+                "source_final_task_score": source_score,
+                "source_score_bucket": source_bucket,
+                "sft_filter_reason": keep_reason,
                 "parse_ok": bool(candidate.get("parse_ok")),
             }
         )
+        sft_records.append(record)
+
+    if sft_max_records is not None and int(sft_max_records) > 0:
+        before_cap = len(sft_records)
+        sft_records = sorted(
+            sft_records,
+            key=lambda record: (
+                not bool(record.get("source_success", False)),
+                -float(record.get("source_final_task_score", 0.0)),
+                int(record.get("source_num_steps", 10**9)),
+                str(record.get("skill_id", "")),
+            ),
+        )[: int(sft_max_records)]
+        filter_counts["drop_max_records_cap"] += max(0, before_cap - len(sft_records))
+
+    filter_metrics = {
+        "total_candidates": len(candidate_skills),
+        "exported_sft_records": len(sft_records),
+        "sft_min_source_score": float(sft_min_source_score),
+        "sft_include_success": bool(sft_include_success),
+        "sft_max_zero_score_failures": sft_max_zero_score_failures,
+        "sft_max_records": sft_max_records,
+        "filter_counts": dict(filter_counts),
+        "source_score_bins_before": dict(source_score_bins_before),
+        "source_score_bins_after": dict(Counter(record.get("source_score_bucket", "unknown") for record in sft_records)),
+        "source_success_counts_after": dict(
+            Counter(str(bool(record.get("source_success", False))) for record in sft_records)
+        ),
+    }
+    write_json(output_dir / "sft_filter_metrics.json", filter_metrics)
 
     all_jsonl = output_dir / "sft_episode_skill_all.jsonl"
     if all_jsonl.exists():
@@ -883,6 +994,9 @@ def write_metrics(
         "candidate_by_task_type": dict(Counter(record.get("task_type", "unknown") for record in candidate_skills)),
         "sft_by_task_type": dict(Counter(record.get("task_type", "unknown") for record in sft_records)),
         "source_success_counts": dict(Counter(str(bool(record.get("source_success", False))) for record in candidate_skills)),
+        "sft_source_success_counts": dict(Counter(str(bool(record.get("source_success", False))) for record in sft_records)),
+        "sft_source_score_bins": dict(Counter(record.get("source_score_bucket", "unknown") for record in sft_records)),
+        "sft_filter_reasons": dict(Counter(record.get("sft_filter_reason", "unknown") for record in sft_records)),
         "baseline_success_rate": (
             float(np.mean([bool(record.get("success", False)) for record in baseline_rollouts]))
             if baseline_rollouts
@@ -1010,6 +1124,10 @@ def main() -> None:
         output_dir=output_dir,
         sft_val_ratio=args.sft_val_ratio,
         seed=args.seed,
+        sft_min_source_score=args.sft_min_source_score,
+        sft_include_success=args.sft_include_success,
+        sft_max_zero_score_failures=args.sft_max_zero_score_failures,
+        sft_max_records=args.sft_max_records,
     )
     log_stage(output_dir, "sft_export", "complete", sft_records=len(sft_records))
 

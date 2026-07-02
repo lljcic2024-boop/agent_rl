@@ -65,6 +65,10 @@ WEBSHOP_USE_SMALL="${WEBSHOP_USE_SMALL:-1}"
 WEBSHOP_TRAIN_START="${WEBSHOP_TRAIN_START:-500}"
 NUM_CPUS_PER_ENV_WORKER="${NUM_CPUS_PER_ENV_WORKER:-0.05}"
 SFT_VAL_RATIO="${SFT_VAL_RATIO:-0.1}"
+SFT_MIN_SOURCE_SCORE="${SFT_MIN_SOURCE_SCORE:-0.0}"
+SFT_INCLUDE_SUCCESS="${SFT_INCLUDE_SUCCESS:-true}"
+SFT_MAX_ZERO_SCORE_FAILURES="${SFT_MAX_ZERO_SCORE_FAILURES:-}"
+SFT_MAX_RECORDS="${SFT_MAX_RECORDS:-}"
 SEED="${SEED:-2026}"
 RESUME="${RESUME:-false}"
 OVERWRITE="${OVERWRITE:-false}"
@@ -108,6 +112,8 @@ args=(
     --skill-retry-delay "$SKILL_RETRY_DELAY"
     --skill-gen-workers "$SKILL_GEN_WORKERS"
     --sft-val-ratio "$SFT_VAL_RATIO"
+    --sft-min-source-score "$SFT_MIN_SOURCE_SCORE"
+    --sft-include-success "$SFT_INCLUDE_SUCCESS"
     --seed "$SEED"
 )
 
@@ -131,6 +137,14 @@ fi
 
 if [[ -n "${MAX_CANDIDATES:-}" ]]; then
     args+=(--max-candidates "$MAX_CANDIDATES")
+fi
+
+if [[ -n "$SFT_MAX_ZERO_SCORE_FAILURES" ]]; then
+    args+=(--sft-max-zero-score-failures "$SFT_MAX_ZERO_SCORE_FAILURES")
+fi
+
+if [[ -n "$SFT_MAX_RECORDS" ]]; then
+    args+=(--sft-max-records "$SFT_MAX_RECORDS")
 fi
 
 if [[ -n "${POLICY_EXTRA_BODY_JSON:-}" ]]; then
@@ -279,6 +293,10 @@ echo "  sampled tasks:      $NUM_TASKS"
 echo "  rollouts per task:  $ROLLOUTS_PER_TASK"
 echo "  task batch size:    $TASK_BATCH_SIZE"
 echo "  skill gen workers:  $SKILL_GEN_WORKERS"
+echo "  sft min score:      $SFT_MIN_SOURCE_SCORE"
+echo "  sft include success:$SFT_INCLUDE_SUCCESS"
+echo "  sft zero cap:       ${SFT_MAX_ZERO_SCORE_FAILURES:-unset}"
+echo "  sft max records:    ${SFT_MAX_RECORDS:-unset}"
 
 set +e
 python "${args[@]}"

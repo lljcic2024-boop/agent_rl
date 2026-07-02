@@ -625,6 +625,24 @@ class RayPPOTrainer:
         sdar_loss_coef = OmegaConf.select(self.config, "actor_rollout_ref.actor.sdar_loss_coef")
         return float(sdar_loss_coef or 0.0) > 0.0
 
+    @staticmethod
+    def _config_bool(config, key: str, default: bool = False) -> bool:
+        value = OmegaConf.select(config, key)
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _is_lhop_enabled(self) -> bool:
+        return self._config_bool(self.config, "algorithm.lhop.enable", False)
+
+    def _get_lhop_teacher_history_length(self) -> Optional[int]:
+        value = OmegaConf.select(self.config, "algorithm.lhop.teacher_history_length")
+        if value is None:
+            return None
+        return int(value)
+
     def _is_opid_skill_gen_enabled(self) -> bool:
         enabled = OmegaConf.select(self.config, "algorithm.opid.skill_gen.enable")
         loss_coef = OmegaConf.select(self.config, "actor_rollout_ref.actor.skill_gen_loss_coef")
@@ -876,6 +894,8 @@ class RayPPOTrainer:
         metrics["opid/episode_skill_teacher/enabled"] = 0.0
         metrics["opid/step_skill_teacher/step_skill_step_ratio"] = 0.0
         metrics["opid/step_skill_teacher/step_skills_applied"] = 0.0
+        metrics.setdefault("lhop/teacher_batch_size", 0.0)
+        metrics.setdefault("lhop/teacher_available", 0.0)
         return batch
 
     def _lazy_init_opid_teacher_signal_executor(self):
@@ -897,6 +917,7 @@ class RayPPOTrainer:
         non_tensor_keys = [
             "obs_text",
             "obs_text_base",
+            "obs_text_teacher",
             "anchor_obs",
             "traj_uid",
             "uid",
@@ -918,6 +939,13 @@ class RayPPOTrainer:
 
     def _prepare_opid_teacher_signals_async_task(self, batch: DataProto, teacher_enabled: bool):
         local_metrics: Dict[str, float] = {}
+        if self._is_lhop_enabled():
+            output_batch = self._prepare_lhop_teacher_signals(
+                batch=batch,
+                metrics=local_metrics,
+                teacher_enabled=teacher_enabled,
+            )
+            return output_batch, local_metrics
         output_batch = self._prepare_opid_teacher_signals(
             batch=batch,
             metrics=local_metrics,
@@ -983,6 +1011,175 @@ class RayPPOTrainer:
         batch.non_tensor_batch.pop("_batch_source_idx", None)
         return batch
 
+    def _prepare_lhop_teacher_signals(
+        self,
+        batch: DataProto,
+        metrics: Dict[str, float],
+        teacher_enabled: bool,
+    ) -> DataProto:
+        batch_size = len(batch)
+        response_mask = compute_response_mask(batch)
+        zero_teacher_log_prob = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
+        zero_mask = torch.zeros(batch_size, dtype=torch.bool, device=batch.batch["responses"].device)
+
+        batch.batch["teacher_log_prob"] = zero_teacher_log_prob
+        batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
+        batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
+        batch.batch["critical_step_mask"] = zero_mask
+        batch.batch["step_skill_mask"] = zero_mask.clone()
+        batch.batch["teacher_signal_mask"] = zero_mask.clone()
+
+        teacher_history_length = self._get_lhop_teacher_history_length()
+        metrics["lhop/enabled"] = 1.0
+        metrics["lhop/teacher_history_length"] = (
+            float(teacher_history_length) if teacher_history_length is not None else -1.0
+        )
+        metrics["lhop/student_history_length"] = float(OmegaConf.select(self.config, "env.history_length") or 0)
+        metrics["lhop/teacher_batch_size"] = 0.0
+        metrics["lhop/teacher_available"] = 0.0
+        metrics["lhop/skipped_missing_obs_text_teacher"] = 0.0
+        metrics["lhop/skipped_same_prompt"] = 0.0
+        metrics["lhop/teacher_log_prob_mean"] = 0.0
+
+        if not teacher_enabled:
+            metrics["lhop/teacher_skipped_by_schedule"] = 1.0
+            return batch
+        metrics["lhop/teacher_skipped_by_schedule"] = 0.0
+
+        if "multi_modal_inputs" in batch.non_tensor_batch:
+            module_logger.warning("LHOP teacher signal skipped because multi_modal_inputs are present.")
+            metrics["lhop/teacher_skipped_multimodal"] = 1.0
+            return batch
+        metrics["lhop/teacher_skipped_multimodal"] = 0.0
+
+        if "obs_text_teacher" not in batch.non_tensor_batch:
+            module_logger.warning("LHOP teacher signal skipped because obs_text_teacher is missing from the rollout batch.")
+            metrics["lhop/skipped_missing_obs_text_teacher"] = float(batch_size)
+            return batch
+
+        teacher_obs_texts = batch.non_tensor_batch["obs_text_teacher"]
+        student_obs_texts = batch.non_tensor_batch.get("obs_text", [""] * batch_size)
+        data_sources = batch.non_tensor_batch.get("data_source")
+        skip_same_prompt = self._config_bool(self.config, "algorithm.lhop.skip_if_same_prompt", True)
+
+        teacher_indices: List[int] = []
+        teacher_prompt_texts: List[str] = []
+        teacher_data_sources: List[object] = []
+        skipped_missing = 0
+        skipped_same = 0
+        for sample_idx in range(batch_size):
+            teacher_text = str(teacher_obs_texts[sample_idx]).strip()
+            if not teacher_text:
+                skipped_missing += 1
+                continue
+            student_text = str(student_obs_texts[sample_idx]).strip()
+            if skip_same_prompt and teacher_text == student_text:
+                skipped_same += 1
+                continue
+            teacher_indices.append(sample_idx)
+            teacher_prompt_texts.append(teacher_text)
+            teacher_data_sources.append(data_sources[sample_idx] if data_sources is not None else None)
+
+        metrics["lhop/skipped_missing_obs_text_teacher"] = float(skipped_missing)
+        metrics["lhop/skipped_same_prompt"] = float(skipped_same)
+        metrics["lhop/teacher_batch_size"] = float(len(teacher_indices))
+        if not teacher_indices:
+            module_logger.info(
+                "LHOP has no long-history teacher prompts for this batch "
+                "(missing=%s, same_prompt=%s, batch_size=%s).",
+                skipped_missing,
+                skipped_same,
+                batch_size,
+            )
+            return batch
+
+        lhop_max_prompt_length = OmegaConf.select(self.config, "algorithm.lhop.max_prompt_length")
+        lhop_max_prompt_length = None if lhop_max_prompt_length is None else int(lhop_max_prompt_length)
+        teacher_meta_info = deepcopy(batch.meta_info or {})
+        teacher_meta_info.pop("opid_skill_gen_samples", None)
+        teacher_prompt_batch = self.traj_collector.build_text_prompt_batch(
+            obs_contents=teacher_prompt_texts,
+            data_sources=teacher_data_sources,
+            meta_info=teacher_meta_info,
+            max_prompt_length=lhop_max_prompt_length,
+        )
+        prompt_lengths = teacher_prompt_batch.batch["attention_mask"].sum(dim=-1).detach().cpu().numpy()
+        metrics["lhop/teacher_prompt_len_min"] = float(prompt_lengths.min())
+        metrics["lhop/teacher_prompt_len_mean"] = float(prompt_lengths.mean())
+        metrics["lhop/teacher_prompt_len_max"] = float(prompt_lengths.max())
+        module_logger.info(
+            "LHOP teacher prompt lengths: min=%s, mean=%.2f, max=%s, teacher_batch_size=%s",
+            int(prompt_lengths.min()),
+            float(prompt_lengths.mean()),
+            int(prompt_lengths.max()),
+            len(teacher_indices),
+        )
+
+        teacher_tensor_indices = torch.as_tensor(
+            teacher_indices,
+            dtype=torch.long,
+            device=batch.batch["responses"].device,
+        )
+        prompt_device = teacher_prompt_batch.batch["input_ids"].device
+        teacher_responses = batch.batch["responses"].index_select(0, teacher_tensor_indices).to(prompt_device)
+        teacher_response_masks = response_mask.index_select(0, teacher_tensor_indices).to(prompt_device)
+        teacher_input_ids = torch.cat([teacher_prompt_batch.batch["input_ids"], teacher_responses], dim=-1)
+        teacher_attention_mask = torch.cat(
+            [
+                teacher_prompt_batch.batch["attention_mask"],
+                teacher_response_masks.to(dtype=teacher_prompt_batch.batch["attention_mask"].dtype),
+            ],
+            dim=-1,
+        )
+        teacher_position_ids = torch.clip(torch.cumsum(teacher_attention_mask, dim=-1) - 1, min=0)
+        teacher_batch = DataProto.from_dict(
+            tensors={
+                "responses": teacher_responses,
+                "input_ids": teacher_input_ids,
+                "attention_mask": teacher_attention_mask,
+                "position_ids": teacher_position_ids,
+            },
+            meta_info=teacher_meta_info,
+        )
+        teacher_batch_padded, teacher_pad_size = pad_dataproto_to_divisor(
+            teacher_batch,
+            self.actor_rollout_wg.world_size,
+        )
+        teacher_log_prob_padded = self.actor_rollout_wg.compute_log_prob(teacher_batch_padded)
+        teacher_log_prob = unpad_dataproto(teacher_log_prob_padded, pad_size=teacher_pad_size).batch["old_log_probs"]
+
+        full_teacher_log_prob = zero_teacher_log_prob.clone()
+        full_teacher_log_prob[teacher_indices] = teacher_log_prob.to(device=full_teacher_log_prob.device)
+        teacher_mask_np = np.zeros(batch_size, dtype=bool)
+        teacher_mask_np[teacher_indices] = True
+        teacher_mask = torch.as_tensor(
+            teacher_mask_np,
+            device=batch.batch["responses"].device,
+            dtype=torch.bool,
+        )
+
+        batch.batch["teacher_log_prob"] = full_teacher_log_prob
+        batch.batch["episode_teacher_log_prob"] = full_teacher_log_prob.clone()
+        batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
+        batch.batch["critical_step_mask"] = teacher_mask
+        batch.batch["step_skill_mask"] = zero_mask.clone()
+        batch.batch["teacher_signal_mask"] = teacher_mask
+
+        metrics["lhop/teacher_available"] = 1.0
+        metrics["lhop/teacher_log_prob_mean"] = float(teacher_log_prob.mean().detach().cpu().item())
+        metrics["opid/critical_step_ratio"] = float(teacher_mask_np.mean()) if batch_size > 0 else 0.0
+        metrics["opid/teacher_batch_size"] = float(len(teacher_indices))
+        metrics["opid/teacher_available"] = 1.0
+        metrics["opid/episode_skill_teacher/enabled"] = 0.0
+        metrics["opid/step_skill_teacher/step_skill_step_ratio"] = 0.0
+        metrics["opid/step_skill_teacher/step_skills_applied"] = 0.0
+        module_logger.info(
+            "LHOP computed long-history teacher log-probs for %s steps (token_mean=%.6f).",
+            len(teacher_indices),
+            metrics["lhop/teacher_log_prob_mean"],
+        )
+        return batch
+
     def _validate_config(self):
         config = self.config
         # number of GPUs total
@@ -1002,12 +1199,16 @@ class RayPPOTrainer:
                 legacy_teacher_advantage_start_after_steps,
             )
         failed_only_after_steps = OmegaConf.select(config, "algorithm.opid.failed_only_after_steps")
+        lhop_enabled = self._config_bool(config, "algorithm.lhop.enable", False)
+        lhop_teacher_history_length = OmegaConf.select(config, "algorithm.lhop.teacher_history_length")
         if opd_stop_after_steps is not None and int(opd_stop_after_steps) < 0:
             raise ValueError("algorithm.opid.opd_stop_after_steps must be null or a non-negative integer.")
         if opd_start_after_steps is not None and int(opd_start_after_steps) < 0:
             raise ValueError("algorithm.opid.opd_start_after_steps must be null or a non-negative integer.")
         if failed_only_after_steps is not None and int(failed_only_after_steps) < 0:
             raise ValueError("algorithm.opid.failed_only_after_steps must be null or a non-negative integer.")
+        if lhop_teacher_history_length is not None and int(lhop_teacher_history_length) < 0:
+            raise ValueError("algorithm.lhop.teacher_history_length must be null or a non-negative integer.")
         if failed_only_after_steps is not None and bool(OmegaConf.select(config, "algorithm.opid.failed_only")):
             module_logger.warning(
                 "algorithm.opid.failed_only_after_steps=%s is set, so scheduled all-then-failed analysis overrides algorithm.opid.failed_only=True until after that step.",
@@ -1033,6 +1234,11 @@ class RayPPOTrainer:
             raise ValueError(
                 f"algorithm.opid.skill_teacher_mode must be one of {SKILL_TEACHER_MODES}, got {skill_teacher_mode!r}."
             )
+        if lhop_enabled and not (
+            config.algorithm.adv_estimator == AdvantageEstimator.OPID
+            or str(config.algorithm.adv_estimator) == AdvantageEstimator.OPID.value
+        ):
+            raise ValueError("algorithm.lhop.enable=True requires algorithm.adv_estimator=opid.")
         if config.algorithm.adv_estimator == AdvantageEstimator.OPID or str(config.algorithm.adv_estimator) == AdvantageEstimator.OPID.value:
             analysis_backend = str(OmegaConf.select(config, "algorithm.opid.analysis_backend") or "openai")
             analysis_enabled_config = OmegaConf.select(config, "algorithm.opid.enable_analysis")
@@ -1042,35 +1248,41 @@ class RayPPOTrainer:
                 analysis_enabled = analysis_enabled_config.lower() in ("1", "true", "yes", "on")
             else:
                 analysis_enabled = bool(analysis_enabled_config)
-            if analysis_backend not in {"openai", "policy_vllm"}:
-                raise ValueError("algorithm.opid.analysis_backend must be 'openai' or 'policy_vllm'.")
-            if analysis_backend == "policy_vllm" and analysis_enabled:
-                if str(config.actor_rollout_ref.rollout.name) != "vllm":
-                    raise ValueError("algorithm.opid.analysis_backend=policy_vllm requires actor_rollout_ref.rollout.name=vllm.")
-                analysis_context_length = int(
-                    OmegaConf.select(config, "algorithm.opid.analysis_context_length") or 16384
-                )
-                analysis_max_completion_tokens = int(
-                    OmegaConf.select(config, "algorithm.opid.analysis_max_completion_tokens") or 4096
-                )
-                effective_max_model_len = int(
-                    OmegaConf.select(config, "actor_rollout_ref.rollout.max_model_len")
-                    or (
-                        int(config.actor_rollout_ref.rollout.prompt_length)
-                        + int(config.actor_rollout_ref.rollout.response_length)
+            if lhop_enabled:
+                if analysis_enabled:
+                    module_logger.warning(
+                        "algorithm.lhop.enable=True is set; OPID LLM analysis will be skipped even though algorithm.opid.enable_analysis=True."
                     )
-                )
-                required_max_model_len = analysis_context_length + analysis_max_completion_tokens
-                if effective_max_model_len < required_max_model_len:
-                    raise ValueError(
-                        "policy_vllm OPID analysis requires actor_rollout_ref.rollout.max_model_len "
-                        f">= {required_max_model_len}, got {effective_max_model_len}."
+            else:
+                if analysis_backend not in {"openai", "policy_vllm"}:
+                    raise ValueError("algorithm.opid.analysis_backend must be 'openai' or 'policy_vllm'.")
+                if analysis_backend == "policy_vllm" and analysis_enabled:
+                    if str(config.actor_rollout_ref.rollout.name) != "vllm":
+                        raise ValueError("algorithm.opid.analysis_backend=policy_vllm requires actor_rollout_ref.rollout.name=vllm.")
+                    analysis_context_length = int(
+                        OmegaConf.select(config, "algorithm.opid.analysis_context_length") or 16384
                     )
+                    analysis_max_completion_tokens = int(
+                        OmegaConf.select(config, "algorithm.opid.analysis_max_completion_tokens") or 4096
+                    )
+                    effective_max_model_len = int(
+                        OmegaConf.select(config, "actor_rollout_ref.rollout.max_model_len")
+                        or (
+                            int(config.actor_rollout_ref.rollout.prompt_length)
+                            + int(config.actor_rollout_ref.rollout.response_length)
+                        )
+                    )
+                    required_max_model_len = analysis_context_length + analysis_max_completion_tokens
+                    if effective_max_model_len < required_max_model_len:
+                        raise ValueError(
+                            "policy_vllm OPID analysis requires actor_rollout_ref.rollout.max_model_len "
+                            f">= {required_max_model_len}, got {effective_max_model_len}."
+                        )
             if float(OmegaConf.select(config, "algorithm.opid.step_advantage_w") or 0.0) != 0.0:
                 raise ValueError(
                     "Episode-level OPID OPD requires algorithm.opid.step_advantage_w=0.0."
                 )
-            if str(OmegaConf.select(config, "algorithm.opid.selector")) != "llm":
+            if not lhop_enabled and str(OmegaConf.select(config, "algorithm.opid.selector")) != "llm":
                 raise ValueError("Episode-level OPID OPD requires algorithm.opid.selector=llm.")
         if opd_start_after_steps is not None and opd_stop_after_steps is not None:
             if int(opd_start_after_steps) >= int(opd_stop_after_steps):
@@ -2837,10 +3049,13 @@ class RayPPOTrainer:
                     opid_teacher_snapshot = None
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.OPID:
                         opid_teacher_schedule_enabled = self._is_opid_teacher_signal_enabled()
-                        opid_analysis_enabled = self._is_opid_analysis_enabled()
+                        opid_lhop_enabled = self._is_lhop_enabled()
+                        opid_analysis_enabled = False if opid_lhop_enabled else self._is_opid_analysis_enabled()
                         opid_sdar_loss_enabled = self._is_opid_sdar_loss_enabled()
                         opid_skill_gen_enabled = self._is_opid_skill_gen_enabled()
-                        opid_teacher_signal_enabled = opid_teacher_schedule_enabled and opid_analysis_enabled
+                        opid_teacher_signal_enabled = opid_teacher_schedule_enabled and (
+                            opid_lhop_enabled or opid_analysis_enabled
+                        )
                         opid_teacher_adv_enabled = opid_teacher_signal_enabled and not opid_sdar_loss_enabled
                         opid_policy_vllm_backend = self._is_opid_policy_vllm_backend()
                     # generate a batch
@@ -2896,13 +3111,16 @@ class RayPPOTrainer:
                         metrics["opid/skill_gen_enabled"] = 1.0 if opid_skill_gen_enabled else 0.0
                         metrics["opid/teacher_disabled_by_schedule"] = 0.0 if opid_teacher_schedule_enabled else 1.0
                         metrics["opid/teacher_disabled_by_analysis"] = (
-                            1.0 if opid_teacher_schedule_enabled and not opid_analysis_enabled else 0.0
+                            1.0
+                            if opid_teacher_schedule_enabled and not opid_analysis_enabled and not opid_lhop_enabled
+                            else 0.0
                         )
                         metrics["opid/analysis_enabled"] = 1.0 if opid_analysis_enabled else 0.0
                         metrics["opid/analysis_disabled"] = 0.0 if opid_analysis_enabled else 1.0
-                        if opid_analysis_enabled:
+                        metrics["lhop/enabled"] = 1.0 if opid_lhop_enabled else 0.0
+                        if opid_lhop_enabled or opid_analysis_enabled:
                             opid_teacher_snapshot = self._build_opid_teacher_signal_snapshot(batch)
-                            if not opid_policy_vllm_backend:
+                            if not opid_lhop_enabled and not opid_policy_vllm_backend:
                                 opid_teacher_future = self._lazy_init_opid_teacher_signal_executor().submit(
                                     self._prepare_opid_teacher_signals_async_task,
                                     opid_teacher_snapshot,
