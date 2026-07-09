@@ -67,7 +67,6 @@ def test_opid_step_only_prompt_requests_only_step_skills():
     user_prompt = prompt["messages"][0]["content"]
 
     assert "step_skills" in user_prompt
-    assert "Do not return episode_skill" in user_prompt
     assert '"episode_skill": "string"' not in user_prompt
     assert "Return only these top-level fields: episode_summary, step_skills" in user_prompt
 
@@ -83,10 +82,40 @@ def test_opid_episode_only_prompt_requests_only_episode_skill():
     user_prompt = prompt["messages"][0]["content"]
 
     assert "episode_skill" in user_prompt
-    assert "applied to every selected step" in user_prompt
-    assert "Do not return step_skills" in user_prompt
     assert '"step_skills": {' not in user_prompt
     assert "Return only these top-level fields: episode_summary, episode_skill" in user_prompt
+
+
+def test_opid_episode_only_no_summary_prompt_requests_only_episode_skill():
+    analyzer = OPIDEpisodeAnalyzer(skill_mode="episode_only", include_episode_summary=False)
+
+    prompt = analyzer._build_episode_analysis_prompt(
+        steps=_sample_steps(),
+        candidate_step_indices=[0, 1],
+        episode_success=1.0,
+    )
+    user_prompt = prompt["messages"][0]["content"]
+
+    assert "episode_skill" in user_prompt
+    assert "episode_summary" not in user_prompt
+    assert '"step_skills": {' not in user_prompt
+    assert "Return only this top-level field: episode_skill" in user_prompt
+
+
+def test_opid_episode_step_no_summary_prompt_requests_skill_fields_without_summary():
+    analyzer = OPIDEpisodeAnalyzer(include_episode_summary=False)
+
+    prompt = analyzer._build_episode_analysis_prompt(
+        steps=_sample_steps(),
+        candidate_step_indices=[0, 1],
+        episode_success=1.0,
+    )
+    user_prompt = prompt["messages"][0]["content"]
+
+    assert "episode_skill" in user_prompt
+    assert "step_skills" in user_prompt
+    assert "episode_summary" not in user_prompt
+    assert "Return only these top-level fields: episode_skill, step_skills" in user_prompt
 
 
 def test_opid_prompt_for_failed_episode_emphasizes_avoidance():
@@ -173,6 +202,22 @@ def test_opid_episode_only_parse_drops_step_skills():
 
     assert parsed["episode_skill"] == "check all constraints first"
     assert parsed["step_skills"] == {}
+
+
+def test_opid_no_summary_parse_keeps_summary_empty():
+    analyzer = OPIDEpisodeAnalyzer(skill_mode="episode_only", include_episode_summary=False)
+
+    parsed = analyzer._parse_analysis_response(
+        """
+        {
+          "episode_summary": "should be ignored",
+          "episode_skill": "check all constraints first"
+        }
+        """
+    )
+
+    assert parsed["episode_summary"] == ""
+    assert parsed["episode_skill"] == "check all constraints first"
 
 
 def test_opid_parse_extracts_json_from_markdown_fence():

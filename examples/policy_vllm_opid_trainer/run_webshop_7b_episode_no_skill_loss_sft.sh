@@ -21,15 +21,14 @@ if [[ -z "${HF_MODEL_PATH:-}" ]]; then
         echo "Please set MODELS_ROOT in $ENV_FILE, or set HF_MODEL_PATH explicitly." >&2
         exit 1
     fi
-    HF_MODEL_PATH="$MODELS_ROOT/Qwen2.5-3B-Instruct-webshop-episode-skill-sft"
+    HF_MODEL_PATH="$MODELS_ROOT/Qwen2.5-7B-Instruct-webshop-episode-skill-sft"
 fi
 if [[ ! -f "$HF_MODEL_PATH/config.json" ]]; then
     echo "HF model not found: $HF_MODEL_PATH" >&2
     exit 1
 fi
 
-# Initialize both policy and policy-vLLM analyzer from the WebShop SFT
-# episode-skill model.
+# Initialize both policy and policy-vLLM analyzer from the WebShop 7B SFT model.
 export MODEL_PATH="${MODEL_PATH:-$HF_MODEL_PATH}"
 
 # Use the SFT model as an episode-only analyzer during OPID RL, while disabling
@@ -40,10 +39,15 @@ export OPID_SKILL_GEN_LOSS_ENABLE="${OPID_SKILL_GEN_LOSS_ENABLE:-False}"
 export OPID_SKILL_GEN_LOSS_COEF="${OPID_SKILL_GEN_LOSS_COEF:-0.0}"
 export OPID_ANALYSIS_BACKEND="${OPID_ANALYSIS_BACKEND:-policy_vllm}"
 
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-opid-grpo_qwen2.5_3b_webshop_episode_no_skill_loss_sft_policy-vllm}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-opid-grpo_qwen2.5_7b_webshop_episode_no_skill_loss_sft_policy-vllm}"
 export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}"
 
 exec "$SCRIPT_DIR/run_webshop_both_no_skill_loss_base.sh" \
+    actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE:-128}" \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-32}" \
+    actor_rollout_ref.rollout.tensor_model_parallel_size="${TENSOR_MODEL_PARALLEL_SIZE:-2}" \
+    actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.7}" \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-32}" \
     algorithm.opid.skill_gen.enable="$OPID_SKILL_GEN_LOSS_ENABLE" \
     actor_rollout_ref.actor.skill_gen_loss_coef="$OPID_SKILL_GEN_LOSS_COEF" \
     "$@"

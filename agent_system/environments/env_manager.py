@@ -24,23 +24,6 @@ from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory
 from omegaconf import OmegaConf
 
-def _config_bool(config, key: str, default: bool = False) -> bool:
-    value = OmegaConf.select(config, key)
-    if value is None:
-        return default
-    if isinstance(value, str):
-        return value.lower() in ("1", "true", "yes", "on")
-    return bool(value)
-
-def _lhop_enabled(config) -> bool:
-    return _config_bool(config, "algorithm.lhop.enable", False)
-
-def _lhop_teacher_history_length(config):
-    value = OmegaConf.select(config, "algorithm.lhop.teacher_history_length")
-    if value is None:
-        return None
-    return int(value)
-
 def parse_gamefile(infos):
     gamefile = []
     for info in infos:
@@ -63,7 +46,19 @@ def _config_select(config, key, default=None):
     try:
         value = OmegaConf.select(config, key)
     except Exception:
-        return default
+        value = default
+        current = config
+        for part in key.split("."):
+            if isinstance(current, dict):
+                if part not in current:
+                    return default
+                current = current[part]
+            else:
+                try:
+                    current = getattr(current, part)
+                except AttributeError:
+                    return default
+        value = current
     return default if value is None else value
 
 
@@ -335,14 +330,6 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
         observations = {'text': full_text_obs, 'text_base': full_text_obs, 'image': image_obs, 'anchor': text_obs}
-        if _lhop_enabled(self.config):
-            teacher_history_length = _lhop_teacher_history_length(self.config)
-            observations['text_teacher'] = self.build_text_obs(
-                text_obs,
-                self.envs.get_admissible_commands,
-                init=True,
-                history_length=teacher_history_length,
-            )
         return observations, infos
     
     def step(self, text_actions: List[str]):
@@ -352,14 +339,6 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.pre_text_obs = text_obs
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
-        teacher_text_obs = None
-        if _lhop_enabled(self.config):
-            teacher_history_length = _lhop_teacher_history_length(self.config)
-            teacher_text_obs = self.build_text_obs(
-                text_obs,
-                self.envs.get_admissible_commands,
-                history_length=teacher_history_length,
-            )
         if infos[0].get("extra.gamefile") is None:
             infos = set_gamefile(infos, self.gamefile)
 
@@ -368,8 +347,6 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             info['is_action_valid'] = to_numpy(valids[i])
 
         next_observations = {'text': full_text_obs, 'text_base': full_text_obs, 'image': image_obs, 'anchor': text_obs}
-        if teacher_text_obs is not None:
-            next_observations['text_teacher'] = teacher_text_obs
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 

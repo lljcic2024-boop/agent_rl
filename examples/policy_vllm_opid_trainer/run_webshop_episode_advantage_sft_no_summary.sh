@@ -28,22 +28,24 @@ if [[ ! -f "$HF_MODEL_PATH/config.json" ]]; then
     exit 1
 fi
 
-# Initialize both policy and policy-vLLM analyzer from the WebShop SFT
-# episode-skill model.
 export MODEL_PATH="${MODEL_PATH:-$HF_MODEL_PATH}"
 
-# Use the SFT model as an episode-only analyzer during OPID RL, while disabling
-# the auxiliary skill-generation LM loss.
+# Use the SFT model as an episode-only analyzer, and feed the
+# generated episode skill through OPID teacher advantage instead of SDAR loss.
 export OPID_SKILL_MODE="${OPID_SKILL_MODE:-episode_only}"
-export OPID_SDAR_LOSS_COEF="${OPID_SDAR_LOSS_COEF:-0.01}"
+export OPID_STEP_ADV_W="${OPID_STEP_ADV_W:-0.0}"
+export OPID_EPISODE_SKILL_TEACHER_ADV_W="${OPID_EPISODE_SKILL_TEACHER_ADV_W:-0.001}"
+export OPID_STEP_SKILL_TEACHER_ADV_W="${OPID_STEP_SKILL_TEACHER_ADV_W:-0.0}"
+export OPID_SDAR_LOSS_COEF="${OPID_SDAR_LOSS_COEF:-0.0}"
 export OPID_SKILL_GEN_LOSS_ENABLE="${OPID_SKILL_GEN_LOSS_ENABLE:-False}"
 export OPID_SKILL_GEN_LOSS_COEF="${OPID_SKILL_GEN_LOSS_COEF:-0.0}"
 export OPID_ANALYSIS_BACKEND="${OPID_ANALYSIS_BACKEND:-policy_vllm}"
 
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-opid-grpo_qwen2.5_3b_webshop_episode_no_skill_loss_sft_policy-vllm}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-opid-grpo_qwen2.5_3b_webshop_episode_advantage_sft_policy-vllm}"
 export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}"
 
 exec "$SCRIPT_DIR/run_webshop_both_no_skill_loss_base.sh" \
+    algorithm.opid.analysis_include_episode_summary=False \
     algorithm.opid.skill_gen.enable="$OPID_SKILL_GEN_LOSS_ENABLE" \
     actor_rollout_ref.actor.skill_gen_loss_coef="$OPID_SKILL_GEN_LOSS_COEF" \
     "$@"

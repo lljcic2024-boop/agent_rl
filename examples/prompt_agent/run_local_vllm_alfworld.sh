@@ -11,7 +11,7 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 MODELS_ROOT="${MODELS_ROOT:-}"
-DEFAULT_MODEL_PATH="${MODELS_ROOT:+${MODELS_ROOT}/Qwen2.5-3B-Instruct}"
+DEFAULT_MODEL_PATH="${MODELS_ROOT:+${MODELS_ROOT}/release/SEED-ALFWorld-3B}"
 MODEL_PATH="${MODEL_PATH:-$DEFAULT_MODEL_PATH}"
 if [[ -z "$MODEL_PATH" ]]; then
   echo "Please set MODEL_PATH, or set MODELS_ROOT so the default base model path can be inferred." >&2
@@ -39,7 +39,7 @@ ENV_NUM="${ENV_NUM:-134}"
 TEST_TIMES="${TEST_TIMES:-1}"
 MAX_STEPS="${MAX_STEPS:-30}"
 HISTORY_LENGTH="${HISTORY_LENGTH:-5}"
-EVAL_DATASET="${EVAL_DATASET:-eval_out_of_distribution}" # eval_in_distribution, eval_out_of_distribution
+EVAL_DATASET="${EVAL_DATASET:-eval_in_distribution}" # eval_in_distribution, eval_out_of_distribution
 TEMPERATURE="${TEMPERATURE:-0.4}"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-512}"
 REQUEST_WORKERS="${REQUEST_WORKERS:-$ENV_NUM}"

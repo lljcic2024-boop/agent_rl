@@ -267,11 +267,6 @@ algorithm:
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
-  lhop:
-    enable: False # Long-History OPD: score the sampled response under a longer-history teacher prompt
-    teacher_history_length: null # null -> reuse env.history_length; set > env.history_length for LHOP
-    max_prompt_length: null # null -> data.max_prompt_length for teacher log-prob prompt construction
-    skip_if_same_prompt: True
   opid:
     step_advantage_w: 0.0 # OPID uses episode-level advantage only.
     episode_skill_teacher_advantage_w: 1.0 # separate weight for episode-skill teacher advantage; ignored when actor.sdar_loss_coef > 0
@@ -292,6 +287,7 @@ algorithm:
     analysis_num_workers: 8
     analysis_context_length: 16384
     analysis_max_completion_tokens: 1024
+    analysis_include_episode_summary: True
     analysis_max_step_skills_per_traj: 1 # number of critical step_skills to add alongside the episode_skill
     skill_gen:
       enable: False

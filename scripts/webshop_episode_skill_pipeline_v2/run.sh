@@ -5,8 +5,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-CONDA_ENV="${CONDA_ENV:-sgop-webshop}"
-VLLM_CONDA_ENV="${VLLM_CONDA_ENV:-copd}"
 ENV_FILE="${ENV_FILE:-$PROJECT_ROOT/.env}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/outputs/webshop_episode_skill_pipeline_v2_qwen25_3b}"
 
@@ -16,6 +14,9 @@ if [[ -f "$ENV_FILE" ]]; then
     source "$ENV_FILE"
     set +a
 fi
+
+AGENT_CONDA_ENV="${AGENT_CONDA_ENV:-${CONDA_ENV:-}}"
+VLLM_CONDA_ENV="${VLLM_CONDA_ENV:-}"
 
 MODELS_ROOT="${MODELS_ROOT:?Please set MODELS_ROOT in $ENV_FILE.}"
 MODEL_PATH="${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-3B-Instruct}"
@@ -41,6 +42,7 @@ SKILL_TIMEOUT="${SKILL_TIMEOUT:-120}"
 SKILL_RETRIES="${SKILL_RETRIES:-5}"
 SKILL_RETRY_DELAY="${SKILL_RETRY_DELAY:-1.0}"
 SKILL_GEN_WORKERS="${SKILL_GEN_WORKERS:-128}"
+SKILL_PARSE_ATTEMPTS="${SKILL_PARSE_ATTEMPTS:-2}"
 
 START_VLLM="${START_VLLM:-1}"
 KEEP_VLLM_ALIVE="${KEEP_VLLM_ALIVE:-0}"
@@ -59,12 +61,14 @@ ROLLOUTS_PER_TASK="${ROLLOUTS_PER_TASK:-8}"
 TASK_BATCH_SIZE="${TASK_BATCH_SIZE:-16}"
 MAX_STEPS="${MAX_STEPS:-15}"
 HISTORY_LENGTH="${HISTORY_LENGTH:-2}"
+BASELINE_HISTORY_LENGTH="${BASELINE_HISTORY_LENGTH:-$HISTORY_LENGTH}"
 REQUEST_WORKERS="${REQUEST_WORKERS:-128}"
 WEBSHOP_HUMAN_GOALS="${WEBSHOP_HUMAN_GOALS:-0}"
 WEBSHOP_USE_SMALL="${WEBSHOP_USE_SMALL:-1}"
 WEBSHOP_TRAIN_START="${WEBSHOP_TRAIN_START:-500}"
 NUM_CPUS_PER_ENV_WORKER="${NUM_CPUS_PER_ENV_WORKER:-0.05}"
 SFT_VAL_RATIO="${SFT_VAL_RATIO:-0.1}"
+INCLUDE_EPISODE_SUMMARY="${INCLUDE_EPISODE_SUMMARY:-true}"
 SFT_MIN_SOURCE_SCORE="${SFT_MIN_SOURCE_SCORE:-0.0}"
 SFT_INCLUDE_SUCCESS="${SFT_INCLUDE_SUCCESS:-true}"
 SFT_MAX_ZERO_SCORE_FAILURES="${SFT_MAX_ZERO_SCORE_FAILURES:-}"
@@ -90,6 +94,7 @@ args=(
     --task-batch-size "$TASK_BATCH_SIZE"
     --max-steps "$MAX_STEPS"
     --history-length "$HISTORY_LENGTH"
+    --baseline-history-length "$BASELINE_HISTORY_LENGTH"
     --request-workers "$REQUEST_WORKERS"
     --webshop-human-goals "$WEBSHOP_HUMAN_GOALS"
     --webshop-train-start "$WEBSHOP_TRAIN_START"
@@ -111,6 +116,8 @@ args=(
     --skill-retries "$SKILL_RETRIES"
     --skill-retry-delay "$SKILL_RETRY_DELAY"
     --skill-gen-workers "$SKILL_GEN_WORKERS"
+    --skill-parse-attempts "$SKILL_PARSE_ATTEMPTS"
+    --include-episode-summary "$INCLUDE_EPISODE_SUMMARY"
     --sft-val-ratio "$SFT_VAL_RATIO"
     --sft-min-source-score "$SFT_MIN_SOURCE_SCORE"
     --sft-include-success "$SFT_INCLUDE_SUCCESS"
@@ -164,10 +171,12 @@ elif [[ "$RESUME" == "true" ]]; then
 fi
 
 cd "$PROJECT_ROOT"
-set +u
-eval "$(conda shell.bash hook)"
-conda activate "$CONDA_ENV"
-set -u
+if [[ -n "$AGENT_CONDA_ENV" ]]; then
+    set +u
+    eval "$(conda shell.bash hook)"
+    conda activate "$AGENT_CONDA_ENV"
+    set -u
+fi
 
 server_pid=""
 progress_monitor_pid=""
@@ -248,10 +257,16 @@ if [[ "$START_VLLM" == "1" ]]; then
             VLLM_SERVE_ARGS+=(--data-parallel-size "$DATA_PARALLEL_SIZE")
         fi
 
-        conda run -n "$VLLM_CONDA_ENV" --no-capture-output \
+        if [[ -n "$VLLM_CONDA_ENV" ]]; then
+            conda run -n "$VLLM_CONDA_ENV" --no-capture-output \
+                "$VLLM_BIN" serve "${VLLM_SERVE_ARGS[@]}" \
+                "${VLLM_EXTRA_ARGS_ARRAY[@]}" \
+                >"$VLLM_LOG_FILE" 2>&1 &
+        else
             "$VLLM_BIN" serve "${VLLM_SERVE_ARGS[@]}" \
-            "${VLLM_EXTRA_ARGS_ARRAY[@]}" \
-            >"$VLLM_LOG_FILE" 2>&1 &
+                "${VLLM_EXTRA_ARGS_ARRAY[@]}" \
+                >"$VLLM_LOG_FILE" 2>&1 &
+        fi
         server_pid=$!
 
         deadline=$((SECONDS + VLLM_STARTUP_TIMEOUT))
@@ -282,8 +297,8 @@ if [[ "$PROGRESS_MONITOR" == "1" ]]; then
 fi
 
 echo "Running WebShop episode-skill pipeline v2"
-echo "  conda env:          $CONDA_ENV"
-echo "  vLLM conda env:     $VLLM_CONDA_ENV"
+echo "  agent conda env:    ${AGENT_CONDA_ENV:-<current shell>}"
+echo "  vLLM conda env:     ${VLLM_CONDA_ENV:-<current shell>}"
 echo "  output dir:         $OUTPUT_DIR"
 echo "  policy model:       $MODEL_PATH"
 echo "  policy endpoint:    $POLICY_BASE_URL"
@@ -292,7 +307,10 @@ echo "  use small data:     $WEBSHOP_USE_SMALL"
 echo "  sampled tasks:      $NUM_TASKS"
 echo "  rollouts per task:  $ROLLOUTS_PER_TASK"
 echo "  task batch size:    $TASK_BATCH_SIZE"
+echo "  baseline history:   $BASELINE_HISTORY_LENGTH"
 echo "  skill gen workers:  $SKILL_GEN_WORKERS"
+echo "  skill parse tries:  $SKILL_PARSE_ATTEMPTS"
+echo "  episode summary:    $INCLUDE_EPISODE_SUMMARY"
 echo "  sft min score:      $SFT_MIN_SOURCE_SCORE"
 echo "  sft include success:$SFT_INCLUDE_SUCCESS"
 echo "  sft zero cap:       ${SFT_MAX_ZERO_SCORE_FAILURES:-unset}"

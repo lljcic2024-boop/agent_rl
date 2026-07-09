@@ -83,6 +83,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=int, default=15)
     parser.add_argument("--history-length", type=int, default=2)
+    parser.add_argument(
+        "--baseline-history-length",
+        type=int,
+        default=None,
+        help=(
+            "Prompt history length used only while collecting baseline rollouts. "
+            "Defaults to --history-length for backward compatibility."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--request-workers", type=int, default=128)
     parser.add_argument("--max-tasks", type=int, default=None)
@@ -125,6 +134,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skill-retry-delay", type=float, default=1.0)
     parser.add_argument("--skill-extra-body-json", default=None)
     parser.add_argument("--skill-gen-workers", type=int, default=128)
+    parser.add_argument(
+        "--skill-parse-attempts",
+        type=int,
+        default=2,
+        help="Maximum API calls per skill sample when the previous response cannot be parsed as valid JSON.",
+    )
+    parser.add_argument(
+        "--include-episode-summary",
+        type=lambda value: coerce_bool(value, default=True),
+        default=True,
+        help="Whether skill-analysis prompts and SFT responses include episode_summary.",
+    )
     parser.add_argument("--sft-val-ratio", type=float, default=0.1)
     parser.add_argument(
         "--sft-min-source-score",
@@ -388,7 +409,7 @@ def build_manager(
             "env": AttrDict(
                 {
                     "env_name": "webshop",
-                    "history_length": int(args.history_length),
+                    "history_length": baseline_history_length(args),
                     "use_skills_only_memory": False,
                 }
             )
@@ -396,6 +417,13 @@ def build_manager(
     )
     time.sleep(max(float(args.startup_wait_seconds), len(session_indices) * 0.02))
     return WebshopEnvironmentManager(envs, webshop_projection, config)
+
+
+def baseline_history_length(args: argparse.Namespace) -> int:
+    value = args.baseline_history_length
+    if value is None:
+        value = args.history_length
+    return int(value)
 
 
 def make_policy_agent(endpoint: ChatEndpoint, fallback_action: str) -> LocalOpenAIAgent:
@@ -458,6 +486,7 @@ def run_rollout_specs(
                 "source_skill_id": spec.get("source_skill_id"),
                 "rollout_id": int(spec.get("rollout_id", env_idx)),
                 "seed": int(spec.get("seed", seed + env_idx)),
+                "history_length": baseline_history_length(args),
                 "episode_skill": spec.get("episode_skill", ""),
                 "task_description": (
                     task_descriptions[env_idx]
@@ -568,6 +597,7 @@ def collect_baseline_rollouts(
         expected_rollouts=expected_total,
         task_batch_size=int(args.task_batch_size),
         rollouts_per_task=int(args.rollouts_per_task),
+        history_length=baseline_history_length(args),
     )
 
     pending_specs: List[Dict[str, Any]] = []
@@ -591,6 +621,7 @@ def collect_baseline_rollouts(
             "complete",
             completed_rollouts=len(records),
             expected_rollouts=expected_total,
+            history_length=baseline_history_length(args),
         )
         return records
 
@@ -615,6 +646,7 @@ def collect_baseline_rollouts(
             tasks_in_wave=len(task_ids),
             completed_rollouts=len(records),
             expected_rollouts=expected_total,
+            history_length=baseline_history_length(args),
         )
         trajectories = run_rollout_specs(
             specs=spec_chunk,
@@ -634,6 +666,7 @@ def collect_baseline_rollouts(
             total_waves=total_waves,
             completed_rollouts=len(records),
             expected_rollouts=expected_total,
+            history_length=baseline_history_length(args),
         )
 
     log_stage(
@@ -642,6 +675,7 @@ def collect_baseline_rollouts(
         "complete",
         completed_rollouts=len(records),
         expected_rollouts=expected_total,
+        history_length=baseline_history_length(args),
     )
     return records
 
@@ -674,6 +708,8 @@ def build_candidate_skill_record(
     *,
     trajectory: Dict[str, Any],
     skill_endpoint: ChatEndpoint,
+    include_episode_summary: bool = True,
+    skill_parse_attempts: int = 2,
 ) -> Dict[str, Any]:
     from opid.analysis import OPIDEpisodeAnalyzer
 
@@ -682,6 +718,7 @@ def build_candidate_skill_record(
         max_completion_tokens=skill_endpoint.max_completion_tokens,
         max_step_skills_per_traj=0,
         skill_mode="episode_only",
+        include_episode_summary=include_episode_summary,
     )
     skill_client = OpenAITextClient(skill_endpoint)
     skill_id = f"{trajectory['task_id']}:{trajectory['rollout_id']}"
@@ -693,16 +730,37 @@ def build_candidate_skill_record(
         episode_success=1.0 if trajectory.get("success") else 0.0,
         task_description=trajectory.get("task_description", ""),
     )
-    raw_output, api_error = skill_client.complete(normalize_messages(prompt))
     parse_ok = False
     parsed: Dict[str, Any] = {"episode_summary": "", "episode_skill": ""}
+    raw_output = ""
+    api_error = None
     parse_error = None
-    if raw_output:
+    raw_outputs: List[str] = []
+    prompt_for_attempt = prompt
+    attempts_used = 0
+    for attempt_idx in range(max(1, int(skill_parse_attempts))):
+        attempts_used = attempt_idx + 1
+        raw_output, api_error = skill_client.complete(normalize_messages(prompt_for_attempt))
+        raw_outputs.append(raw_output)
+        if api_error:
+            parse_error = None
+            break
         try:
             parsed = analyzer._parse_analysis_response(raw_output)
-            parse_ok = bool(str(parsed.get("episode_skill", "")).strip())
+            if not str(parsed.get("episode_skill", "")).strip():
+                raise ValueError("OPID analyzer response missing required field: episode_skill")
+            parse_ok = True
+            parse_error = None
+            break
         except Exception as exc:
             parse_error = f"{type(exc).__name__}: {exc}"
+            if attempt_idx + 1 >= max(1, int(skill_parse_attempts)):
+                break
+            prompt_for_attempt = analyzer._build_json_retry_prompt(
+                original_prompt=prompt,
+                invalid_response=raw_output,
+                error=exc,
+            )
 
     return {
         "skill_id": skill_id,
@@ -716,9 +774,12 @@ def build_candidate_skill_record(
         "task_description": trajectory.get("task_description", ""),
         "analysis_prompt": prompt,
         "llm_raw_output": raw_output,
+        "llm_raw_outputs": raw_outputs,
         "episode_summary": str(parsed.get("episode_summary", "")),
         "episode_skill": str(parsed.get("episode_skill", "")),
         "parse_ok": parse_ok,
+        "parse_attempts": attempts_used,
+        "max_parse_attempts": max(1, int(skill_parse_attempts)),
         "analysis_error": api_error or parse_error,
     }
 
@@ -731,6 +792,8 @@ def generate_candidate_skills(
     max_candidates: Optional[int],
     max_workers: int,
     resume: bool,
+    include_episode_summary: bool,
+    skill_parse_attempts: int,
 ) -> List[Dict[str, Any]]:
     path = output_dir / "candidate_skills.jsonl"
     existing = read_jsonl(path) if resume else []
@@ -754,6 +817,7 @@ def generate_candidate_skills(
         pending_skills=len(pending),
         expected_skills=expected_total,
         skill_gen_workers=int(max_workers),
+        skill_parse_attempts=max(1, int(skill_parse_attempts)),
     )
     if not pending:
         log_stage(
@@ -774,6 +838,8 @@ def generate_candidate_skills(
                 build_candidate_skill_record,
                 trajectory=trajectory,
                 skill_endpoint=skill_endpoint,
+                include_episode_summary=include_episode_summary,
+                skill_parse_attempts=skill_parse_attempts,
             ): trajectory
             for trajectory in pending
         }
@@ -796,9 +862,12 @@ def generate_candidate_skills(
                     "task_description": trajectory.get("task_description", ""),
                     "analysis_prompt": None,
                     "llm_raw_output": "",
+                    "llm_raw_outputs": [],
                     "episode_summary": "",
                     "episode_skill": "",
                     "parse_ok": False,
+                    "parse_attempts": 0,
+                    "max_parse_attempts": max(1, int(skill_parse_attempts)),
                     "analysis_error": f"{type(exc).__name__}: {exc}",
                 }
             append_jsonl(path, record)
@@ -843,6 +912,7 @@ def build_sft_exports_from_candidates(
     sft_include_success: bool,
     sft_max_zero_score_failures: Optional[int],
     sft_max_records: Optional[int],
+    include_episode_summary: bool,
 ) -> List[Dict[str, Any]]:
     sft_records: List[Dict[str, Any]] = []
     filter_counts: Counter[str] = Counter()
@@ -893,10 +963,12 @@ def build_sft_exports_from_candidates(
             filter_counts["drop_low_score"] += 1
             continue
 
-        response_payload = {
-            "episode_summary": candidate.get("episode_summary", ""),
-            "episode_skill": candidate.get("episode_skill", ""),
-        }
+        response_payload = {"episode_skill": candidate.get("episode_skill", "")}
+        if include_episode_summary:
+            response_payload = {
+                "episode_summary": candidate.get("episode_summary", ""),
+                **response_payload,
+            }
         source_score_bins_after[source_bucket] += 1
         filter_counts[f"keep_{keep_reason}"] += 1
         record = (
@@ -912,6 +984,7 @@ def build_sft_exports_from_candidates(
                 "source_final_task_score": source_score,
                 "source_score_bucket": source_bucket,
                 "sft_filter_reason": keep_reason,
+                "include_episode_summary": bool(include_episode_summary),
                 "parse_ok": bool(candidate.get("parse_ok")),
             }
         )
@@ -937,6 +1010,7 @@ def build_sft_exports_from_candidates(
         "sft_include_success": bool(sft_include_success),
         "sft_max_zero_score_failures": sft_max_zero_score_failures,
         "sft_max_records": sft_max_records,
+        "include_episode_summary": bool(include_episode_summary),
         "filter_counts": dict(filter_counts),
         "source_score_bins_before": dict(source_score_bins_before),
         "source_score_bins_after": dict(Counter(record.get("source_score_bucket", "unknown") for record in sft_records)),
@@ -1116,6 +1190,8 @@ def main() -> None:
         max_candidates=None,
         max_workers=args.skill_gen_workers,
         resume=args.resume and not args.regenerate_candidates,
+        include_episode_summary=args.include_episode_summary,
+        skill_parse_attempts=args.skill_parse_attempts,
     )
 
     log_stage(output_dir, "sft_export", "running", candidate_skills=len(candidate_skills))
@@ -1128,6 +1204,7 @@ def main() -> None:
         sft_include_success=args.sft_include_success,
         sft_max_zero_score_failures=args.sft_max_zero_score_failures,
         sft_max_records=args.sft_max_records,
+        include_episode_summary=args.include_episode_summary,
     )
     log_stage(output_dir, "sft_export", "complete", sft_records=len(sft_records))
 
