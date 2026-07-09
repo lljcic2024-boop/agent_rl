@@ -8,7 +8,7 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 # Model, data, and rollout scale.
 MODELS_ROOT=${MODELS_ROOT:?Please set MODELS_ROOT}
-MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-3B-Instruct-webshop-episode-skill-sft}
+MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen3-1.7B}
 TRAIN_DATA_SIZE=16
 VAL_DATA_SIZE=128
 GROUP_SIZE=8
@@ -20,7 +20,7 @@ GIGPO_STEP_ADV_W=${GIGPO_STEP_ADV_W:-0.0}
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_webshop
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo-sft_qwen2.5_3b_webshop_mean-std-norm}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen3_1.7b_webshop_mean-std-norm}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.
@@ -43,6 +43,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation=left \
     data.return_raw_chat=True \
+    +data.apply_chat_template_kwargs.enable_thinking=False \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \

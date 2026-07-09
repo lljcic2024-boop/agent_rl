@@ -293,11 +293,6 @@ algorithm:
     mode: "mean_norm"
     enable_similarity: False
     similarity_thresh: 0.95
-  lhop:
-    enable: False
-    teacher_history_length: null
-    max_prompt_length: null
-    skip_if_same_prompt: True
   opid:
     step_advantage_w: 0.0 # OPID uses episode-level advantage only.
     episode_skill_teacher_advantage_w: 1.0
@@ -319,6 +314,7 @@ algorithm:
     analysis_num_workers: 8
     analysis_context_length: 16384
     analysis_max_completion_tokens: 1024
+    analysis_include_episode_summary: True
     analysis_max_step_skills_per_traj: 1
     save_analysis: False
     analysis_dump_dir: null # null -> ${trainer.default_local_dir}/opid_analysis

@@ -252,6 +252,7 @@ class OPIDEpisodeAnalyzer:
         max_step_skills_per_traj: int = 1,
         skill_mode: str = "episode_step",
         analysis_prompt_version: str = "opid",
+        include_episode_summary: bool = True,
     ):
         self.requested_backend = backend
         if backend == "azure":
@@ -265,11 +266,12 @@ class OPIDEpisodeAnalyzer:
         self.max_step_skills_per_traj = max(int(max_step_skills_per_traj), 0)
         self.skill_mode = validate_skill_mode(skill_mode)
         self.analysis_prompt_version = validate_analysis_prompt_version(analysis_prompt_version)
+        self.include_episode_summary = bool(include_episode_summary)
         self.client = None
         self.model = os.environ.get("OPENAI_MODEL", "gemini-2.5-flash")
 
         logger.info(
-            "Initialized OPIDEpisodeAnalyzer with requested_backend=%s, resolved_backend=%s, model=%s, max_completion_tokens=%s, max_step_skills_per_traj=%s, skill_mode=%s, analysis_prompt_version=%s",
+            "Initialized OPIDEpisodeAnalyzer with requested_backend=%s, resolved_backend=%s, model=%s, max_completion_tokens=%s, max_step_skills_per_traj=%s, skill_mode=%s, analysis_prompt_version=%s, include_episode_summary=%s",
             self.requested_backend,
             self.backend,
             self.model,
@@ -277,6 +279,7 @@ class OPIDEpisodeAnalyzer:
             self.max_step_skills_per_traj,
             self.skill_mode,
             self.analysis_prompt_version,
+            self.include_episode_summary,
         )
 
     def _get_openai_client(self):
@@ -454,6 +457,20 @@ class OPIDEpisodeAnalyzer:
   "episode_skill": "string",
   "step_skills": {}
 }"""
+        if not self.include_episode_summary:
+            if self.skill_mode == "step_only":
+                schema_text = """{
+  "step_skills": {}
+}"""
+            elif self.skill_mode == "episode_only":
+                schema_text = """{
+  "episode_skill": "string"
+}"""
+            else:
+                schema_text = """{
+  "episode_skill": "string",
+  "step_skills": {}
+}"""
         retry_prompt = f"""{original_user_prompt}
 
 The previous answer could not be parsed as the required JSON object.
@@ -523,6 +540,36 @@ Return ONLY one valid JSON object with this exact shape:
             "but phrase each skill as advice the policy can act on at that step."
         )
         if self.skill_mode == "step_only":
+            if not self.include_episode_summary:
+                prompt_text = f"""Analyze the following agent episode and return ONLY valid JSON.
+
+You need to complete one field:
+1. {selection_instruction}
+
+Important constraints:
+- Step indexing is 0-based: step 0 is the first step of the trajectory.
+- Use the full episode context to identify what each critical step should have done better.
+- Each step_skills value should be one short imperative sentence for the policy at that step.
+- Write step_skills as policy-facing skills, not as retrospective explanation of the trajectory.
+- Return only this top-level field: step_skills.
+- The chosen steps are exactly the keys present in step_skills.
+
+Return format:
+{{
+  "step_skills": {{
+    "0": "skill for step 0",
+    "2": "skill for step 2"
+  }}
+}}
+
+Episode context:
+- Task description: {task_description or "(not available)"}
+- episode_success: {outcome_label}
+- Candidate step indices: {list(candidate_step_indices)}
+- Interaction trajectory: {self._format_episode_steps(steps)}
+"""
+                return build_prompt_dict(user_prompt=prompt_text)
+
             prompt_text = f"""Analyze the following agent episode and return ONLY valid JSON.
 
 You need to complete two fields:
@@ -555,6 +602,28 @@ Episode context:
             return build_prompt_dict(user_prompt=prompt_text)
 
         if self.skill_mode == "episode_only":
+            if not self.include_episode_summary:
+                prompt_text = f"""Analyze the following agent episode and return ONLY valid JSON.
+
+You need to complete one field:
+1. {episode_skill_instruction}
+
+Important constraints:
+- Write episode_skill as one short policy-facing skill, not as retrospective explanation of the trajectory.
+- Return only this top-level field: episode_skill.
+
+Return format:
+{{
+  "episode_skill": "string"
+}}
+
+Episode context:
+- Task description: {task_description or "(not available)"}
+- episode_success: {outcome_label}
+- Interaction trajectory: {self._format_episode_steps(steps)}
+"""
+                return build_prompt_dict(user_prompt=prompt_text)
+
             prompt_text = f"""Analyze the following agent episode and return ONLY valid JSON.
 
 You need to complete two fields:
@@ -574,6 +643,38 @@ Return format:
 Episode context:
 - Task description: {task_description or "(not available)"}
 - episode_success: {outcome_label}
+- Interaction trajectory: {self._format_episode_steps(steps)}
+"""
+            return build_prompt_dict(user_prompt=prompt_text)
+
+        if not self.include_episode_summary:
+            prompt_text = f"""Analyze the following agent episode and return ONLY valid JSON.
+
+You need to complete two fields:
+1. {episode_skill_instruction}
+2. {selection_instruction}
+
+Important constraints:
+- Step indexing is 0-based: step 0 is the first step of the trajectory.
+- Use the full episode context to identify what each critical step should have done better.
+- Each step_skills value should be one short imperative sentence for the policy at that step.
+- Write episode_skill and step_skills as policy-facing skills, not as retrospective explanation of the trajectory.
+- Return only these top-level fields: episode_skill, step_skills.
+- The chosen steps are exactly the keys present in step_skills.
+
+Return format:
+{{
+  "episode_skill": "string",
+  "step_skills": {{
+    "0": "skill for step 0",
+    "2": "skill for step 2"
+  }}
+}}
+
+Episode context:
+- Task description: {task_description or "(not available)"}
+- episode_success: {outcome_label}
+- Candidate step indices: {list(candidate_step_indices)}
 - Interaction trajectory: {self._format_episode_steps(steps)}
 """
             return build_prompt_dict(user_prompt=prompt_text)
@@ -901,7 +1002,7 @@ Episode context:
         if self.skill_mode == "episode_only":
             step_skills = {}
         return {
-            "episode_summary": str(parsed.get("episode_summary", "")),
+            "episode_summary": str(parsed.get("episode_summary", "")) if self.include_episode_summary else "",
             "episode_skill": "" if self.skill_mode == "step_only" else str(parsed.get("episode_skill", "")),
             "step_skills": step_skills,
         }

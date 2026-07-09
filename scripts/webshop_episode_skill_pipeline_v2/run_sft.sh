@@ -13,11 +13,13 @@ if [[ -f "$ENV_FILE" ]]; then
     set +a
 fi
 
-CONDA_ENV="${CONDA_ENV:-copd}"
+SFT_CONDA_ENV="${SFT_CONDA_ENV:-${CONDA_ENV:-}}"
+SFT_CUDA_VISIBLE_DEVICES="${SFT_CUDA_VISIBLE_DEVICES:-}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-3}"
 LR="${LR:-5e-6}"
 MAX_LENGTH="${MAX_LENGTH:-12288}"
+TRUNCATION="${TRUNCATION:-error}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 MICRO_BATCH_SIZE_PER_GPU="${MICRO_BATCH_SIZE_PER_GPU:-1}"
 ULYSSES_SEQUENCE_PARALLEL_SIZE="${ULYSSES_SEQUENCE_PARALLEL_SIZE:-1}"
@@ -64,11 +66,16 @@ if [[ ! -d "$MODEL_PATH" && ! -f "$MODEL_PATH" ]]; then
     exit 1
 fi
 
+if [[ -n "$SFT_CUDA_VISIBLE_DEVICES" ]]; then
+    export CUDA_VISIBLE_DEVICES="$SFT_CUDA_VISIBLE_DEVICES"
+fi
+
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 cd "$PROJECT_ROOT"
 
 echo "Running WebShop episode-skill SFT v2"
-echo "  conda env:      $CONDA_ENV"
+echo "  SFT conda env:  ${SFT_CONDA_ENV:-<current shell>}"
+echo "  CUDA devices:   ${CUDA_VISIBLE_DEVICES:-unset}"
 echo "  model:          $MODEL_PATH"
 echo "  train data:     $TRAIN_DATA"
 echo "  val data:       $VAL_DATA"
@@ -76,6 +83,7 @@ echo "  output dir:     $OUTPUT_DIR"
 echo "  log file:       $LOG_FILE"
 echo "  epochs:         $TOTAL_EPOCHS"
 echo "  max length:     $MAX_LENGTH"
+echo "  truncation:     $TRUNCATION"
 echo "  nproc:          $NPROC_PER_NODE"
 echo "  sp size:        $ULYSSES_SEQUENCE_PARALLEL_SIZE"
 echo "  logger:         $TRAINER_LOGGER"
@@ -85,10 +93,12 @@ if [[ "$EXPORT_MODEL_AFTER_TRAIN" == "true" ]]; then
     echo "  export dir:     $EXPORT_MODEL_DIR"
 fi
 
-set +u
-eval "$(conda shell.bash hook)"
-conda activate "$CONDA_ENV"
-set -u
+if [[ -n "$SFT_CONDA_ENV" ]]; then
+    set +u
+    eval "$(conda shell.bash hook)"
+    conda activate "$SFT_CONDA_ENV"
+    set -u
+fi
 
 torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
     -m verl.trainer.fsdp_sft_trainer \
@@ -101,7 +111,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
     data.prompt_dict_keys=[] \
     data.response_dict_keys=[] \
     data.max_length="$MAX_LENGTH" \
-    data.truncation=error \
+    data.truncation="$TRUNCATION" \
     model.partial_pretrain="$MODEL_PATH" \
     model.enable_gradient_checkpointing=True \
     optim.lr="$LR" \
@@ -113,6 +123,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
     trainer.default_hdfs_dir=null \
     ulysses_sequence_parallel_size="$ULYSSES_SEQUENCE_PARALLEL_SIZE" \
     use_remove_padding=true \
+    "$@" \
     2>&1 | tee "$LOG_FILE"
 
 if [[ "$EXPORT_MODEL_AFTER_TRAIN" == "true" ]]; then
