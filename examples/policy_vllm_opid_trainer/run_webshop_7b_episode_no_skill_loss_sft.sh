@@ -21,29 +21,27 @@ if [[ -z "${HF_MODEL_PATH:-}" ]]; then
         echo "Please set MODELS_ROOT in $ENV_FILE, or set HF_MODEL_PATH explicitly." >&2
         exit 1
     fi
-    HF_MODEL_PATH="$MODELS_ROOT/Qwen2.5-3B-Instruct-webshop-episode-skill-sft"
+    HF_MODEL_PATH="$MODELS_ROOT/Qwen2.5-7B-Instruct-webshop-episode-skill-sft"
 fi
 if [[ ! -f "$HF_MODEL_PATH/config.json" ]]; then
     echo "HF model not found: $HF_MODEL_PATH" >&2
+    echo "Run scripts/webshop_episode_skill_pipeline_v2/run_sft_qwen25_7b.sh first, or set HF_MODEL_PATH explicitly." >&2
     exit 1
 fi
 
-# Initialize both policy and policy-vLLM analyzer from the WebShop SFT
-# episode-skill model.
 export MODEL_PATH="${MODEL_PATH:-$HF_MODEL_PATH}"
 
-# Use the SFT model as an episode-only analyzer during OPID RL, while disabling
-# the auxiliary skill-generation LM loss.
 export OPID_SKILL_MODE="${OPID_SKILL_MODE:-episode_only}"
 export OPID_SDAR_LOSS_COEF="${OPID_SDAR_LOSS_COEF:-0.01}"
 export OPID_SKILL_GEN_LOSS_ENABLE="${OPID_SKILL_GEN_LOSS_ENABLE:-False}"
 export OPID_SKILL_GEN_LOSS_COEF="${OPID_SKILL_GEN_LOSS_COEF:-0.0}"
 export OPID_ANALYSIS_BACKEND="${OPID_ANALYSIS_BACKEND:-policy_vllm}"
+export OPID_ANALYSIS_PROMPT_VERSION="${OPID_ANALYSIS_PROMPT_VERSION:-opid}"
 
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-opid-grpo_qwen2.5_3b_webshop_episode_no_skill_loss_sft_policy-vllm_exp2}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-opid-grpo_qwen2.5_7b_webshop_episode_no_skill_loss_sft_policy-vllm}"
 export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}"
 
-exec "$SCRIPT_DIR/run_webshop_both_no_skill_loss_base.sh" \
+exec bash "$SCRIPT_DIR/run_webshop_both_no_skill_loss_base.sh" \
     algorithm.opid.skill_gen.enable="$OPID_SKILL_GEN_LOSS_ENABLE" \
     actor_rollout_ref.actor.skill_gen_loss_coef="$OPID_SKILL_GEN_LOSS_COEF" \
     "$@"

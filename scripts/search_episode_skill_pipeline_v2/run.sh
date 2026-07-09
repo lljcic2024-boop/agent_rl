@@ -9,13 +9,28 @@ CONDA_ENV="${CONDA_ENV:-copd}"
 VLLM_CONDA_ENV="${VLLM_CONDA_ENV:-copd}"
 RETRIEVER_CONDA_ENV="${RETRIEVER_CONDA_ENV:-$CONDA_ENV}"
 ENV_FILE="${ENV_FILE:-$PROJECT_ROOT/.env}"
-OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_3b}"
 
 if [[ -f "$ENV_FILE" ]]; then
     set -a
     # shellcheck disable=SC1090
     source "$ENV_FILE"
     set +a
+fi
+
+SKILL_PROMPT_VERSION="${SKILL_PROMPT_VERSION:-opid}"
+if [[ "$SKILL_PROMPT_VERSION" == "strategy_bank" ]]; then
+    SKILL_PROMPT_VERSION="search_strategy_bank"
+elif [[ "$SKILL_PROMPT_VERSION" == "skill_only" ]]; then
+    SKILL_PROMPT_VERSION="search_skill_only"
+fi
+if [[ -z "${OUTPUT_DIR:-}" ]]; then
+    if [[ "$SKILL_PROMPT_VERSION" == "search_strategy_bank" ]]; then
+        OUTPUT_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_strategy_bank_qwen25_3b"
+    elif [[ "$SKILL_PROMPT_VERSION" == "search_skill_only" ]]; then
+        OUTPUT_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_skill_only_qwen25_3b"
+    else
+        OUTPUT_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_3b"
+    fi
 fi
 
 : "${MODELS_ROOT:?Please set MODELS_ROOT in $ENV_FILE.}"
@@ -140,6 +155,7 @@ args=(
     --skill-retries "$SKILL_RETRIES"
     --skill-retry-delay "$SKILL_RETRY_DELAY"
     --skill-gen-workers "$SKILL_GEN_WORKERS"
+    --skill-prompt-version "$SKILL_PROMPT_VERSION"
     --sft-val-ratio "$SFT_VAL_RATIO"
     --seed "$SEED"
 )
@@ -347,6 +363,7 @@ echo "  search endpoint:    $SEARCH_URL"
 echo "  policy model:       $MODEL_PATH"
 echo "  policy endpoint:    $POLICY_BASE_URL"
 echo "  skill model:        $SKILL_MODEL @ $SKILL_BASE_URL"
+echo "  skill prompt:       $SKILL_PROMPT_VERSION"
 echo "  sampled tasks:      $NUM_TASKS"
 echo "  rollouts per task:  $ROLLOUTS_PER_TASK"
 echo "  task batch size:    $TASK_BATCH_SIZE"

@@ -78,6 +78,29 @@ from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
 module_logger = logging.getLogger(__name__)
+
+
+def _sanitize_json_value(value: Any) -> Any:
+    """Return a JSON-serializable value that is safe to write as UTF-8."""
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="replace").decode("utf-8")
+    if isinstance(value, np.generic):
+        return value.item()
+    if torch.is_tensor(value):
+        return value.detach().cpu().item() if value.numel() == 1 else value.detach().cpu().tolist()
+    if isinstance(value, dict):
+        return {
+            _sanitize_json_value(key): _sanitize_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_value(item) for item in value]
+    return value
+
+
+def _safe_json_dumps(payload: Any, **kwargs: Any) -> str:
+    kwargs.setdefault("ensure_ascii", False)
+    return json.dumps(_sanitize_json_value(payload), **kwargs)
 OPID_STATE_GROUP_METRIC_PREFIX = "opid/state_group/"
 
 
@@ -1241,6 +1264,9 @@ class RayPPOTrainer:
             raise ValueError("algorithm.lhop.enable=True requires algorithm.adv_estimator=opid.")
         if config.algorithm.adv_estimator == AdvantageEstimator.OPID or str(config.algorithm.adv_estimator) == AdvantageEstimator.OPID.value:
             analysis_backend = str(OmegaConf.select(config, "algorithm.opid.analysis_backend") or "openai")
+            analysis_prompt_version = core_opid.validate_analysis_prompt_version(
+                OmegaConf.select(config, "algorithm.opid.analysis_prompt_version") or "opid"
+            )
             analysis_enabled_config = OmegaConf.select(config, "algorithm.opid.enable_analysis")
             if analysis_enabled_config is None:
                 analysis_enabled = True
@@ -1530,7 +1556,7 @@ class RayPPOTrainer:
 
         with open(filename, "w") as f:
             for entry in entries:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.write(_safe_json_dumps(entry) + "\n")
 
         print(f"Dumped generations to {filename}")
 
@@ -1567,6 +1593,10 @@ class RayPPOTrainer:
                     "selector": selector,
                     "analysis_mode": analysis.get("analysis_mode"),
                     "skill_mode": analysis.get("skill_mode", self._get_opid_skill_mode()),
+                    "analysis_prompt_version": analysis.get(
+                        "analysis_prompt_version",
+                        self._get_opid_analysis_prompt_version(),
+                    ),
                     "analysis_backend_requested": analysis.get(
                         "analysis_backend_requested",
                         self.config.algorithm.opid.analysis_backend,
@@ -1592,7 +1622,7 @@ class RayPPOTrainer:
                     "llm_prompt": analysis.get("llm_prompt"),
                     "llm_raw_output": analysis.get("llm_raw_output"),
                 }
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.write(_safe_json_dumps(entry) + "\n")
 
         module_logger.info("Dumped OPID analysis results to %s", filename)
 
@@ -1625,7 +1655,7 @@ class RayPPOTrainer:
         filename = os.path.join(dump_dir, f"step_{self.global_steps:08d}.jsonl")
         with open(filename, "w", encoding="utf-8") as f:
             for entry in entries:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.write(_safe_json_dumps(entry) + "\n")
 
         module_logger.info("Dumped OPID augmented observations to %s", filename)
 
@@ -1826,7 +1856,7 @@ class RayPPOTrainer:
         json_path = os.path.join(dump_dir, f"step_{self.global_steps:08d}.json")
         svg_path = os.path.join(dump_dir, f"step_{self.global_steps:08d}.svg")
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write(_safe_json_dumps(payload, indent=2))
         with open(svg_path, "w", encoding="utf-8") as f:
             f.write(
                 self._build_opid_state_group_svg(
@@ -2097,16 +2127,18 @@ class RayPPOTrainer:
             if max_step_skills_per_traj is None:
                 max_step_skills_per_traj = 1
             module_logger.info(
-                "Initializing OPID analyzer with backend=%s, max_completion_tokens=%s, max_step_skills_per_traj=%s",
+                "Initializing OPID analyzer with backend=%s, max_completion_tokens=%s, max_step_skills_per_traj=%s, analysis_prompt_version=%s",
                 self.config.algorithm.opid.analysis_backend,
                 self.config.algorithm.opid.analysis_max_completion_tokens,
                 max_step_skills_per_traj,
+                self._get_opid_analysis_prompt_version(),
             )
             self._opid_analyzer = core_opid.OPIDEpisodeAnalyzer(
                 backend=self.config.algorithm.opid.analysis_backend,
                 max_completion_tokens=self.config.algorithm.opid.analysis_max_completion_tokens,
                 max_step_skills_per_traj=max_step_skills_per_traj,
                 skill_mode=self._get_opid_skill_mode(),
+                analysis_prompt_version=self._get_opid_analysis_prompt_version(),
             )
         return self._opid_analyzer
 
@@ -2116,6 +2148,11 @@ class RayPPOTrainer:
 
     def _get_opid_skill_mode(self) -> str:
         return validate_skill_mode(OmegaConf.select(self.config, "algorithm.opid.skill_mode") or "episode_step")
+
+    def _get_opid_analysis_prompt_version(self) -> str:
+        return core_opid.validate_analysis_prompt_version(
+            OmegaConf.select(self.config, "algorithm.opid.analysis_prompt_version") or "opid"
+        )
 
     def _build_opid_traj_success_map(self, batch: DataProto) -> Dict[object, float]:
         if "episode_success" in batch.non_tensor_batch:
@@ -2180,6 +2217,7 @@ class RayPPOTrainer:
         parsed["analysis_backend_used"] = "policy_vllm"
         parsed["analysis_error"] = parse_error
         parsed["analysis_mode"] = analysis_mode
+        parsed["analysis_prompt_version"] = analyzer.analysis_prompt_version
         parsed["skill_mode"] = analyzer.skill_mode
         parsed["task_description"] = task_description or analyzer._infer_task_description(steps)
         parsed["llm_prompt"] = prompt

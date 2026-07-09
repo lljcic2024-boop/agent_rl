@@ -45,6 +45,12 @@ OPID_ANALYSIS_CONTEXT_LENGTH=${OPID_ANALYSIS_CONTEXT_LENGTH:-16384}
 OPID_ANALYSIS_MAX_COMPLETION_TOKENS=${OPID_ANALYSIS_MAX_COMPLETION_TOKENS:-4096}
 OPID_ANALYSIS_MAX_MODEL_LEN=${OPID_ANALYSIS_MAX_MODEL_LEN:-20480}
 OPID_ANALYSIS_MAX_STEP_SKILLS_PER_TRAJ=${OPID_ANALYSIS_MAX_STEP_SKILLS_PER_TRAJ:-2}
+OPID_ANALYSIS_PROMPT_VERSION=${OPID_ANALYSIS_PROMPT_VERSION:-opid}
+if [[ "$OPID_ANALYSIS_PROMPT_VERSION" == "strategy_bank" ]]; then
+    OPID_ANALYSIS_PROMPT_VERSION=search_strategy_bank
+elif [[ "$OPID_ANALYSIS_PROMPT_VERSION" == "skill_only" ]]; then
+    OPID_ANALYSIS_PROMPT_VERSION=search_skill_only
+fi
 
 # Experiment naming and output location.
 PROJECT_NAME=${PROJECT_NAME:-agentic_search}
@@ -115,6 +121,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.opid.analysis_context_length=$OPID_ANALYSIS_CONTEXT_LENGTH \
     algorithm.opid.analysis_max_completion_tokens=$OPID_ANALYSIS_MAX_COMPLETION_TOKENS \
     algorithm.opid.analysis_max_step_skills_per_traj=$OPID_ANALYSIS_MAX_STEP_SKILLS_PER_TRAJ \
+    algorithm.opid.analysis_prompt_version=$OPID_ANALYSIS_PROMPT_VERSION \
     algorithm.opid.normalize_teacher_adv=False \
     env.history_length=$history_length \
     env.env_name=search \

@@ -8,7 +8,7 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 # Model, data, and rollout scale.
 MODELS_ROOT=${MODELS_ROOT:?Please set MODELS_ROOT}
-MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-3B-Instruct}
+MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-3B-Instruct-webshop-episode-skill-sft}
 TRAIN_DATA_SIZE=16
 VAL_DATA_SIZE=128
 GROUP_SIZE=8
@@ -20,7 +20,7 @@ GIGPO_STEP_ADV_W=${GIGPO_STEP_ADV_W:-0.0}
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_webshop
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen2.5_3b_webshop_mean-std-norm}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo-sft_qwen2.5_3b_webshop_mean-std-norm}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.

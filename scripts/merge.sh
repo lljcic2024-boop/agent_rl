@@ -4,8 +4,8 @@ set -euo pipefail
 
 MODELS_ROOT="${MODELS_ROOT:?Please set MODELS_ROOT, e.g. /path/to/models}"
 
-ALFWORLD_CKPT="${ALFWORLD_CKPT:-${MODELS_ROOT}/ckpt/copd-grpo_qwen3_1.7b_alfworld_llm-5_episode-step-hint-plus-v3_opd-adv-0.001_exp1/global_step_150/actor}"
-ALFWORLD_TARGET="${ALFWORLD_TARGET:-${MODELS_ROOT}/release/OPID-ALFWorld-1.7B}"
+ALFWORLD_CKPT=/data/models/Qwen/Qwen2.5-3B-Instruct-alfworld-episode-skill-sft/opid-rl-sft-analyzer-qwen25-3b-alfworld-no-skill-loss/global_step_150/actor
+ALFWORLD_TARGET="${ALFWORLD_TARGET:-${MODELS_ROOT}/release/SEED-ALFWorld-3B}"
 
 python scripts/model_merger.py merge \
     --backend fsdp \

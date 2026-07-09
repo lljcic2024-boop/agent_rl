@@ -21,7 +21,7 @@ if [[ -z "${HF_MODEL_PATH:-}" ]]; then
         echo "Please set MODELS_ROOT in $ENV_FILE, or set HF_MODEL_PATH explicitly." >&2
         exit 1
     fi
-    HF_MODEL_PATH="$MODELS_ROOT/Qwen2.5-3B-Instruct-search-episode-skill-sft"
+    HF_MODEL_PATH="$MODELS_ROOT/Qwen2.5-7B-Instruct-search-episode-skill-sft"
 fi
 if [[ ! -f "$HF_MODEL_PATH/config.json" ]]; then
     echo "HF model not found: $HF_MODEL_PATH" >&2
@@ -53,7 +53,7 @@ elif [[ "$OPID_ANALYSIS_PROMPT_VERSION" == "skill_only" ]]; then
     export OPID_ANALYSIS_PROMPT_VERSION="search_skill_only"
 fi
 
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-opid-grpo_qwen2.5_3b_search_episode_no_skill_loss_sft_policy-vllm_glm}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-opid-grpo_qwen2.5_7b_search_episode_no_skill_loss_sft_policy-vllm}"
 export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}"
 
 exec "$SCRIPT_DIR/run_search_both_no_skill_loss_base.sh" \

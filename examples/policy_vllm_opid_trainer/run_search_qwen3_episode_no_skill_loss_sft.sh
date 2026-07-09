@@ -21,15 +21,15 @@ if [[ -z "${HF_MODEL_PATH:-}" ]]; then
         echo "Please set MODELS_ROOT in $ENV_FILE, or set HF_MODEL_PATH explicitly." >&2
         exit 1
     fi
-    HF_MODEL_PATH="$MODELS_ROOT/Qwen2.5-3B-Instruct-search-episode-skill-sft"
+    HF_MODEL_PATH="$MODELS_ROOT/Qwen3-1.7B-search-episode-skill-sft"
 fi
 if [[ ! -f "$HF_MODEL_PATH/config.json" ]]; then
     echo "HF model not found: $HF_MODEL_PATH" >&2
     exit 1
 fi
 
-# Initialize both policy and policy-vLLM analyzer from the Search QA SFT
-# episode-skill model.
+# Initialize both policy and policy-vLLM analyzer from the Qwen3 Search SFT
+# episode-summary + episode-skill model.
 export MODEL_PATH="${MODEL_PATH:-$HF_MODEL_PATH}"
 
 # Use the SFT model as an episode-only analyzer during OPID RL, while disabling
@@ -53,10 +53,25 @@ elif [[ "$OPID_ANALYSIS_PROMPT_VERSION" == "skill_only" ]]; then
     export OPID_ANALYSIS_PROMPT_VERSION="search_skill_only"
 fi
 
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-opid-grpo_qwen2.5_3b_search_episode_no_skill_loss_sft_policy-vllm_glm}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-seed_qwen3_1.7b_search_episode_no_skill_loss_sft_policy-vllm}"
 export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}"
 
+thinking_arg_seen=false
+for arg in "$@"; do
+    if [[ "$arg" == data.apply_chat_template_kwargs.enable_thinking=* ]] \
+        || [[ "$arg" == +data.apply_chat_template_kwargs.enable_thinking=* ]]; then
+        thinking_arg_seen=true
+        break
+    fi
+done
+
+extra_args=()
+if [[ "$thinking_arg_seen" == "false" ]]; then
+    extra_args+=(+data.apply_chat_template_kwargs.enable_thinking=False)
+fi
+
 exec "$SCRIPT_DIR/run_search_both_no_skill_loss_base.sh" \
+    "${extra_args[@]}" \
     algorithm.opid.skill_gen.enable="$OPID_SKILL_GEN_LOSS_ENABLE" \
     actor_rollout_ref.actor.skill_gen_loss_coef="$OPID_SKILL_GEN_LOSS_COEF" \
     "$@"

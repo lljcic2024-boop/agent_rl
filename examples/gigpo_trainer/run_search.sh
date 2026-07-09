@@ -8,7 +8,7 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 # Model, data, and rollout scale.
 MODELS_ROOT=${MODELS_ROOT:?Please set MODELS_ROOT}
-MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-3B-Instruct}
+MODEL_PATH=${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-7B-Instruct}
 TRAIN_DATA_SIZE=128
 VAL_DATA_SIZE=512
 GROUP_SIZE=8
@@ -24,7 +24,7 @@ GIGPO_SIMILARITY_THRESH=0.9
 
 # Experiment naming and output location.
 PROJECT_NAME=agentic_search
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen2.5_3b_search_mean-std-norm}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo_qwen2.5_7b_search_mean-std-norm}
 DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}
 
 # Prompt observation history.

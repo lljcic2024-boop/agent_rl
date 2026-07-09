@@ -24,8 +24,32 @@ from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory
 from omegaconf import OmegaConf
 
+def _mapping_select(config, key: str, default=None):
+    current = config
+    for part in key.split("."):
+        if isinstance(current, dict):
+            if part not in current:
+                return default
+            current = current[part]
+            continue
+        if not hasattr(current, part):
+            return default
+        current = getattr(current, part)
+    return current
+
+
+def _config_select(config, key: str, default=None):
+    try:
+        value = OmegaConf.select(config, key)
+    except Exception:
+        value = None
+    if value is None:
+        value = _mapping_select(config, key, default)
+    return default if value is None else value
+
+
 def _config_bool(config, key: str, default: bool = False) -> bool:
-    value = OmegaConf.select(config, key)
+    value = _config_select(config, key)
     if value is None:
         return default
     if isinstance(value, str):
@@ -36,7 +60,7 @@ def _lhop_enabled(config) -> bool:
     return _config_bool(config, "algorithm.lhop.enable", False)
 
 def _lhop_teacher_history_length(config):
-    value = OmegaConf.select(config, "algorithm.lhop.teacher_history_length")
+    value = _config_select(config, "algorithm.lhop.teacher_history_length")
     if value is None:
         return None
     return int(value)
@@ -57,14 +81,6 @@ def set_gamefile(infos, gamefile):
         else:
             infos[i]['extra.gamefile'] = None
     return infos
-
-
-def _config_select(config, key, default=None):
-    try:
-        value = OmegaConf.select(config, key)
-    except Exception:
-        return default
-    return default if value is None else value
 
 
 def _path_or_config_suggests_qwen3(model_path) -> bool:

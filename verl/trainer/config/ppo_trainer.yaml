@@ -289,6 +289,7 @@ algorithm:
     failed_only_after_steps: null # null -> use failed_only; otherwise analyze all episodes through this step, then failed episodes only
     failure_success_threshold: 1.0 # when episode_success is unavailable, episode_rewards >= this value counts as success
     analysis_backend: "openai"
+    analysis_prompt_version: "opid" # "opid" uses original OPID; "strategy_bank" is WebShop-style; "search_strategy_bank" is Search QA-style; "search_skill_only" omits episode_summary
     analysis_num_workers: 8
     analysis_context_length: 16384
     analysis_max_completion_tokens: 1024

@@ -117,8 +117,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skill-retry-delay", type=float, default=1.0)
     parser.add_argument("--skill-extra-body-json", default=None)
     parser.add_argument("--skill-gen-workers", type=int, default=128)
+    parser.add_argument(
+        "--skill-prompt-version",
+        default="opid",
+        choices=("opid", "strategy_bank", "search_strategy_bank", "skill_only", "search_skill_only"),
+        help=(
+            "Episode-skill prompt version. Use 'search_strategy_bank' for the "
+            "search QA strategy-bank prompt, or 'search_skill_only' for an "
+            "episode-skill-only prompt without episode_summary. "
+            "'strategy_bank' and 'skill_only' are accepted as aliases."
+        ),
+    )
     parser.add_argument("--sft-val-ratio", type=float, default=0.1)
     return parser.parse_args()
+
+
+def normalize_search_skill_prompt_version(version: object) -> str:
+    value = str(version or "opid").strip()
+    if value == "strategy_bank":
+        return "search_strategy_bank"
+    if value == "skill_only":
+        return "search_skill_only"
+    return value
 
 
 def prepare_output_dir(
@@ -602,6 +622,7 @@ def build_candidate_skill_record(
     *,
     trajectory: Dict[str, Any],
     skill_endpoint: ChatEndpoint,
+    skill_prompt_version: str,
 ) -> Dict[str, Any]:
     from opid.analysis import OPIDEpisodeAnalyzer
 
@@ -610,6 +631,7 @@ def build_candidate_skill_record(
         max_completion_tokens=skill_endpoint.max_completion_tokens,
         max_step_skills_per_traj=0,
         skill_mode="episode_only",
+        analysis_prompt_version=skill_prompt_version,
     )
     skill_client = OpenAITextClient(skill_endpoint)
     skill_id = f"{trajectory['task_id']}:{trajectory['rollout_id']}"
@@ -643,6 +665,7 @@ def build_candidate_skill_record(
         "source_num_steps": int(trajectory.get("num_steps", 0)),
         "source_final_task_score": float(trajectory.get("final_task_score", 0.0)),
         "task_description": trajectory.get("task_description", ""),
+        "analysis_prompt_version": skill_prompt_version,
         "analysis_prompt": prompt,
         "llm_raw_output": raw_output,
         "episode_summary": str(parsed.get("episode_summary", "")),
@@ -657,6 +680,7 @@ def generate_candidate_skills(
     baseline_rollouts: Sequence[Dict[str, Any]],
     output_dir: Path,
     skill_endpoint: ChatEndpoint,
+    skill_prompt_version: str,
     max_candidates: Optional[int],
     max_workers: int,
     resume: bool,
@@ -682,6 +706,7 @@ def generate_candidate_skills(
         existing_skills=len(existing),
         pending_skills=len(pending),
         expected_skills=expected_total,
+        skill_prompt_version=skill_prompt_version,
         skill_gen_workers=int(max_workers),
     )
     if not pending:
@@ -703,6 +728,7 @@ def generate_candidate_skills(
                 build_candidate_skill_record,
                 trajectory=trajectory,
                 skill_endpoint=skill_endpoint,
+                skill_prompt_version=skill_prompt_version,
             ): trajectory
             for trajectory in pending
         }
@@ -724,6 +750,7 @@ def generate_candidate_skills(
                     "source_num_steps": int(trajectory.get("num_steps", 0)),
                     "source_final_task_score": float(trajectory.get("final_task_score", 0.0)),
                     "task_description": trajectory.get("task_description", ""),
+                    "analysis_prompt_version": skill_prompt_version,
                     "analysis_prompt": None,
                     "llm_raw_output": "",
                     "episode_summary": "",
@@ -778,10 +805,16 @@ def build_sft_exports_from_candidates(
         messages = prompt.get("messages", []) if isinstance(prompt, dict) else []
         if not messages:
             continue
-        response_payload = {
-            "episode_summary": candidate.get("episode_summary", ""),
-            "episode_skill": candidate.get("episode_skill", ""),
-        }
+        analysis_prompt_version = str(candidate.get("analysis_prompt_version", "opid"))
+        if analysis_prompt_version == "search_skill_only":
+            response_payload = {
+                "episode_skill": candidate.get("episode_skill", ""),
+            }
+        else:
+            response_payload = {
+                "episode_summary": candidate.get("episode_summary", ""),
+                "episode_skill": candidate.get("episode_skill", ""),
+            }
         sft_records.append(
             {
                 "prompt": str(messages[-1].get("content", "")),
@@ -794,6 +827,7 @@ def build_sft_exports_from_candidates(
                 "source_success": bool(candidate.get("source_success", False)),
                 "source_num_steps": int(candidate.get("source_num_steps", 0)),
                 "source_final_task_score": float(candidate.get("source_final_task_score", 0.0)),
+                "analysis_prompt_version": analysis_prompt_version,
                 "parse_ok": bool(candidate.get("parse_ok")),
             }
         )
@@ -843,6 +877,9 @@ def write_metrics(
         "parse_ok_skills": sum(1 for record in candidate_skills if record.get("parse_ok")),
         "parse_error_skills": sum(1 for record in candidate_skills if not record.get("parse_ok")),
         "sft_records": len(sft_records),
+        "candidate_by_prompt_version": dict(
+            Counter(record.get("analysis_prompt_version", "unknown") for record in candidate_skills)
+        ),
         "candidate_by_task_type": dict(Counter(record.get("task_type", "unknown") for record in candidate_skills)),
         "candidate_by_data_source": dict(Counter(record.get("data_source", "unknown") for record in candidate_skills)),
         "sft_by_task_type": dict(Counter(record.get("task_type", "unknown") for record in sft_records)),
@@ -895,6 +932,7 @@ def write_run_config(
 
 def main() -> None:
     args = parse_args()
+    args.skill_prompt_version = normalize_search_skill_prompt_version(args.skill_prompt_version)
     load_env_file(args.env_file)
     output_dir = Path(args.output_dir)
     prepare_output_dir(
@@ -964,6 +1002,7 @@ def main() -> None:
         baseline_rollouts=baseline_rollouts_for_generation,
         output_dir=output_dir,
         skill_endpoint=skill_endpoint,
+        skill_prompt_version=args.skill_prompt_version,
         max_candidates=None,
         max_workers=args.skill_gen_workers,
         resume=args.resume and not args.regenerate_candidates,

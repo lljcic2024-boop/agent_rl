@@ -22,33 +22,11 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 MICRO_BATCH_SIZE_PER_GPU="${MICRO_BATCH_SIZE_PER_GPU:-1}"
 ULYSSES_SEQUENCE_PARALLEL_SIZE="${ULYSSES_SEQUENCE_PARALLEL_SIZE:-1}"
 EXPORT_MODEL_AFTER_TRAIN="${EXPORT_MODEL_AFTER_TRAIN:-true}"
+EXPORT_MODEL_NAME="${EXPORT_MODEL_NAME:-Qwen3-1.7B-webshop-episode-skill-sft}"
 TRAINER_LOGGER="${TRAINER_LOGGER:-['console','wandb']}"
-SKILL_PROMPT_VERSION="${SKILL_PROMPT_VERSION:-opid}"
-if [[ "$SKILL_PROMPT_VERSION" == "strategy_bank" ]]; then
-    SKILL_PROMPT_VERSION="search_strategy_bank"
-elif [[ "$SKILL_PROMPT_VERSION" == "skill_only" ]]; then
-    SKILL_PROMPT_VERSION="search_skill_only"
-fi
+QWEN3_ENABLE_THINKING="${QWEN3_ENABLE_THINKING:-False}"
 
-if [[ "$SKILL_PROMPT_VERSION" == "search_strategy_bank" ]]; then
-    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_strategy_bank_qwen25_3b"
-    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-3B-Instruct-search-episode-skill-sft-v2-strategy_bank"
-    DEFAULT_EXPERIMENT_NAME="qwen25-3b-search-episode-skill-sft-v2-strategy_bank-ep${TOTAL_EPOCHS}"
-    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_strategy_bank_qwen25_3b_ep${TOTAL_EPOCHS}"
-elif [[ "$SKILL_PROMPT_VERSION" == "search_skill_only" ]]; then
-    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_skill_only_qwen25_3b"
-    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-3B-Instruct-search-episode-skill-sft-v2-skill_only"
-    DEFAULT_EXPERIMENT_NAME="qwen25-3b-search-episode-skill-sft-v2-skill_only-ep${TOTAL_EPOCHS}"
-    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_skill_only_qwen25_3b_ep${TOTAL_EPOCHS}"
-else
-    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_3b"
-    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-3B-Instruct-search-episode-skill-sft"
-    DEFAULT_EXPERIMENT_NAME="qwen25-3b-search-episode-skill-sft-v2-ep${TOTAL_EPOCHS}"
-    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_qwen25_3b_ep${TOTAL_EPOCHS}"
-fi
-
-EXPORT_MODEL_NAME="${EXPORT_MODEL_NAME:-$DEFAULT_EXPORT_MODEL_NAME}"
-DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
+DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/webshop_episode_skill_pipeline_v2_qwen25_3b}"
 TRAIN_DATA="${TRAIN_DATA:-$DATA_DIR/sft_episode_skill_train.parquet}"
 VAL_DATA="${VAL_DATA:-$DATA_DIR/sft_episode_skill_val.parquet}"
 
@@ -57,15 +35,15 @@ if [[ -z "${MODEL_PATH:-}" ]]; then
         echo "Please set MODELS_ROOT in $ENV_FILE, or set MODEL_PATH explicitly." >&2
         exit 1
     fi
-    MODEL_PATH="$MODELS_ROOT/Qwen2.5-3B-Instruct"
+    MODEL_PATH="$MODELS_ROOT/Qwen3-1.7B"
 fi
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-PROJECT_NAME="${PROJECT_NAME:-search-episode-skill-sft}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-$DEFAULT_EXPERIMENT_NAME}"
-OUTPUT_DIR="${OUTPUT_DIR:-$MODELS_ROOT/outputs/sft/${DEFAULT_OUTPUT_STEM}_${RUN_ID}}"
+PROJECT_NAME="${PROJECT_NAME:-webshop-episode-skill-sft}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3-1.7b-webshop-episode-skill-sft-v2-ep${TOTAL_EPOCHS}}"
+OUTPUT_DIR="${OUTPUT_DIR:-$MODELS_ROOT/outputs/sft/webshop_episode_skill_analyzer_v2_qwen3_1_7b_ep${TOTAL_EPOCHS}_${RUN_ID}}"
 LOG_DIR="${LOG_DIR:-$MODELS_ROOT/logs/sft}"
-LOG_FILE="${LOG_FILE:-$LOG_DIR/${DEFAULT_OUTPUT_STEM}_${RUN_ID}.log}"
+LOG_FILE="${LOG_FILE:-$LOG_DIR/webshop_episode_skill_analyzer_v2_qwen3_1_7b_ep${TOTAL_EPOCHS}_${RUN_ID}.log}"
 if [[ "$EXPORT_MODEL_AFTER_TRAIN" == "true" ]]; then
     if [[ -z "${MODELS_ROOT:-}" && -z "${EXPORT_MODEL_DIR:-}" ]]; then
         echo "Please set MODELS_ROOT in $ENV_FILE, or set EXPORT_MODEL_DIR explicitly." >&2
@@ -90,12 +68,11 @@ fi
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 cd "$PROJECT_ROOT"
 
-echo "Running Search QA episode-skill SFT v2"
+echo "Running WebShop episode-skill SFT v2 for Qwen3"
 echo "  conda env:      $CONDA_ENV"
 echo "  model:          $MODEL_PATH"
 echo "  train data:     $TRAIN_DATA"
 echo "  val data:       $VAL_DATA"
-echo "  skill prompt:   $SKILL_PROMPT_VERSION"
 echo "  output dir:     $OUTPUT_DIR"
 echo "  log file:       $LOG_FILE"
 echo "  epochs:         $TOTAL_EPOCHS"
@@ -104,6 +81,7 @@ echo "  nproc:          $NPROC_PER_NODE"
 echo "  sp size:        $ULYSSES_SEQUENCE_PARALLEL_SIZE"
 echo "  logger:         $TRAINER_LOGGER"
 echo "  wandb mode:     ${WANDB_MODE:-unset}"
+echo "  qwen3 thinking: $QWEN3_ENABLE_THINKING"
 echo "  export model:   $EXPORT_MODEL_AFTER_TRAIN"
 if [[ "$EXPORT_MODEL_AFTER_TRAIN" == "true" ]]; then
     echo "  export dir:     $EXPORT_MODEL_DIR"
@@ -126,6 +104,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" \
     data.response_dict_keys=[] \
     data.max_length="$MAX_LENGTH" \
     data.truncation=error \
+    +data.apply_chat_template_kwargs.enable_thinking="$QWEN3_ENABLE_THINKING" \
     model.partial_pretrain="$MODEL_PATH" \
     model.enable_gradient_checkpointing=True \
     optim.lr="$LR" \
@@ -170,7 +149,7 @@ if [[ "$EXPORT_MODEL_AFTER_TRAIN" == "true" ]]; then
         exit 1
     fi
 
-    echo "Exporting latest Search QA SFT checkpoint"
+    echo "Exporting latest WebShop Qwen3 SFT checkpoint"
     echo "  source: $latest_checkpoint"
     echo "  target: $EXPORT_MODEL_DIR"
 

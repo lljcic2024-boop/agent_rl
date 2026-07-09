@@ -28,23 +28,33 @@ if [[ "$SKILL_PROMPT_VERSION" == "strategy_bank" ]]; then
     SKILL_PROMPT_VERSION="search_strategy_bank"
 elif [[ "$SKILL_PROMPT_VERSION" == "skill_only" ]]; then
     SKILL_PROMPT_VERSION="search_skill_only"
+elif [[ "$SKILL_PROMPT_VERSION" == "self" ]] \
+    || [[ "$SKILL_PROMPT_VERSION" == "self_glm" ]] \
+    || [[ "$SKILL_PROMPT_VERSION" == "glm_self" ]] \
+    || [[ "$SKILL_PROMPT_VERSION" == "search_self_glm" ]]; then
+    SKILL_PROMPT_VERSION="search_summary_skill_glm_self"
 fi
 
 if [[ "$SKILL_PROMPT_VERSION" == "search_strategy_bank" ]]; then
-    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_strategy_bank_qwen25_3b"
-    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-3B-Instruct-search-episode-skill-sft-v2-strategy_bank"
-    DEFAULT_EXPERIMENT_NAME="qwen25-3b-search-episode-skill-sft-v2-strategy_bank-ep${TOTAL_EPOCHS}"
-    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_strategy_bank_qwen25_3b_ep${TOTAL_EPOCHS}"
+    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_strategy_bank_qwen25_7b"
+    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-7B-Instruct-search-episode-skill-sft-v2-strategy_bank"
+    DEFAULT_EXPERIMENT_NAME="qwen25-7b-search-episode-skill-sft-v2-strategy_bank-ep${TOTAL_EPOCHS}"
+    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_strategy_bank_qwen25_7b_ep${TOTAL_EPOCHS}"
 elif [[ "$SKILL_PROMPT_VERSION" == "search_skill_only" ]]; then
-    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_skill_only_qwen25_3b"
-    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-3B-Instruct-search-episode-skill-sft-v2-skill_only"
-    DEFAULT_EXPERIMENT_NAME="qwen25-3b-search-episode-skill-sft-v2-skill_only-ep${TOTAL_EPOCHS}"
-    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_skill_only_qwen25_3b_ep${TOTAL_EPOCHS}"
+    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_skill_only_qwen25_7b"
+    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-7B-Instruct-search-episode-skill-sft-v2-skill_only"
+    DEFAULT_EXPERIMENT_NAME="qwen25-7b-search-episode-skill-sft-v2-skill_only-ep${TOTAL_EPOCHS}"
+    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_skill_only_qwen25_7b_ep${TOTAL_EPOCHS}"
+elif [[ "$SKILL_PROMPT_VERSION" == "search_summary_skill_glm_self" ]]; then
+    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_7b_glm_self"
+    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-7B-Instruct-search-episode-skill-sft-glm-self"
+    DEFAULT_EXPERIMENT_NAME="qwen25-7b-search-episode-skill-sft-glm-self-ep${TOTAL_EPOCHS}"
+    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_qwen25_7b_glm_self_ep${TOTAL_EPOCHS}"
 else
-    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_3b"
-    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-3B-Instruct-search-episode-skill-sft"
-    DEFAULT_EXPERIMENT_NAME="qwen25-3b-search-episode-skill-sft-v2-ep${TOTAL_EPOCHS}"
-    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_qwen25_3b_ep${TOTAL_EPOCHS}"
+    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_7b"
+    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-7B-Instruct-search-episode-skill-sft"
+    DEFAULT_EXPERIMENT_NAME="qwen25-7b-search-episode-skill-sft-v2-ep${TOTAL_EPOCHS}"
+    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_qwen25_7b_ep${TOTAL_EPOCHS}"
 fi
 
 EXPORT_MODEL_NAME="${EXPORT_MODEL_NAME:-$DEFAULT_EXPORT_MODEL_NAME}"
@@ -57,7 +67,7 @@ if [[ -z "${MODEL_PATH:-}" ]]; then
         echo "Please set MODELS_ROOT in $ENV_FILE, or set MODEL_PATH explicitly." >&2
         exit 1
     fi
-    MODEL_PATH="$MODELS_ROOT/Qwen2.5-3B-Instruct"
+    MODEL_PATH="$MODELS_ROOT/Qwen2.5-7B-Instruct"
 fi
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
@@ -90,7 +100,7 @@ fi
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 cd "$PROJECT_ROOT"
 
-echo "Running Search QA episode-skill SFT v2"
+echo "Running Search QA episode-skill SFT v2 for Qwen2.5-7B"
 echo "  conda env:      $CONDA_ENV"
 echo "  model:          $MODEL_PATH"
 echo "  train data:     $TRAIN_DATA"
