@@ -2076,8 +2076,13 @@ class RayPPOTrainer:
         return None
 
     @staticmethod
-    def _extract_policy_vllm_prompt_images(steps: List[Dict[str, object]], prompt_text: str) -> List[Any]:
-        if "<image>" not in prompt_text:
+    def _extract_policy_vllm_prompt_images(
+        steps: List[Dict[str, object]],
+        prompt_text: str,
+        *,
+        require_visual_prompt: bool = False,
+    ) -> List[Any]:
+        if not require_visual_prompt:
             return []
         images = [
             step.get("observation_image")
@@ -2085,11 +2090,8 @@ class RayPPOTrainer:
             if step.get("observation_image") is not None
         ]
         placeholder_count = prompt_text.count("<image>")
-        if images and len(images) != placeholder_count:
-            raise RuntimeError(
-                "SEED policy_vllm visual analysis prompt has "
-                f"{placeholder_count} image placeholder(s) but {len(images)} image(s)."
-            )
+        if placeholder_count == 0:
+            raise RuntimeError("SEED policy_vllm visual analysis prompt has no image placeholders.")
         if placeholder_count != len(images):
             raise RuntimeError(
                 "SEED policy_vllm visual analysis prompt has "
@@ -2179,7 +2181,11 @@ class RayPPOTrainer:
             prompt_text = self._seed_prompt_dict_to_text(prompt)
             prompt_texts.append(prompt_text)
             prompt_images.append(
-                self._extract_policy_vllm_prompt_images(task["steps"], prompt_text)
+                self._extract_policy_vllm_prompt_images(
+                    task["steps"],
+                    prompt_text,
+                    require_visual_prompt=analyzer.analysis_prompt_version == "seed_visual",
+                )
             )
 
         analysis_context_length = int(

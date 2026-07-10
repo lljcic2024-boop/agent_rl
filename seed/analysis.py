@@ -392,6 +392,8 @@ class SEEDEpisodeAnalyzer:
         prompt: Dict[str, Any],
         steps: List[Dict[str, object]],
     ) -> Dict[str, Any]:
+        if self.analysis_prompt_version != "seed_visual":
+            return prompt
         messages = prompt.get("messages", []) if isinstance(prompt, dict) else []
         placeholder_count = sum(str(message.get("content", "")).count("<image>") for message in messages)
         if placeholder_count == 0:
