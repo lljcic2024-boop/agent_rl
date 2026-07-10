@@ -2,14 +2,14 @@
 
 This directory contains a standalone offline pipeline for building verified
 episode-level skill data on ALFWorld. It does not modify existing trainer,
-OPID, or environment code.
+SEED, or environment code.
 
 ## What It Does
 
 1. Sample ALFWorld train tasks: 6 task types, 30 tasks per type by default.
 2. Run the policy without skill on each task for 8 rollouts.
 3. Ask an OpenAI-compatible LLM to generate one `episode_skill` per rollout,
-   using the same episode-only analyzer style as `opid.analysis`.
+   using the same episode-only analyzer style as `seed.analysis`.
 4. Replay each candidate skill on the same task for 8 rollouts.
 5. Keep skills that improve success count/rate over the no-skill baseline.
 6. Export accepted examples as SFT parquet files.

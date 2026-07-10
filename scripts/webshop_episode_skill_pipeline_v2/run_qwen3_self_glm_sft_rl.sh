@@ -29,4 +29,4 @@ bash "$SCRIPT_DIR/run_sft_qwen3_self_glm.sh"
 
 echo "[webshop-qwen3-self] Step 3/3: start WebShop RL from self SFT checkpoint."
 conda activate "$CONDA_ENV_WEBSHOP"
-bash "$PROJECT_ROOT/examples/policy_vllm_opid_trainer/run_webshop_qwen3_episode_no_skill_loss_sft_self.sh"
+bash "$PROJECT_ROOT/examples/seed/run_webshop_qwen3_episode_no_skill_loss_sft_self.sh"

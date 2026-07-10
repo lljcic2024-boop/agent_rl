@@ -16,6 +16,7 @@
 import torch
 import numpy as np
 import re
+import os
 from verl import DataProto
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.model import compute_position_id_with_mask
@@ -26,6 +27,7 @@ from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict
 from agent_system.environments import EnvironmentManagerBase
 from typing import Any, List, Dict, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from omegaconf import OmegaConf
 
 class TrajectoryCollector:
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
@@ -40,6 +42,7 @@ class TrajectoryCollector:
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+        self._sokoban_image_save_error_reported = False
 
     @staticmethod
     def _object_array(values: List[Any]) -> np.ndarray:
@@ -74,6 +77,115 @@ class TrajectoryCollector:
             return values[index]
         except Exception:
             return default
+
+    def _config_select(self, key: str, default: Any = None) -> Any:
+        try:
+            value = OmegaConf.select(self.config, key)
+        except Exception:
+            value = default
+        return default if value is None else value
+
+    def _config_bool(self, key: str, default: bool = False) -> bool:
+        value = self._config_select(key, default)
+        if isinstance(value, str):
+            return value.lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _sokoban_image_saving_enabled(self) -> bool:
+        env_name = str(self._config_select("env.env_name", ""))
+        return "sokoban" in env_name.lower() and self._config_bool("env.sokoban.save_images", False)
+
+    def _sokoban_image_root(self) -> Optional[str]:
+        image_save_dir = self._config_select("env.sokoban.image_save_dir")
+        if image_save_dir:
+            return os.path.expanduser(str(image_save_dir))
+        default_local_dir = self._config_select("trainer.default_local_dir")
+        if not default_local_dir:
+            return None
+        return os.path.join(os.path.expanduser(str(default_local_dir)), "sokoban_images")
+
+    @staticmethod
+    def _sanitize_path_component(value: Any) -> str:
+        text = str(value)
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._") or "unknown"
+
+    @staticmethod
+    def _global_step_dir_name(global_step: Any) -> str:
+        try:
+            return f"global_step_{int(global_step)}"
+        except (TypeError, ValueError):
+            return "global_step_unknown"
+
+    @staticmethod
+    def _image_to_uint8_array(image: Any) -> np.ndarray:
+        if isinstance(image, torch.Tensor):
+            image = image.detach().cpu().numpy()
+        if not isinstance(image, np.ndarray):
+            image = np.asarray(image)
+
+        if image.ndim == 4:
+            image = image[0]
+        if image.ndim == 3 and image.shape[0] in (1, 3, 4) and image.shape[-1] not in (1, 3, 4):
+            image = np.transpose(image, (1, 2, 0))
+        if image.ndim == 3 and image.shape[-1] == 1:
+            image = image[:, :, 0]
+
+        if image.dtype != np.uint8:
+            image = image.astype(np.float32, copy=False)
+            if image.size and float(np.nanmax(image)) <= 1.0:
+                image = image * 255.0
+            image = np.clip(image, 0, 255).astype(np.uint8)
+        return image
+
+    def _save_sokoban_observation_images(
+        self,
+        obs: Dict[str, Any],
+        *,
+        traj_uid: np.ndarray,
+        sample_ids: np.ndarray,
+        rollout_ids: np.ndarray,
+        step_num: int,
+        global_step: Any,
+        active_masks: np.ndarray,
+        phase: str,
+    ) -> None:
+        if not self._sokoban_image_saving_enabled():
+            return
+
+        images = obs.get("image")
+        if images is None:
+            return
+
+        root = self._sokoban_image_root()
+        if root is None:
+            return
+
+        try:
+            from PIL import Image
+
+            batch_size = len(traj_uid)
+            for sample_idx in range(batch_size):
+                if not bool(active_masks[sample_idx]):
+                    continue
+                image = self._get_indexed(images, sample_idx)
+                if image is None:
+                    continue
+
+                sequence_name = (
+                    f"{phase}_sample_{int(sample_ids[sample_idx]):06d}"
+                    f"_rollout_{int(rollout_ids[sample_idx]):03d}"
+                    f"_{self._sanitize_path_component(traj_uid[sample_idx])}"
+                )
+                sequence_dir = os.path.join(root, self._global_step_dir_name(global_step), sequence_name)
+                os.makedirs(sequence_dir, exist_ok=True)
+                image_array = self._image_to_uint8_array(image)
+                Image.fromarray(image_array).save(
+                    os.path.join(sequence_dir, f"step_{int(step_num):03d}.png")
+                )
+        except Exception as exc:
+            if not self._sokoban_image_save_error_reported:
+                print(f"Warning: failed to save Sokoban observation images: {exc}")
+                self._sokoban_image_save_error_reported = True
 
     @staticmethod
     def _extract_tag(text: str, tag: str) -> str:
@@ -128,18 +240,32 @@ class TrajectoryCollector:
 
         return []
 
-    def build_text_prompt_sample(
+    @staticmethod
+    def _normalize_prompt_images(images: Any) -> List[Any]:
+        if images is None:
+            return []
+        if isinstance(images, (list, tuple)):
+            return list(images)
+        if isinstance(images, np.ndarray) and images.ndim == 4:
+            return [images[idx] for idx in range(images.shape[0])]
+        if isinstance(images, torch.Tensor) and images.dim() == 4:
+            return [images[idx] for idx in range(images.shape[0])]
+        return [images]
+
+    def build_prompt_sample(
         self,
         obs_content: str,
         data_source: Optional[str] = None,
         max_prompt_length: Optional[int] = None,
+        images: Any = None,
     ) -> Dict:
         """
-        Build a text-only prompt sample using the same chat-template path as rollout.
-        This is used by OPID teacher scoring to reconstruct prompt-enhanced inputs.
+        Build a prompt sample using the same chat-template path as rollout.
+        This is used by SEED teacher scoring to reconstruct prompt-enhanced inputs.
         """
         prompt_length = int(max_prompt_length or self.config.data.max_prompt_length)
         apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+        prompt_images = self._normalize_prompt_images(images)
         chat = np.array([{
             "content": obs_content,
             "role": "user",
@@ -150,6 +276,57 @@ class TrajectoryCollector:
             tokenize=False,
             **apply_chat_template_kwargs
         )
+        row_dict = {}
+
+        if prompt_images:
+            if self.processor is None:
+                raise RuntimeError("Multimodal prompt construction requires a processor.")
+            placeholder_count = prompt_with_chat_template.count("<image>")
+            if placeholder_count == 0:
+                prompt_with_chat_template = ("<image>\n" * len(prompt_images)) + prompt_with_chat_template
+                placeholder_count = len(prompt_images)
+            if placeholder_count != len(prompt_images):
+                raise RuntimeError(
+                    f"Prompt has {placeholder_count} <image> placeholder(s), "
+                    f"but {len(prompt_images)} image(s) were provided."
+                )
+
+            raw_prompt = prompt_with_chat_template.replace(
+                "<image>",
+                "<|vision_start|><|image_pad|><|vision_end|>",
+            )
+            row_dict["multi_modal_data"] = {
+                "image": [
+                    process_image(self._image_to_uint8_array(image))
+                    for image in prompt_images
+                ]
+            }
+            image_inputs = self.processor.image_processor(
+                row_dict["multi_modal_data"]["image"],
+                return_tensors="pt",
+            )
+            image_grid_thw = image_inputs["image_grid_thw"]
+            row_dict["multi_modal_inputs"] = {
+                key: val for key, val in image_inputs.items()
+            }
+            if image_grid_thw is not None:
+                merge_length = self.processor.image_processor.merge_size**2
+                for image_idx in range(len(prompt_images)):
+                    prompt_with_chat_template = prompt_with_chat_template.replace(
+                        "<image>",
+                        "<|vision_start|>"
+                        + "<|placeholder|>" * (image_grid_thw[image_idx].prod() // merge_length)
+                        + "<|vision_end|>",
+                        1,
+                    )
+
+                prompt_with_chat_template = prompt_with_chat_template.replace(
+                    "<|placeholder|>",
+                    self.processor.image_token,
+                )
+        else:
+            raw_prompt = prompt_with_chat_template
+
         input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
             prompt=prompt_with_chat_template,
             tokenizer=self.tokenizer,
@@ -158,9 +335,27 @@ class TrajectoryCollector:
             left_pad=True,
             truncation=self.config.data.truncation,
         )
-        position_ids = compute_position_id_with_mask(attention_mask)
 
-        raw_prompt_ids = self.tokenizer.encode(prompt_with_chat_template, add_special_tokens=False)
+        if prompt_images:
+            if "Qwen3VLProcessor" in self.processor.__class__.__name__:
+                from verl.models.transformers.qwen3_vl import get_rope_index
+            else:
+                from verl.models.transformers.qwen2_vl import get_rope_index
+
+            vision_position_ids = get_rope_index(
+                self.processor,
+                input_ids=input_ids[0],
+                image_grid_thw=image_grid_thw,
+                attention_mask=attention_mask[0],
+            )
+            valid_mask = attention_mask[0].bool()
+            text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
+            text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+            position_ids = [torch.cat((text_position_ids, vision_position_ids), dim=0)]
+        else:
+            position_ids = compute_position_id_with_mask(attention_mask)
+
+        raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > prompt_length:
             if self.config.data.truncation == "left":
                 raw_prompt_ids = raw_prompt_ids[-prompt_length:]
@@ -175,14 +370,58 @@ class TrajectoryCollector:
                     f"Prompt length {len(raw_prompt_ids)} is longer than {prompt_length}."
                 )
 
-        return {
+        row_dict.update({
             "input_ids": input_ids[0],
             "attention_mask": attention_mask[0],
-            "position_ids": position_ids[0],
+            "position_ids": position_ids[0] if isinstance(position_ids, list) else position_ids[0],
             "raw_prompt_ids": raw_prompt_ids,
             "obs_text": obs_content,
             "data_source": data_source,
-        }
+        })
+        return row_dict
+
+    def build_text_prompt_sample(
+        self,
+        obs_content: str,
+        data_source: Optional[str] = None,
+        max_prompt_length: Optional[int] = None,
+    ) -> Dict:
+        """
+        Build a text-only prompt sample using the same chat-template path as rollout.
+        """
+        return self.build_prompt_sample(
+            obs_content=obs_content,
+            data_source=data_source,
+            max_prompt_length=max_prompt_length,
+            images=None,
+        )
+
+    def build_prompt_batch(
+        self,
+        obs_contents: List[str],
+        data_sources: Optional[List[Optional[str]]] = None,
+        meta_info: Optional[Dict] = None,
+        max_prompt_length: Optional[int] = None,
+        images: Optional[List[Any]] = None,
+    ) -> DataProto:
+        """
+        Build a batch of text or multimodal prompts. Used for SEED analysis
+        and teacher scoring.
+        """
+        processed_samples = []
+        for sample_idx, obs_content in enumerate(obs_contents):
+            data_source = None if data_sources is None else data_sources[sample_idx]
+            sample_images = None if images is None else images[sample_idx]
+            processed_samples.append(
+                self.build_prompt_sample(
+                    obs_content=obs_content,
+                    data_source=data_source,
+                    max_prompt_length=max_prompt_length,
+                    images=sample_images,
+                )
+            )
+        batch = collate_fn(processed_samples)
+        return DataProto.from_single_dict(data=batch, meta_info=meta_info)
 
     def build_text_prompt_batch(
         self,
@@ -192,20 +431,15 @@ class TrajectoryCollector:
         max_prompt_length: Optional[int] = None,
     ) -> DataProto:
         """
-        Build a batch of text-only prompts. Used for OPID teacher scoring.
+        Build a batch of text-only prompts. Used for SEED teacher scoring.
         """
-        processed_samples = []
-        for sample_idx, obs_content in enumerate(obs_contents):
-            data_source = None if data_sources is None else data_sources[sample_idx]
-            processed_samples.append(
-                self.build_text_prompt_sample(
-                    obs_content=obs_content,
-                    data_source=data_source,
-                    max_prompt_length=max_prompt_length,
-                )
-            )
-        batch = collate_fn(processed_samples)
-        return DataProto.from_single_dict(data=batch, meta_info=meta_info)
+        return self.build_prompt_batch(
+            obs_contents=obs_contents,
+            data_sources=data_sources,
+            meta_info=meta_info,
+            max_prompt_length=max_prompt_length,
+            images=None,
+        )
 
     def preprocess_single_sample(
         self,
@@ -276,7 +510,7 @@ class TrajectoryCollector:
         if is_multi_modal:
             # Replace image placeholder with vision tokens
             raw_prompt = prompt_with_chat_template.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
-            row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
+            row_dict['multi_modal_data'] = {'image': [process_image(self._image_to_uint8_array(obs_image))]}
             image_inputs = self.processor.image_processor(row_dict['multi_modal_data']['image'], return_tensors='pt')
             image_grid_thw = image_inputs['image_grid_thw']
             row_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}
@@ -466,6 +700,7 @@ class TrajectoryCollector:
             gen_batch: DataProto, 
             actor_rollout_wg, 
             envs: EnvironmentManagerBase,
+            phase: str = "train",
             ) -> DataProto:
         """
         Collects trajectories through parallel agent-environment agent_loop.
@@ -483,6 +718,7 @@ class TrajectoryCollector:
         """
 
         batch_size = len(gen_batch.batch)
+        global_step = (gen_batch.meta_info or {}).get("global_step")
 
         # Initial observations from the environment
         obs, infos = envs.reset(kwargs=gen_batch.non_tensor_batch.pop('env_kwargs', None))
@@ -521,6 +757,16 @@ class TrajectoryCollector:
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):
             active_masks = np.logical_not(is_done)
+            self._save_sokoban_observation_images(
+                obs,
+                traj_uid=traj_uid,
+                sample_ids=sample_ids,
+                rollout_ids=rollout_ids,
+                step_num=_step,
+                global_step=global_step,
+                active_masks=active_masks,
+                phase=phase,
+            )
 
             batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
 
@@ -644,6 +890,7 @@ class TrajectoryCollector:
             gen_batch: DataProto, 
             actor_rollout_wg, 
             envs: EnvironmentManagerBase,
+            phase: str = "train",
             ) -> DataProto:
         """
         Conduct dynamic rollouts until a target batch size is met. 
@@ -681,6 +928,7 @@ class TrajectoryCollector:
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
                 envs=envs,
+                phase=phase,
             )
             batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings = filter_group_data(batch_list=batch_list, 
                                                                                                 episode_rewards=episode_rewards, 
@@ -765,6 +1013,7 @@ class TrajectoryCollector:
                     gen_batch=gen_batch,
                     actor_rollout_wg=actor_rollout_wg,
                     envs=envs,
+                    phase="train" if is_train else "val",
                 )
             else:
                 # Vanilla Sampling
@@ -773,6 +1022,7 @@ class TrajectoryCollector:
                     gen_batch=gen_batch,
                     actor_rollout_wg=actor_rollout_wg,
                     envs=envs,
+                    phase="train" if is_train else "val",
                 )
             assert len(total_batch_list) == len(total_episode_rewards)
             assert len(total_batch_list) == len(total_episode_lengths)

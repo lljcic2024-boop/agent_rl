@@ -3,7 +3,7 @@
 
 This mirrors the ALFWorld/WebShop v2 flow: sample Search-R1 train examples,
 collect baseline rollouts with a local/OpenAI-compatible policy model, ask an
-LLM to produce episode-level skills using the current OPID analyzer prompt, and
+LLM to produce episode-level skills using the current SEED analyzer prompt, and
 export every parseable candidate directly as SFT data.
 """
 
@@ -34,7 +34,7 @@ from examples.prompt_agent.local_vllm_alfworld import (  # noqa: E402
     json_safe,
     load_env_file,
 )
-from opid.prompting import build_augmented_observation_text  # noqa: E402
+from seed.prompting import build_augmented_observation_text  # noqa: E402
 from scripts.alfworld_episode_skill_pipeline.pipeline import (  # noqa: E402
     ChatEndpoint,
     OpenAITextClient,
@@ -89,6 +89,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete existing candidate/SFT outputs before generating candidates.",
     )
+    parser.add_argument(
+        "--stop-after-baseline-rollouts",
+        action="store_true",
+        help="Exit successfully after baseline rollouts are complete.",
+    )
+    parser.add_argument(
+        "--stop-after-skill-generation",
+        action="store_true",
+        help="Exit successfully after candidate skill API generation is complete.",
+    )
     parser.add_argument("--log-level", default="INFO")
 
     parser.add_argument("--search-url", default="http://127.0.0.1:8000/retrieve")
@@ -119,8 +129,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skill-gen-workers", type=int, default=128)
     parser.add_argument(
         "--skill-prompt-version",
-        default="opid",
-        choices=("opid", "strategy_bank", "search_strategy_bank", "skill_only", "search_skill_only"),
+        default="seed",
+        choices=("seed", "strategy_bank", "search_strategy_bank", "skill_only", "search_skill_only"),
         help=(
             "Episode-skill prompt version. Use 'search_strategy_bank' for the "
             "search QA strategy-bank prompt, or 'search_skill_only' for an "
@@ -133,7 +143,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def normalize_search_skill_prompt_version(version: object) -> str:
-    value = str(version or "opid").strip()
+    value = str(version or "seed").strip()
     if value == "strategy_bank":
         return "search_strategy_bank"
     if value == "skill_only":
@@ -594,7 +604,7 @@ def collect_baseline_rollouts(
     return records
 
 
-def trajectory_to_opid_steps(trajectory: Dict[str, Any]) -> List[Dict[str, Any]]:
+def trajectory_to_seed_steps(trajectory: Dict[str, Any]) -> List[Dict[str, Any]]:
     steps: List[Dict[str, Any]] = []
     for step in trajectory.get("steps", []):
         step_info = step.get("info", {})
@@ -624,9 +634,9 @@ def build_candidate_skill_record(
     skill_endpoint: ChatEndpoint,
     skill_prompt_version: str,
 ) -> Dict[str, Any]:
-    from opid.analysis import OPIDEpisodeAnalyzer
+    from seed.analysis import SEEDEpisodeAnalyzer
 
-    analyzer = OPIDEpisodeAnalyzer(
+    analyzer = SEEDEpisodeAnalyzer(
         backend="openai",
         max_completion_tokens=skill_endpoint.max_completion_tokens,
         max_step_skills_per_traj=0,
@@ -635,7 +645,7 @@ def build_candidate_skill_record(
     )
     skill_client = OpenAITextClient(skill_endpoint)
     skill_id = f"{trajectory['task_id']}:{trajectory['rollout_id']}"
-    steps = trajectory_to_opid_steps(trajectory)
+    steps = trajectory_to_seed_steps(trajectory)
     prompt = analyzer._build_episode_analysis_prompt(
         steps=steps,
         candidate_step_indices=[step["step_index"] for step in steps],
@@ -805,7 +815,7 @@ def build_sft_exports_from_candidates(
         messages = prompt.get("messages", []) if isinstance(prompt, dict) else []
         if not messages:
             continue
-        analysis_prompt_version = str(candidate.get("analysis_prompt_version", "opid"))
+        analysis_prompt_version = str(candidate.get("analysis_prompt_version", "seed"))
         if analysis_prompt_version == "search_skill_only":
             response_payload = {
                 "episode_skill": candidate.get("episode_skill", ""),
@@ -992,6 +1002,17 @@ def main() -> None:
         output_dir=output_dir,
         policy_endpoint=policy_endpoint,
     )
+    if args.stop_after_baseline_rollouts:
+        log_stage(
+            output_dir,
+            "baseline_rollout",
+            "complete",
+            completed_rollouts=len(baseline_rollouts),
+            stopped_before_skill_generation=True,
+        )
+        logging.info("Baseline rollouts complete; stopping before skill API generation.")
+        return
+
     baseline_rollouts_for_generation = (
         baseline_rollouts[: max(0, int(args.max_candidates))]
         if args.max_candidates is not None
@@ -1007,6 +1028,17 @@ def main() -> None:
         max_workers=args.skill_gen_workers,
         resume=args.resume and not args.regenerate_candidates,
     )
+    if args.stop_after_skill_generation:
+        log_stage(
+            output_dir,
+            "skill_generation",
+            "complete",
+            completed_skills=len(candidate_skills),
+            parse_ok_skills=sum(1 for record in candidate_skills if record.get("parse_ok")),
+            stopped_before_sft_export=True,
+        )
+        logging.info("Candidate skill API generation complete; stopping before SFT export.")
+        return
 
     log_stage(output_dir, "sft_export", "running", candidate_skills=len(candidate_skills))
     sft_records = build_sft_exports_from_candidates(

@@ -261,7 +261,7 @@ def compute_teacher_token_advantage(
     epsilon: float = 1e-6,
 ) -> torch.Tensor:
     """
-    Compute token-level teacher advantage for OPID.
+    Compute token-level teacher advantage for SEED.
 
     The default teacher signal is the detached log-prob improvement under the
     enhanced prompt:
@@ -316,7 +316,7 @@ def compute_teacher_token_advantage(
     return teacher_advantages
 
 
-def summarize_opid_advantage_components(
+def summarize_seed_advantage_components(
     response_mask: torch.Tensor,
     episode_advantages: torch.Tensor,
     step_advantages: torch.Tensor,
@@ -325,7 +325,7 @@ def summarize_opid_advantage_components(
     epsilon: float = 1e-6,
 ) -> Dict[str, float]:
     """
-    Summarize the relative contribution of the three OPID advantage terms.
+    Summarize the relative contribution of the three SEED advantage terms.
 
     The reported share is based on the weighted absolute mean magnitude of each
     component over valid response tokens:
@@ -387,16 +387,16 @@ def summarize_opid_advantage_components(
     ) if valid_mask.any() else 0.0
 
     metrics = {}
-    metrics.update(_summarize("opid/adv_raw", raw_components))
-    metrics.update(_summarize("opid/adv", weighted_components))
+    metrics.update(_summarize("seed/adv_raw", raw_components))
+    metrics.update(_summarize("seed/adv", weighted_components))
     metrics.update({
-        "opid/adv/teacher_active_token_ratio": teacher_active_token_ratio,
-        "opid/adv/step_weight": float(step_advantage_w),
+        "seed/adv/teacher_active_token_ratio": teacher_active_token_ratio,
+        "seed/adv/step_weight": float(step_advantage_w),
     })
     return metrics
 
 
-def compute_opid_advantage_components(
+def compute_seed_advantage_components(
     token_level_rewards: torch.Tensor,
     step_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -418,10 +418,10 @@ def compute_opid_advantage_components(
     similarity_thresh: float = 0.95,
     normalize_teacher_adv: bool = False,
     clip_teacher_adv: Optional[float] = None,
-    metrics_prefix: str = "opid/state_group",
+    metrics_prefix: str = "seed/state_group",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
     """
-    Compute OPID advantages with independently weighted episode- and step-skill teacher terms.
+    Compute SEED advantages with independently weighted episode- and step-skill teacher terms.
     """
     remove_std = _mode_to_remove_std(mode)
 
@@ -437,7 +437,7 @@ def compute_opid_advantage_components(
     step_weight = float(step_advantage_w or 0.0)
     if step_weight != 0.0:
         if step_rewards is None:
-            raise ValueError("step_rewards is required when algorithm.opid.step_advantage_w is non-zero.")
+            raise ValueError("step_rewards is required when algorithm.seed.step_advantage_w is non-zero.")
         step_group_uids = build_step_group(anchor_obs, index, enable_similarity, similarity_thresh)
         step_group_metrics = compute_step_group_distribution_metrics(
             step_group_uids=step_group_uids,
@@ -479,9 +479,9 @@ def compute_opid_advantage_components(
         + teacher_advantages
     )
     step_group_metrics.update({
-        "opid/adv/step_advantage_weight": step_weight,
-        "opid/adv/episode_skill_teacher_weight": episode_skill_weight,
-        "opid/adv/step_skill_teacher_weight": step_skill_weight,
+        "seed/adv/step_advantage_weight": step_weight,
+        "seed/adv/episode_skill_teacher_weight": episode_skill_weight,
+        "seed/adv/step_skill_teacher_weight": step_skill_weight,
     })
     return episode_advantages, step_advantages, teacher_advantages, scores, step_group_metrics
 
@@ -527,7 +527,7 @@ def compute_gigpo_outcome_advantage(token_level_rewards: torch.Tensor,
     return scores, scores
 
 
-def compute_opid_outcome_advantage(token_level_rewards: torch.Tensor,
+def compute_seed_outcome_advantage(token_level_rewards: torch.Tensor,
                                    step_rewards: torch.Tensor,
                                    response_mask: torch.Tensor,
                                    anchor_obs: np.array,
@@ -551,12 +551,12 @@ def compute_opid_outcome_advantage(token_level_rewards: torch.Tensor,
                                    return_metrics: bool = False,
                                    ):
     """
-    Compute the advantages for OPID.
+    Compute the advantages for SEED.
 
-    OPID uses episode-level outcome advantages plus optional episode-skill and
+    SEED uses episode-level outcome advantages plus optional episode-skill and
     step-skill teacher terms, each derived from enhanced-prompt log-probs.
     """
-    episode_advantages, step_advantages, teacher_advantages, scores, step_group_metrics = compute_opid_advantage_components(
+    episode_advantages, step_advantages, teacher_advantages, scores, step_group_metrics = compute_seed_advantage_components(
         token_level_rewards=token_level_rewards,
         step_rewards=step_rewards,
         response_mask=response_mask,
@@ -578,10 +578,10 @@ def compute_opid_outcome_advantage(token_level_rewards: torch.Tensor,
         similarity_thresh=similarity_thresh,
         normalize_teacher_adv=normalize_teacher_adv,
         clip_teacher_adv=clip_teacher_adv,
-        metrics_prefix="opid/state_group",
+        metrics_prefix="seed/state_group",
     )
     if return_metrics:
-        component_metrics = summarize_opid_advantage_components(
+        component_metrics = summarize_seed_advantage_components(
             response_mask=response_mask,
             episode_advantages=episode_advantages,
             step_advantages=step_advantages,

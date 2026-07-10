@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Generate episode-skill SFT data from ALFWorld baseline rollouts.
+"""Generate episode-skill SFT data from ALFWorld policy rollouts.
 
-Version 2 intentionally skips downstream skill validation. It reads existing
-baseline rollouts, regenerates candidate episode skills with the current OPID
-episode-only analyzer prompt, and exports parseable candidates directly as SFT
-records.
+Version 2 intentionally skips downstream skill validation. It can collect
+baseline rollouts with a local policy endpoint, generate candidate episode
+skills with the current SEED episode-only analyzer prompt, and export parseable
+candidates directly as SFT records.
 """
 
 from __future__ import annotations
@@ -29,11 +29,13 @@ from scripts.alfworld_episode_skill_pipeline.pipeline import (  # noqa: E402
     ChatEndpoint,
     append_jsonl,
     build_candidate_skill_record,
+    collect_baseline_rollouts,
     json_safe,
     load_env_file,
     log_stage,
     read_jsonl,
     resolve_endpoint,
+    sample_tasks,
     setup_logging,
     update_progress,
     write_json,
@@ -42,6 +44,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 OUTPUT_FILES = [
+    "sampled_tasks.jsonl",
     "baseline_rollouts.jsonl",
     "candidate_skills.jsonl",
     "sft_episode_skill_all.jsonl",
@@ -56,12 +59,30 @@ OUTPUT_FILES = [
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", default=".env")
+    parser.add_argument(
+        "--alf-config",
+        default=str(
+            PROJECT_ROOT / "agent_system/environments/env_package/alfworld/configs/config_tw.yaml"
+        ),
+    )
     parser.add_argument("--output-dir", default="outputs/alfworld_episode_skill_pipeline_v2")
     parser.add_argument(
         "--baseline-rollouts",
-        default="outputs/alfworld_episode_skill_pipeline_qwen25_3b/baseline_rollouts.jsonl",
-        help="Existing baseline_rollouts.jsonl to reuse.",
+        default=None,
+        help="Optional existing baseline_rollouts.jsonl to reuse instead of collecting policy rollouts.",
     )
+    parser.add_argument("--tasks-per-type", type=int, default=30)
+    parser.add_argument("--rollouts-per-task", type=int, default=8)
+    parser.add_argument(
+        "--task-batch-size",
+        type=int,
+        default=128,
+        help="Number of different ALFWorld tasks to rollout in the same baseline wave.",
+    )
+    parser.add_argument("--max-steps", type=int, default=30)
+    parser.add_argument("--history-length", type=int, default=5)
+    parser.add_argument("--request-workers", type=int, default=128)
+    parser.add_argument("--max-tasks", type=int, default=None)
     parser.add_argument("--max-candidates", type=int, default=None)
     parser.add_argument("--skill-gen-workers", type=int, default=128)
     parser.add_argument("--sft-val-ratio", type=float, default=0.1)
@@ -73,7 +94,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete existing candidate/SFT outputs before generating candidates.",
     )
+    parser.add_argument(
+        "--stop-after-baseline-rollouts",
+        action="store_true",
+        help="Exit successfully after baseline rollouts are complete.",
+    )
+    parser.add_argument(
+        "--stop-after-skill-generation",
+        action="store_true",
+        help="Exit successfully after candidate skill API generation is complete.",
+    )
     parser.add_argument("--log-level", default="INFO")
+
+    parser.add_argument("--policy-base-url", default=None)
+    parser.add_argument("--policy-api-key", default=None)
+    parser.add_argument("--policy-model", default=None)
+    parser.add_argument("--policy-temperature", type=float, default=0.4)
+    parser.add_argument("--policy-max-completion-tokens", type=int, default=512)
+    parser.add_argument("--policy-timeout", type=float, default=120.0)
+    parser.add_argument("--policy-retries", type=int, default=2)
+    parser.add_argument("--policy-retry-delay", type=float, default=1.0)
+    parser.add_argument("--policy-extra-body-json", default=None)
+    parser.add_argument("--fallback-action", default="look")
 
     parser.add_argument("--skill-base-url", default=None)
     parser.add_argument("--skill-api-key", default=None)
@@ -324,16 +366,20 @@ def write_run_config(
     args: argparse.Namespace,
     output_dir: Path,
     skill_endpoint: ChatEndpoint,
+    policy_endpoint: ChatEndpoint | None,
 ) -> None:
     redacted_args = vars(args).copy()
     if redacted_args.get("skill_api_key"):
         redacted_args["skill_api_key"] = "<redacted>"
+    if redacted_args.get("policy_api_key"):
+        redacted_args["policy_api_key"] = "<redacted>"
     payload = {
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "version": "v2_no_skill_validation",
         "project_root": str(PROJECT_ROOT),
         "argv": sys.argv,
         "args": redacted_args,
+        "policy_endpoint": None,
         "skill_endpoint": {
             "base_url": skill_endpoint.base_url,
             "api_key": "<redacted>" if skill_endpoint.api_key else None,
@@ -342,6 +388,14 @@ def write_run_config(
             "max_completion_tokens": skill_endpoint.max_completion_tokens,
         },
     }
+    if policy_endpoint is not None:
+        payload["policy_endpoint"] = {
+            "base_url": policy_endpoint.base_url,
+            "api_key": "<redacted>" if policy_endpoint.api_key else None,
+            "model": policy_endpoint.model,
+            "temperature": policy_endpoint.temperature,
+            "max_completion_tokens": policy_endpoint.max_completion_tokens,
+        }
     write_json(output_dir / "run_config.json", payload)
 
 
@@ -357,6 +411,22 @@ def main() -> None:
     )
     setup_logging(output_dir, args.log_level)
 
+    policy_endpoint = None
+    if not args.baseline_rollouts:
+        policy_endpoint = resolve_endpoint(
+            prefix="policy",
+            args=args,
+            default_base_url_env="POLICY_OPENAI_BASE_URL",
+            default_model_env="POLICY_OPENAI_MODEL",
+            default_model="Qwen2.5-3B-Instruct",
+            temperature=args.policy_temperature,
+            max_completion_tokens=args.policy_max_completion_tokens,
+            timeout=args.policy_timeout,
+            retries=args.policy_retries,
+            retry_delay=args.policy_retry_delay,
+            extra_body_json=args.policy_extra_body_json,
+        )
+
     skill_endpoint = resolve_endpoint(
         prefix="skill",
         args=args,
@@ -370,10 +440,57 @@ def main() -> None:
         retry_delay=args.skill_retry_delay,
         extra_body_json=args.skill_extra_body_json,
     )
-    write_run_config(args=args, output_dir=output_dir, skill_endpoint=skill_endpoint)
+    write_run_config(
+        args=args,
+        output_dir=output_dir,
+        policy_endpoint=policy_endpoint,
+        skill_endpoint=skill_endpoint,
+    )
 
-    baseline_path = copy_baseline_rollouts(Path(args.baseline_rollouts), output_dir)
-    baseline_rollouts = read_jsonl(baseline_path)
+    if args.baseline_rollouts:
+        baseline_path = copy_baseline_rollouts(Path(args.baseline_rollouts), output_dir)
+        baseline_rollouts = read_jsonl(baseline_path)
+        log_stage(
+            output_dir,
+            "baseline_rollouts",
+            "complete",
+            baseline_rollouts=len(baseline_rollouts),
+            source=str(Path(args.baseline_rollouts)),
+        )
+    else:
+        if policy_endpoint is None:
+            raise RuntimeError("policy endpoint is required when --baseline-rollouts is not provided")
+        log_stage(
+            output_dir,
+            "task_sampling",
+            "running",
+            tasks_per_type=int(args.tasks_per_type),
+        )
+        tasks = sample_tasks(args, output_dir)
+        log_stage(
+            output_dir,
+            "task_sampling",
+            "complete",
+            sampled_tasks=len(tasks),
+            rollouts_per_task=int(args.rollouts_per_task),
+        )
+        baseline_rollouts = collect_baseline_rollouts(
+            tasks=tasks,
+            args=args,
+            output_dir=output_dir,
+            policy_endpoint=policy_endpoint,
+        )
+    if args.stop_after_baseline_rollouts:
+        log_stage(
+            output_dir,
+            "baseline_rollout",
+            "complete",
+            completed_rollouts=len(baseline_rollouts),
+            stopped_before_skill_generation=True,
+        )
+        logging.info("Baseline rollouts complete; stopping before skill API generation.")
+        return
+
     if args.max_candidates is not None:
         baseline_rollouts_for_generation = baseline_rollouts[: max(0, args.max_candidates)]
     else:
@@ -384,7 +501,7 @@ def main() -> None:
         "complete",
         baseline_rollouts=len(baseline_rollouts),
         used_for_generation=len(baseline_rollouts_for_generation),
-        source=str(Path(args.baseline_rollouts)),
+        source=str(Path(args.baseline_rollouts)) if args.baseline_rollouts else "generated",
     )
 
     candidate_skills = generate_candidate_skills_v2(
@@ -395,6 +512,17 @@ def main() -> None:
         max_workers=args.skill_gen_workers,
         resume=args.resume and not args.regenerate_candidates,
     )
+    if args.stop_after_skill_generation:
+        log_stage(
+            output_dir,
+            "skill_generation",
+            "complete",
+            completed_skills=len(candidate_skills),
+            parse_ok_skills=sum(1 for record in candidate_skills if record.get("parse_ok")),
+            stopped_before_sft_export=True,
+        )
+        logging.info("Candidate skill API generation complete; stopping before SFT export.")
+        return
 
     log_stage(output_dir, "sft_export", "running", candidate_skills=len(candidate_skills))
     sft_records = build_sft_exports_from_candidates(

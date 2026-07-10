@@ -1,6 +1,6 @@
 import pytest
 
-from opid.prompting import build_augmented_observation_text, select_skill_teacher_sources
+from seed.prompting import build_augmented_observation_text, select_skill_teacher_sources
 
 
 PROMPT = """You are an expert autonomous agent.
@@ -113,7 +113,7 @@ def test_episode_only_uses_episode_skill_without_step_skill():
 
 
 def test_skill_teacher_mode_rejects_unknown_mode():
-    with pytest.raises(ValueError, match="Unsupported OPID skill_teacher_mode"):
+    with pytest.raises(ValueError, match="Unsupported SEED skill_teacher_mode"):
         select_skill_teacher_sources(
             step_skill="skill",
             episode_skill_enabled=True,

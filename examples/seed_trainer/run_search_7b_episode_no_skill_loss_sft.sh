@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+set -x
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ENV_FILE="${ENV_FILE:-$PROJECT_ROOT/.env}"
+
+if [[ -f "$ENV_FILE" ]]; then
+    set +x
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+    set -x
+fi
+
+if [[ -z "${HF_MODEL_PATH:-}" ]]; then
+    if [[ -z "${MODELS_ROOT:-}" ]]; then
+        echo "Please set MODELS_ROOT in $ENV_FILE, or set HF_MODEL_PATH explicitly." >&2
+        exit 1
+    fi
+    HF_MODEL_PATH="$MODELS_ROOT/Qwen2.5-7B-Instruct-search-episode-skill-sft"
+fi
+if [[ ! -f "$HF_MODEL_PATH/config.json" ]]; then
+    echo "HF model not found: $HF_MODEL_PATH" >&2
+    exit 1
+fi
+
+# Initialize both policy and policy-vLLM analyzer from the Search QA SFT
+# episode-skill model.
+export MODEL_PATH="${MODEL_PATH:-$HF_MODEL_PATH}"
+
+# Use the SFT model as an episode-only analyzer during SEED RL, while disabling
+# the auxiliary skill-generation LM loss.
+export SEED_SKILL_MODE="${SEED_SKILL_MODE:-episode_only}"
+export SEED_SDAR_LOSS_COEF="${SEED_SDAR_LOSS_COEF:-0.01}"
+export SEED_SKILL_GEN_LOSS_ENABLE="${SEED_SKILL_GEN_LOSS_ENABLE:-False}"
+export SEED_SKILL_GEN_LOSS_COEF="${SEED_SKILL_GEN_LOSS_COEF:-0.0}"
+export SEED_ANALYSIS_BACKEND="${SEED_ANALYSIS_BACKEND:-policy_vllm}"
+if [[ -z "${SEED_ANALYSIS_PROMPT_VERSION:-}" ]]; then
+    if [[ "$(basename "$HF_MODEL_PATH")" == *"skill_only"* ]]; then
+        export SEED_ANALYSIS_PROMPT_VERSION="search_skill_only"
+    elif [[ "$(basename "$HF_MODEL_PATH")" == *"strategy_bank"* ]]; then
+        export SEED_ANALYSIS_PROMPT_VERSION="search_strategy_bank"
+    else
+        export SEED_ANALYSIS_PROMPT_VERSION="seed"
+    fi
+elif [[ "$SEED_ANALYSIS_PROMPT_VERSION" == "strategy_bank" ]]; then
+    export SEED_ANALYSIS_PROMPT_VERSION="search_strategy_bank"
+elif [[ "$SEED_ANALYSIS_PROMPT_VERSION" == "skill_only" ]]; then
+    export SEED_ANALYSIS_PROMPT_VERSION="search_skill_only"
+fi
+
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-seed_qwen2.5_7b_search_sft}"
+export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}"
+
+exec "$SCRIPT_DIR/run_search_both_no_skill_loss_base.sh" \
+    algorithm.seed.skill_gen.enable="$SEED_SKILL_GEN_LOSS_ENABLE" \
+    actor_rollout_ref.actor.skill_gen_loss_coef="$SEED_SKILL_GEN_LOSS_COEF" \
+    "$@"

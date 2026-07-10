@@ -770,11 +770,11 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         sdar_loss_coef = float(self.config.get("sdar_loss_coef", 0.0) or 0.0)
         skill_gen_loss_coef = float(self.config.get("skill_gen_loss_coef", 0.0) or 0.0)
-        opid_skill_gen_payload = data.meta_info.get("opid_skill_gen")
+        seed_skill_gen_payload = data.meta_info.get("seed_skill_gen")
         use_skill_gen_loss = (
             skill_gen_loss_coef > 0
-            and isinstance(opid_skill_gen_payload, dict)
-            and all(key in opid_skill_gen_payload for key in ("responses", "input_ids", "attention_mask", "position_ids", "rewards"))
+            and isinstance(seed_skill_gen_payload, dict)
+            and all(key in seed_skill_gen_payload for key in ("responses", "input_ids", "attention_mask", "position_ids", "rewards"))
         )
         teacher_mask_key = "teacher_signal_mask" if "teacher_signal_mask" in data.batch.keys() else "critical_step_mask"
         has_teacher_signal = "teacher_log_prob" in data.batch.keys() and teacher_mask_key in data.batch.keys()
@@ -968,7 +968,7 @@ class DataParallelPPOActor(BasePPOActor):
         if use_skill_gen_loss:
             self.actor_optimizer.zero_grad()
             skill_gen_metrics = self.backward_skill_gen_loss(
-                opid_skill_gen_payload,
+                seed_skill_gen_payload,
                 temperature=temperature,
                 loss_coef=skill_gen_loss_coef,
             )

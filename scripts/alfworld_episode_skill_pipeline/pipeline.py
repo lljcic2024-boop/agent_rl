@@ -2,8 +2,8 @@
 """Build verified episode-skill SFT data for ALFWorld.
 
 This script is intentionally standalone: it adds a new offline pipeline without
-editing the existing trainer or OPID implementation. It reuses the current
-ALFWorld prompt manager, OPID episode-only analyzer prompt, and OPID skill
+editing the existing trainer or SEED implementation. It reuses the current
+ALFWorld prompt manager, SEED episode-only analyzer prompt, and SEED skill
 injection format.
 """
 
@@ -40,7 +40,7 @@ from examples.prompt_agent.local_vllm_alfworld import (  # noqa: E402
     load_env_file,
     resolve_extra_body,
 )
-from opid.prompting import build_augmented_observation_text  # noqa: E402
+from seed.prompting import build_augmented_observation_text  # noqa: E402
 
 
 TASK_TYPES = [
@@ -900,7 +900,7 @@ def collect_baseline_rollouts(
     return records
 
 
-def trajectory_to_opid_steps(trajectory: Dict[str, Any]) -> List[Dict[str, Any]]:
+def trajectory_to_seed_steps(trajectory: Dict[str, Any]) -> List[Dict[str, Any]]:
     steps = []
     for step in trajectory.get("steps", []):
         raw_observation = extract_standard_alfworld_observation(step.get("observation", ""))
@@ -943,9 +943,9 @@ def build_candidate_skill_record(
     trajectory: Dict[str, Any],
     skill_endpoint: ChatEndpoint,
 ) -> Dict[str, Any]:
-    from opid.analysis import OPIDEpisodeAnalyzer
+    from seed.analysis import SEEDEpisodeAnalyzer
 
-    analyzer = OPIDEpisodeAnalyzer(
+    analyzer = SEEDEpisodeAnalyzer(
         backend="openai",
         max_completion_tokens=skill_endpoint.max_completion_tokens,
         max_step_skills_per_traj=0,
@@ -953,7 +953,7 @@ def build_candidate_skill_record(
     )
     skill_client = OpenAITextClient(skill_endpoint)
     skill_id = f"{trajectory['task_id']}:{trajectory['rollout_id']}"
-    steps = trajectory_to_opid_steps(trajectory)
+    steps = trajectory_to_seed_steps(trajectory)
     candidate_step_indices = [step["step_index"] for step in steps]
     prompt = analyzer._build_episode_analysis_prompt(
         steps=steps,
@@ -995,15 +995,15 @@ def build_episode_only_analysis_prompt_from_trajectory(
     *,
     max_completion_tokens: int,
 ) -> Dict[str, Any]:
-    from opid.analysis import OPIDEpisodeAnalyzer
+    from seed.analysis import SEEDEpisodeAnalyzer
 
-    analyzer = OPIDEpisodeAnalyzer(
+    analyzer = SEEDEpisodeAnalyzer(
         backend="openai",
         max_completion_tokens=max_completion_tokens,
         max_step_skills_per_traj=0,
         skill_mode="episode_only",
     )
-    steps = trajectory_to_opid_steps(trajectory)
+    steps = trajectory_to_seed_steps(trajectory)
     candidate_step_indices = [step["step_index"] for step in steps]
     return analyzer._build_episode_analysis_prompt(
         steps=steps,

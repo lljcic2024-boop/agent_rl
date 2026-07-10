@@ -25,9 +25,11 @@ if [[ -z "${MODEL_PATH:-}" ]]; then
 fi
 export MODEL_PATH
 export MODEL_NAME="${MODEL_NAME:-$(basename "$MODEL_PATH")}"
-export OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_7b_glm_self}"
-export SKILL_PROMPT_VERSION="${SKILL_PROMPT_VERSION:-opid}"
+export SKILL_PROMPT_VERSION="${SKILL_PROMPT_VERSION:-seed}"
 export SKILL_MODEL="${SKILL_MODEL:-glm-5.2}"
+# shellcheck source=../sft_teacher_naming.sh
+source "$PROJECT_ROOT/scripts/sft_teacher_naming.sh"
+export OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_7b_${SFT_SELF_DIR_SUFFIX}}"
 
 export VLLM_LOG_FILE="${VLLM_LOG_FILE:-$PROJECT_ROOT/logs/vllm/search_policy_${MODEL_NAME}_self_glm_$(date +%Y%m%d_%H%M%S).log}"
 

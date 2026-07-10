@@ -7,6 +7,7 @@ data:
   # Single-turn settings
   prompt_key: question
   response_key: answer
+  image_key: null
   prompt_dict_keys: ['question']
   response_dict_keys: ['answer']
   # Multi-turn settings

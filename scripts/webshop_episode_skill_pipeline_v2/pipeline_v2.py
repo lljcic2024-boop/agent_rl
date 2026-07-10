@@ -3,7 +3,7 @@
 
 This is the WebShop counterpart of the ALFWorld v2 pipeline: sample train
 goals, collect baseline rollouts with a local/OpenAI-compatible policy model,
-ask an LLM to produce episode-level skills with the current OPID analyzer
+ask an LLM to produce episode-level skills with the current SEED analyzer
 prompt, and export all parseable skills directly as SFT data.
 """
 
@@ -39,7 +39,7 @@ from examples.prompt_agent.local_vllm_alfworld import (  # noqa: E402
     resolve_extra_body,
 )
 from examples.prompt_agent.local_vllm_webshop import has_action_tag  # noqa: E402
-from opid.prompting import build_augmented_observation_text  # noqa: E402
+from seed.prompting import build_augmented_observation_text  # noqa: E402
 from scripts.alfworld_episode_skill_pipeline.pipeline import (  # noqa: E402
     ChatEndpoint,
     OpenAITextClient,
@@ -102,6 +102,16 @@ def parse_args() -> argparse.Namespace:
         "--regenerate-candidates",
         action="store_true",
         help="Delete existing candidate/SFT outputs before generating candidates.",
+    )
+    parser.add_argument(
+        "--stop-after-baseline-rollouts",
+        action="store_true",
+        help="Exit successfully after baseline rollouts are complete.",
+    )
+    parser.add_argument(
+        "--stop-after-skill-generation",
+        action="store_true",
+        help="Exit successfully after candidate skill API generation is complete.",
     )
     parser.add_argument("--log-level", default="INFO")
 
@@ -680,7 +690,7 @@ def collect_baseline_rollouts(
     return records
 
 
-def trajectory_to_opid_steps(trajectory: Dict[str, Any]) -> List[Dict[str, Any]]:
+def trajectory_to_seed_steps(trajectory: Dict[str, Any]) -> List[Dict[str, Any]]:
     steps: List[Dict[str, Any]] = []
     for step in trajectory.get("steps", []):
         step_info = step.get("info", {})
@@ -711,9 +721,9 @@ def build_candidate_skill_record(
     include_episode_summary: bool = True,
     skill_parse_attempts: int = 2,
 ) -> Dict[str, Any]:
-    from opid.analysis import OPIDEpisodeAnalyzer
+    from seed.analysis import SEEDEpisodeAnalyzer
 
-    analyzer = OPIDEpisodeAnalyzer(
+    analyzer = SEEDEpisodeAnalyzer(
         backend="openai",
         max_completion_tokens=skill_endpoint.max_completion_tokens,
         max_step_skills_per_traj=0,
@@ -722,7 +732,7 @@ def build_candidate_skill_record(
     )
     skill_client = OpenAITextClient(skill_endpoint)
     skill_id = f"{trajectory['task_id']}:{trajectory['rollout_id']}"
-    steps = trajectory_to_opid_steps(trajectory)
+    steps = trajectory_to_seed_steps(trajectory)
     prompt = analyzer._build_episode_analysis_prompt(
         steps=steps,
         candidate_step_indices=[step["step_index"] for step in steps],
@@ -748,7 +758,7 @@ def build_candidate_skill_record(
         try:
             parsed = analyzer._parse_analysis_response(raw_output)
             if not str(parsed.get("episode_skill", "")).strip():
-                raise ValueError("OPID analyzer response missing required field: episode_skill")
+                raise ValueError("SEED analyzer response missing required field: episode_skill")
             parse_ok = True
             parse_error = None
             break
@@ -1177,6 +1187,17 @@ def main() -> None:
         output_dir=output_dir,
         policy_endpoint=policy_endpoint,
     )
+    if args.stop_after_baseline_rollouts:
+        log_stage(
+            output_dir,
+            "baseline_rollout",
+            "complete",
+            completed_rollouts=len(baseline_rollouts),
+            stopped_before_skill_generation=True,
+        )
+        logging.info("Baseline rollouts complete; stopping before skill API generation.")
+        return
+
     baseline_rollouts_for_generation = (
         baseline_rollouts[: max(0, int(args.max_candidates))]
         if args.max_candidates is not None
@@ -1193,6 +1214,17 @@ def main() -> None:
         include_episode_summary=args.include_episode_summary,
         skill_parse_attempts=args.skill_parse_attempts,
     )
+    if args.stop_after_skill_generation:
+        log_stage(
+            output_dir,
+            "skill_generation",
+            "complete",
+            completed_skills=len(candidate_skills),
+            parse_ok_skills=sum(1 for record in candidate_skills if record.get("parse_ok")),
+            stopped_before_sft_export=True,
+        )
+        logging.info("Candidate skill API generation complete; stopping before SFT export.")
+        return
 
     log_stage(output_dir, "sft_export", "running", candidate_skills=len(candidate_skills))
     sft_records = build_sft_exports_from_candidates(

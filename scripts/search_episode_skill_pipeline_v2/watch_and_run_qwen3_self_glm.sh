@@ -76,6 +76,6 @@ log "Starting Qwen3 self-baseline SFT."
 run_logged bash "$SCRIPT_DIR/run_sft_qwen3_self_glm.sh"
 
 log "Starting Qwen3 self-baseline RL."
-run_logged bash "$PROJECT_ROOT/examples/policy_vllm_opid_trainer/run_search_qwen3_episode_no_skill_loss_sft_self.sh"
+run_logged bash "$PROJECT_ROOT/examples/seed/run_search_qwen3_episode_no_skill_loss_sft_self.sh"
 
 log "Qwen3 self-baseline experiment chain finished."

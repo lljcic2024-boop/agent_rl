@@ -4,6 +4,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ENV_FILE="${ENV_FILE:-$PROJECT_ROOT/.env}"
+
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+SFT_TEACHER_SHORT="${SFT_TEACHER_SHORT:-glm}"
+# shellcheck source=../sft_teacher_naming.sh
+source "$PROJECT_ROOT/scripts/sft_teacher_naming.sh"
 
 stop_rollout_vllm() {
     local pattern="${1:-}"
@@ -33,8 +44,8 @@ stop_rollout_vllm() {
 stop_rollout_vllm "vllm serve .*Qwen3-1.7B.*--port 60002"
 stop_rollout_vllm "vllm.entrypoints.openai.*Qwen3-1.7B.*60002"
 
-export DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/webshop_episode_skill_pipeline_v2_qwen3_1.7b_glm_self}"
-export EXPORT_MODEL_NAME="${EXPORT_MODEL_NAME:-Qwen3-1.7B-webshop-episode-skill-sft-glm-self}"
+export DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/webshop_episode_skill_pipeline_v2_qwen3_1.7b_${SFT_SELF_DIR_SUFFIX}}"
+export EXPORT_MODEL_NAME="${EXPORT_MODEL_NAME:-Qwen3-1.7B-webshop-episode-skill-sft-${SFT_SELF_SUFFIX}}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3-1.7b-webshop-episode-skill-sft-glm-self-ep${TOTAL_EPOCHS:-3}}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${MODELS_ROOT:-/data/models/Qwen}/outputs/sft/webshop_episode_skill_analyzer_v2_qwen3_1_7b_glm_self_ep${TOTAL_EPOCHS:-3}_$(date +%Y%m%d_%H%M%S)}"
 export LOG_FILE="${LOG_FILE:-${MODELS_ROOT:-/data/models/Qwen}/logs/sft/webshop_episode_skill_analyzer_v2_qwen3_1_7b_glm_self_ep${TOTAL_EPOCHS:-3}_$(date +%Y%m%d_%H%M%S).log}"

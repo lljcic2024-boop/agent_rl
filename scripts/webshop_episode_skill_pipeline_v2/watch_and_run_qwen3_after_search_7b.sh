@@ -5,7 +5,7 @@ set -u
 PROJECT_ROOT="${PROJECT_ROOT:-/root/works/SGOP}"
 SEARCH_MAIN_PID="${SEARCH_MAIN_PID:-2571955}"
 SEARCH_TASK_PID="${SEARCH_TASK_PID:-2580579}"
-SEARCH_CKPT_DIR="${SEARCH_CKPT_DIR:-/data/models/Qwen/ckpt/opid-grpo_qwen2.5_7b_search_episode_no_skill_loss_sft_glm_self_policy-vllm}"
+SEARCH_CKPT_DIR="${SEARCH_CKPT_DIR:-/data/models/Qwen/ckpt/seed-grpo_qwen2.5_7b_search_episode_no_skill_loss_sft_glm_self_policy-vllm}"
 WEBSHOP_SFT_MODEL="${WEBSHOP_SFT_MODEL:-/data/models/Qwen/Qwen3-1.7B-webshop-episode-skill-sft}"
 CONDA_ENV="${CONDA_ENV:-copd}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-300}"
@@ -38,7 +38,7 @@ while true; do
             | tail -n 1
     )"
     latest_analysis="$(
-        find "$SEARCH_CKPT_DIR/opid_analysis" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
+        find "$SEARCH_CKPT_DIR/seed_analysis" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
             | sort -V \
             | tail -n 1
     )"
@@ -79,7 +79,7 @@ else
 fi
 
 echo "$prefix starting WebShop Qwen3 RL at $(date)"
-bash examples/policy_vllm_opid_trainer/run_webshop_qwen3_episode_no_skill_loss_sft.sh
+bash examples/seed/run_webshop_qwen3_episode_no_skill_loss_sft.sh
 rl_status=$?
 echo "$prefix WebShop Qwen3 RL exited with status $rl_status at $(date)"
 exit "$rl_status"

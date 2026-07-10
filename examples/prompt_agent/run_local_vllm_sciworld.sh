@@ -11,10 +11,10 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 MODELS_ROOT="${MODELS_ROOT:-}"
-DEFAULT_MODEL_PATH="${MODELS_ROOT:+${MODELS_ROOT}/release/opid_3b_sciworld_step80}"
+DEFAULT_MODEL_PATH="${MODELS_ROOT:+${MODELS_ROOT}/release/seed_3b_sciworld_step80}"
 MODEL_PATH="${MODEL_PATH:-$DEFAULT_MODEL_PATH}"
 if [[ -z "$MODEL_PATH" ]]; then
-  echo "Please set MODEL_PATH, or set MODELS_ROOT so the default OPID model path can be inferred." >&2
+  echo "Please set MODEL_PATH, or set MODELS_ROOT so the default SEED model path can be inferred." >&2
   exit 1
 fi
 HOST="${HOST:-127.0.0.1}"

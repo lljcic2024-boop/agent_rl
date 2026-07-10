@@ -293,8 +293,8 @@ algorithm:
     mode: "mean_norm"
     enable_similarity: False
     similarity_thresh: 0.95
-  opid:
-    step_advantage_w: 0.0 # OPID uses episode-level advantage only.
+  seed:
+    step_advantage_w: 0.0 # SEED uses episode-level advantage only.
     episode_skill_teacher_advantage_w: 1.0
     step_skill_teacher_advantage_w: 0.0
     skill_mode: "episode_step" # "episode_step" generates episode_skill + step_skills; "step_only" uses step_skills only; "episode_only" applies episode_skill to all selected steps
@@ -302,7 +302,7 @@ algorithm:
     opd_start_after_steps: null
     opd_stop_after_steps: null
     mode: "mean_norm"
-    enable_analysis: True # False skips OPID analysis and teacher signal construction while keeping the OPID estimator
+    enable_analysis: True # False skips SEED analysis and teacher signal construction while keeping the SEED estimator
     enable_similarity: False
     similarity_thresh: 0.95
     selector: "llm"
@@ -310,16 +310,16 @@ algorithm:
     failed_only_after_steps: null # null -> use failed_only; otherwise analyze all episodes through this step, then failed episodes only
     failure_success_threshold: 1.0 # when episode_success is unavailable, episode_rewards >= this value counts as success
     analysis_backend: "openai"
-    analysis_prompt_version: "opid" # "opid", "strategy_bank" for WebShop, "search_strategy_bank" for Search QA, or "search_skill_only" without episode_summary
+    analysis_prompt_version: "seed" # "seed", "strategy_bank" for WebShop, "search_strategy_bank" for Search QA, or "search_skill_only" without episode_summary
     analysis_num_workers: 8
     analysis_context_length: 16384
     analysis_max_completion_tokens: 1024
     analysis_include_episode_summary: True
     analysis_max_step_skills_per_traj: 1
     save_analysis: False
-    analysis_dump_dir: null # null -> ${trainer.default_local_dir}/opid_analysis
+    analysis_dump_dir: null # null -> ${trainer.default_local_dir}/seed_analysis
     save_augmented_observations: True
-    augmented_observation_dump_dir: null # null -> ${trainer.default_local_dir}/opid_augmented_observations
+    augmented_observation_dump_dir: null # null -> ${trainer.default_local_dir}/seed_augmented_observations
     normalize_teacher_adv: False
     clip_teacher_adv: null
 

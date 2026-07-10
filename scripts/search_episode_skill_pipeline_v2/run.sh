@@ -17,20 +17,11 @@ if [[ -f "$ENV_FILE" ]]; then
     set +a
 fi
 
-SKILL_PROMPT_VERSION="${SKILL_PROMPT_VERSION:-opid}"
+SKILL_PROMPT_VERSION="${SKILL_PROMPT_VERSION:-seed}"
 if [[ "$SKILL_PROMPT_VERSION" == "strategy_bank" ]]; then
     SKILL_PROMPT_VERSION="search_strategy_bank"
 elif [[ "$SKILL_PROMPT_VERSION" == "skill_only" ]]; then
     SKILL_PROMPT_VERSION="search_skill_only"
-fi
-if [[ -z "${OUTPUT_DIR:-}" ]]; then
-    if [[ "$SKILL_PROMPT_VERSION" == "search_strategy_bank" ]]; then
-        OUTPUT_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_strategy_bank_qwen25_3b"
-    elif [[ "$SKILL_PROMPT_VERSION" == "search_skill_only" ]]; then
-        OUTPUT_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_skill_only_qwen25_3b"
-    else
-        OUTPUT_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_3b"
-    fi
 fi
 
 : "${MODELS_ROOT:?Please set MODELS_ROOT in $ENV_FILE.}"
@@ -61,6 +52,17 @@ if [[ -z "${SKILL_MODEL:-}" ]]; then
     : "${OPENAI_MODEL:?Please set OPENAI_MODEL in .env or SKILL_MODEL.}"
     SKILL_MODEL="$OPENAI_MODEL"
 fi
+# shellcheck source=../sft_teacher_naming.sh
+source "$PROJECT_ROOT/scripts/sft_teacher_naming.sh"
+if [[ -z "${OUTPUT_DIR:-}" ]]; then
+    if [[ "$SKILL_PROMPT_VERSION" == "search_strategy_bank" ]]; then
+        OUTPUT_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_strategy_bank_qwen25_3b_${SFT_SELF_DIR_SUFFIX}"
+    elif [[ "$SKILL_PROMPT_VERSION" == "search_skill_only" ]]; then
+        OUTPUT_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_skill_only_qwen25_3b_${SFT_SELF_DIR_SUFFIX}"
+    else
+        OUTPUT_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_3b_${SFT_SELF_DIR_SUFFIX}"
+    fi
+fi
 SKILL_TEMPERATURE="${SKILL_TEMPERATURE:-0.0}"
 SKILL_MAX_COMPLETION_TOKENS="${SKILL_MAX_COMPLETION_TOKENS:-1024}"
 SKILL_TIMEOUT="${SKILL_TIMEOUT:-120}"
@@ -70,6 +72,8 @@ SKILL_GEN_WORKERS="${SKILL_GEN_WORKERS:-128}"
 
 START_VLLM="${START_VLLM:-1}"
 KEEP_VLLM_ALIVE="${KEEP_VLLM_ALIVE:-0}"
+STOP_VLLM_AFTER_API="${STOP_VLLM_AFTER_API:-${STOP_VLLM_AFTER_BASELINE:-1}}"
+STOP_EXISTING_VLLM_AFTER_API="${STOP_EXISTING_VLLM_AFTER_API:-${STOP_EXISTING_VLLM_AFTER_BASELINE:-$STOP_VLLM_AFTER_API}}"
 VLLM_BIN="${VLLM_BIN:-vllm}"
 VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-600}"
 VLLM_LOG_DIR="${VLLM_LOG_DIR:-$PROJECT_ROOT/logs/vllm}"
@@ -199,6 +203,13 @@ is_server_ready() {
     curl -fsS "${POLICY_BASE_URL}/models" >/dev/null 2>&1
 }
 
+find_local_vllm_pid() {
+    if [[ "$HOST" != "127.0.0.1" && "$HOST" != "localhost" && "$HOST" != "0.0.0.0" ]]; then
+        return
+    fi
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true
+}
+
 is_retriever_ready() {
     curl -fsS -X POST "$SEARCH_URL" \
         -H 'Content-Type: application/json' \
@@ -250,15 +261,21 @@ cleanup() {
         kill "$progress_monitor_pid" >/dev/null 2>&1 || true
         wait "$progress_monitor_pid" >/dev/null 2>&1 || true
     fi
-    if [[ -n "$server_pid" && "$KEEP_VLLM_ALIVE" != "1" ]]; then
-        kill "$server_pid" >/dev/null 2>&1 || true
-        wait "$server_pid" >/dev/null 2>&1 || true
-    fi
+    stop_vllm_server
     if [[ -n "$retriever_pid" && "$KEEP_RETRIEVER_ALIVE" != "1" ]]; then
         kill "$retriever_pid" >/dev/null 2>&1 || true
         wait "$retriever_pid" >/dev/null 2>&1 || true
     elif [[ -n "$retriever_pid" && "$KEEP_RETRIEVER_ALIVE" == "1" ]]; then
         disown "$retriever_pid" >/dev/null 2>&1 || true
+    fi
+}
+
+stop_vllm_server() {
+    if [[ -n "$server_pid" && "$KEEP_VLLM_ALIVE" != "1" ]]; then
+        echo "Stopping policy vLLM server pid=$server_pid"
+        kill "$server_pid" >/dev/null 2>&1 || true
+        wait "$server_pid" >/dev/null 2>&1 || true
+        server_pid=""
     fi
 }
 trap cleanup EXIT
@@ -304,6 +321,14 @@ done
 if [[ "$START_VLLM" == "1" ]]; then
     if is_server_ready; then
         echo "Using existing policy vLLM server at $POLICY_BASE_URL"
+        if [[ "$STOP_EXISTING_VLLM_AFTER_API" == "1" && "$KEEP_VLLM_ALIVE" != "1" ]]; then
+            server_pid="$(find_local_vllm_pid)"
+            if [[ -n "$server_pid" ]]; then
+                echo "Will stop existing local policy vLLM pid=$server_pid after API calls."
+            else
+                echo "Could not find a local vLLM pid for $POLICY_BASE_URL; it will not be stopped automatically."
+            fi
+        fi
     else
         mkdir -p "$VLLM_LOG_DIR"
         read -r -a VLLM_EXTRA_ARGS_ARRAY <<< "${VLLM_EXTRA_ARGS:-}"
@@ -367,12 +392,57 @@ echo "  skill prompt:       $SKILL_PROMPT_VERSION"
 echo "  sampled tasks:      $NUM_TASKS"
 echo "  rollouts per task:  $ROLLOUTS_PER_TASK"
 echo "  task batch size:    $TASK_BATCH_SIZE"
+echo "  stop vLLM after API:$STOP_VLLM_AFTER_API"
 echo "  skill gen workers:  $SKILL_GEN_WORKERS"
 
-set +e
-python "${args[@]}"
-run_status=$?
-set -e
+run_pipeline() {
+    python "${args[@]}" "$@"
+}
+
+run_remaining_pipeline() {
+    local remaining_args=()
+    local arg
+    local has_resume=0
+    for arg in "${args[@]}"; do
+        if [[ "$arg" == "--overwrite" || "$arg" == "--regenerate-candidates" ]]; then
+            continue
+        fi
+        if [[ "$arg" == "--resume" ]]; then
+            has_resume=1
+        fi
+        remaining_args+=("$arg")
+    done
+    if [[ "$has_resume" != "1" ]]; then
+        remaining_args+=(--resume)
+    fi
+    python "${remaining_args[@]}"
+}
+
+if [[ "$STOP_VLLM_AFTER_API" == "1" && -n "$server_pid" && "$KEEP_VLLM_ALIVE" != "1" ]]; then
+    echo "Running baseline rollouts and skill API generation before stopping policy vLLM."
+    set +e
+    run_pipeline --stop-after-skill-generation
+    run_status=$?
+    set -e
+    print_progress
+    if [[ "$run_status" -ne 0 ]]; then
+        exit "$run_status"
+    fi
+    stop_vllm_server
+    echo "Running SFT export after policy vLLM has stopped."
+    set +e
+    run_remaining_pipeline
+    run_status=$?
+    set -e
+else
+    if [[ "$STOP_VLLM_AFTER_API" == "1" && "$KEEP_VLLM_ALIVE" != "1" && -z "$server_pid" ]]; then
+        echo "Policy vLLM was not started by this script; it will not be stopped after API calls."
+    fi
+    set +e
+    run_pipeline
+    run_status=$?
+    set -e
+fi
 
 print_progress
 exit "$run_status"

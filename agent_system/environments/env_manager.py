@@ -330,7 +330,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.extract_task(text_obs)
 
         # Retrieve memories for each task if enabled
-        if self.retrieval_memory is not None and self._opid_use_with_memory:
+        if self.retrieval_memory is not None and self._seed_use_with_memory:
             self.retrieved_memories = []
 
             # Determine which config to use
@@ -412,7 +412,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # Use retrieval memory template if enabled
             use_retrieval = (self.retrieval_memory is not None and
                            self.retrieved_memories is not None and
-                           self._opid_use_with_memory)
+                           self._seed_use_with_memory)
 
             step_count = 0 if init else len(self.memory[i])
             current_step = 1 if init else len(self.memory[i]) + 1
@@ -676,7 +676,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         obs = self.format_obs(obs)
 
         # Retrieve skills for each task if memory is configured
-        if self.retrieval_memory is not None and self._opid_use_with_memory:
+        if self.retrieval_memory is not None and self._seed_use_with_memory:
             mem_cfg = self.config.env.skills_only_memory
             self.retrieved_memories = [
                 self.retrieval_memory.retrieve(
@@ -777,7 +777,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         use_retrieval = (
             self.retrieval_memory is not None
             and self.retrieved_memories is not None
-            and self._opid_use_with_memory
+            and self._seed_use_with_memory
         )
 
         for i in range(len(text_obs)):
@@ -962,7 +962,7 @@ class SciWorldEnvironmentManager(EnvironmentManagerBase):
         self.tasks = self.extract_task_descriptions(infos)
         self.pre_text_obs = text_obs
 
-        if self.retrieval_memory is not None and self._opid_use_with_memory:
+        if self.retrieval_memory is not None and self._seed_use_with_memory:
             self.retrieved_memories = []
 
             if self.config.env.get('use_skills_only_memory', False):
@@ -1053,7 +1053,7 @@ class SciWorldEnvironmentManager(EnvironmentManagerBase):
         use_retrieval = (
             self.retrieval_memory is not None
             and self.retrieved_memories is not None
-            and self._opid_use_with_memory
+            and self._seed_use_with_memory
         )
 
         for i in range(len(text_obs)):

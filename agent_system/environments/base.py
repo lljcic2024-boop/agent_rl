@@ -44,10 +44,10 @@ class EnvironmentManagerBase:
         self.envs = envs
         self.projection_f = projection_f
         self.config = config
-        self._opid_use_with_memory = False
+        self._seed_use_with_memory = False
 
-    def set_opid_use_with_memory(self, enabled: bool) -> None:
-        self._opid_use_with_memory = bool(enabled)
+    def set_seed_use_with_memory(self, enabled: bool) -> None:
+        self._seed_use_with_memory = bool(enabled)
 
     def reset(self, kwargs) -> Dict[str, Any]:
         """
@@ -89,7 +89,7 @@ class EnvironmentManagerBase:
         next_observations = {
             'text': None, # Implement this if needed
             'image': next_obs,
-            'anchor': None # For GiGPO/OPID only. anchor observation without histories, injected skills, etc. Implement this if needed
+            'anchor': None # For GiGPO/SEED only. anchor observation without histories, injected skills, etc. Implement this if needed
         }
         # add action_valid to infos
         for i, info in enumerate(infos):

@@ -12,6 +12,8 @@ if [[ -f "$ENV_FILE" ]]; then
     source "$ENV_FILE"
     set +a
 fi
+# shellcheck source=../sft_teacher_naming.sh
+source "$PROJECT_ROOT/scripts/sft_teacher_naming.sh"
 
 CONDA_ENV="${CONDA_ENV:-copd}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -23,7 +25,7 @@ MICRO_BATCH_SIZE_PER_GPU="${MICRO_BATCH_SIZE_PER_GPU:-1}"
 ULYSSES_SEQUENCE_PARALLEL_SIZE="${ULYSSES_SEQUENCE_PARALLEL_SIZE:-1}"
 EXPORT_MODEL_AFTER_TRAIN="${EXPORT_MODEL_AFTER_TRAIN:-true}"
 TRAINER_LOGGER="${TRAINER_LOGGER:-['console','wandb']}"
-SKILL_PROMPT_VERSION="${SKILL_PROMPT_VERSION:-opid}"
+SKILL_PROMPT_VERSION="${SKILL_PROMPT_VERSION:-seed}"
 if [[ "$SKILL_PROMPT_VERSION" == "strategy_bank" ]]; then
     SKILL_PROMPT_VERSION="search_strategy_bank"
 elif [[ "$SKILL_PROMPT_VERSION" == "skill_only" ]]; then
@@ -31,18 +33,18 @@ elif [[ "$SKILL_PROMPT_VERSION" == "skill_only" ]]; then
 fi
 
 if [[ "$SKILL_PROMPT_VERSION" == "search_strategy_bank" ]]; then
-    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_strategy_bank_qwen25_3b"
-    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-3B-Instruct-search-episode-skill-sft-v2-strategy_bank"
+    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_strategy_bank_qwen25_3b_${SFT_SELF_DIR_SUFFIX}"
+    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-3B-Instruct-search-episode-skill-sft-v2-strategy_bank-${SFT_SELF_SUFFIX}"
     DEFAULT_EXPERIMENT_NAME="qwen25-3b-search-episode-skill-sft-v2-strategy_bank-ep${TOTAL_EPOCHS}"
     DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_strategy_bank_qwen25_3b_ep${TOTAL_EPOCHS}"
 elif [[ "$SKILL_PROMPT_VERSION" == "search_skill_only" ]]; then
-    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_skill_only_qwen25_3b"
-    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-3B-Instruct-search-episode-skill-sft-v2-skill_only"
+    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_skill_only_qwen25_3b_${SFT_SELF_DIR_SUFFIX}"
+    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-3B-Instruct-search-episode-skill-sft-v2-skill_only-${SFT_SELF_SUFFIX}"
     DEFAULT_EXPERIMENT_NAME="qwen25-3b-search-episode-skill-sft-v2-skill_only-ep${TOTAL_EPOCHS}"
     DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_skill_only_qwen25_3b_ep${TOTAL_EPOCHS}"
 else
-    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_3b"
-    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-3B-Instruct-search-episode-skill-sft"
+    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_3b_${SFT_SELF_DIR_SUFFIX}"
+    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-3B-Instruct-search-episode-skill-sft-${SFT_SELF_SUFFIX}"
     DEFAULT_EXPERIMENT_NAME="qwen25-3b-search-episode-skill-sft-v2-ep${TOTAL_EPOCHS}"
     DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_qwen25_3b_ep${TOTAL_EPOCHS}"
 fi

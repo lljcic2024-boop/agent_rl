@@ -27,8 +27,10 @@ if [[ -z "${MODEL_PATH:-}" ]]; then
 fi
 export MODEL_PATH
 export MODEL_NAME="${MODEL_NAME:-$(basename "$MODEL_PATH")}"
-export OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/outputs/webshop_episode_skill_pipeline_v2_qwen3_1.7b_glm_self}"
 export SKILL_MODEL="${SKILL_MODEL:-glm-5.2}"
+# shellcheck source=../sft_teacher_naming.sh
+source "$PROJECT_ROOT/scripts/sft_teacher_naming.sh"
+export OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_ROOT/outputs/webshop_episode_skill_pipeline_v2_qwen3_1.7b_${SFT_SELF_DIR_SUFFIX}}"
 
 # Qwen3 should act as an instruction-following WebShop policy here, not as a
 # thinking-model data generator.

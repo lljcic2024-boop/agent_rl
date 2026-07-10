@@ -1,26 +1,26 @@
 <h1 align="center">
-OPID: On-Policy Skill Distillation for Agentic Reinforcement Learning
+SEED: On-Policy Skill Distillation for Agentic Reinforcement Learning
 </h1>
 
 
 ## Overview
 
-We introduce **OPID**, an **On-Policy Skill Distillation** framework that turns completed
-agent trajectories into hierarchical hindsight skills. OPID routes episode-level and step-level
+We introduce **SEED**, an **On-Policy Skill Distillation** framework that turns completed
+agent trajectories into hierarchical hindsight skills. SEED routes episode-level and step-level
 skills during training to provide dense token-level supervision, while requiring no analyzer,
 skill retrieval, or privileged context at inference time.
 
 <div align="center">
-  <img src="figs/pipeline.png" alt="OPID pipeline" style="width:100%;">
+  <img src="figs/pipeline.png" alt="SEED pipeline" style="width:100%;">
   <br>
-  <em>Figure 1: Overview of OPID.</em>
+  <em>Figure 1: Overview of SEED.</em>
 </div>
 
-OPID achieves strong performance across ALFWorld, Search-based QA, and WebShop, improving over
+SEED achieves strong performance across ALFWorld, Search-based QA, and WebShop, improving over
 outcome-only RL and competitive skill-distillation baselines.
 
 <div align="center">
-  <img src="figs/results.png" alt="OPID results" style="width:100%;">
+  <img src="figs/results.png" alt="SEED results" style="width:100%;">
   <br>
   <em>Figure 2: Main results.</em>
 </div>
@@ -34,8 +34,8 @@ outcome-only RL and competitive skill-distillation baselines.
 ### Python Environment
 
 ```bash
-conda create -n opid python==3.12 -y
-conda activate opid
+conda create -n seed python==3.12 -y
+conda activate seed
 
 pip3 install vllm==0.11.0
 pip3 install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
@@ -49,8 +49,8 @@ Log in to Weights & Biases if you use WandB logging. Many example scripts use
 export WANDB_API_KEY=your_key_here
 ```
 
-OPID uses an LLM analyzer to extract episode-level and step-level hindsight skills during training.
-Configure an OpenAI-compatible endpoint before running OPID scripts:
+SEED uses an LLM analyzer to extract episode-level and step-level hindsight skills during training.
+Configure an OpenAI-compatible endpoint before running SEED scripts:
 
 ```bash
 export OPENAI_API_KEY=your_key_here
@@ -161,27 +161,27 @@ bash examples/search/retriever/retrieval_launch.sh > retrieval_server.log
 
 ## Training
 
-All OPID scripts live under `examples/opid_trainer/` and assume the repo root as the working directory.
+All SEED scripts live under `examples/seed_trainer/` and assume the repo root as the working directory.
 
 ```bash
-bash examples/opid_trainer/run_alfworld_opid_guide.sh
-bash examples/opid_trainer/run_webshop_opid_guide.sh
-bash examples/opid_trainer/run_search_opid_guide.sh
+bash examples/seed_trainer/run_alfworld_seed_guide.sh
+bash examples/seed_trainer/run_webshop_seed_guide.sh
+bash examples/seed_trainer/run_search_seed_guide.sh
 ```
 
 Additional scripts are provided for Qwen3:
 
 ```bash
-bash examples/opid_trainer/run_alfworld_opid_guide_qwen3.sh
-bash examples/opid_trainer/run_webshop_opid_guide_qwen3.sh
-bash examples/opid_trainer/run_search_opid_guide_qwen3.sh
+bash examples/seed_trainer/run_alfworld_seed_guide_qwen3.sh
+bash examples/seed_trainer/run_webshop_seed_guide_qwen3.sh
+bash examples/seed_trainer/run_search_seed_guide_qwen3.sh
 ```
 
-Useful OPID parameters:
+Useful SEED parameters:
 
-- `OPID_ANALYSIS_MAX_STEP_SKILLS_PER_TRAJ`: maximum number of critical step skills per trajectory.
-- `OPID_EPISODE_SKILL_TEACHER_ADV_W`: weight for episode-level skill teacher advantage.
-- `OPID_STEP_SKILL_TEACHER_ADV_W`: weight for step-level skill teacher advantage.
+- `SEED_ANALYSIS_MAX_STEP_SKILLS_PER_TRAJ`: maximum number of critical step skills per trajectory.
+- `SEED_EPISODE_SKILL_TEACHER_ADV_W`: weight for episode-level skill teacher advantage.
+- `SEED_STEP_SKILL_TEACHER_ADV_W`: weight for step-level skill teacher advantage.
 
 
 ## Merge Checkpoints

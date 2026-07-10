@@ -64,16 +64,16 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 from gigpo import core_gigpo
-from opid import analysis as core_opid
+from seed import analysis as core_seed
 
-from opid.prompting import (
+from seed.prompting import (
     SKILL_MODES,
     SKILL_TEACHER_MODES,
     build_augmented_observation_text,
     select_skill_teacher_sources,
     validate_skill_mode,
 )
-from opid.skill_gen import SkillGenRewardConfig, compute_skill_gen_reward
+from seed.skill_gen import SkillGenRewardConfig, compute_skill_gen_reward
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
@@ -101,7 +101,7 @@ def _sanitize_json_value(value: Any) -> Any:
 def _safe_json_dumps(payload: Any, **kwargs: Any) -> str:
     kwargs.setdefault("ensure_ascii", False)
     return json.dumps(_sanitize_json_value(payload), **kwargs)
-OPID_STATE_GROUP_METRIC_PREFIX = "opid/state_group/"
+SEED_STATE_GROUP_METRIC_PREFIX = "seed/state_group/"
 
 
 class Role(Enum):
@@ -131,7 +131,7 @@ class AdvantageEstimator(str, Enum):
     RLOO = "rloo"
     GRPO_PASSK = "grpo_passk"
     GiGPO = 'gigpo'
-    OPID = "opid"
+    SEED = "seed"
 
 
 @dataclass
@@ -293,11 +293,11 @@ def compute_advantage(
     gigpo_similarity_thresh=0.95,
     episode_skill_teacher_advantage_w=1.0,
     step_skill_teacher_advantage_w=0.0,
-    opid_mode="mean_norm",
-    opid_enable_similarity=False,
-    opid_similarity_thresh=0.95,
-    opid_normalize_teacher_adv=False,
-    opid_clip_teacher_adv=None,
+    seed_mode="mean_norm",
+    seed_enable_similarity=False,
+    seed_similarity_thresh=0.95,
+    seed_normalize_teacher_adv=False,
+    seed_clip_teacher_adv=None,
     **kwargs,
 ):
     """Compute advantage estimates for policy optimization.
@@ -419,7 +419,7 @@ def compute_advantage(
         if data.meta_info is None:
             data.meta_info = {}
         data.meta_info["gigpo_adv_metrics"] = gigpo_adv_metrics
-    elif adv_estimator == AdvantageEstimator.OPID:
+    elif adv_estimator == AdvantageEstimator.SEED:
         teacher_log_prob = data.batch['teacher_log_prob'] if 'teacher_log_prob' in data.batch.keys() else None
         episode_teacher_log_prob = (
             data.batch['episode_teacher_log_prob']
@@ -445,7 +445,7 @@ def compute_advantage(
         else:
             step_skill_mask = None
 
-        advantages, returns, opid_adv_metrics = core_gigpo.compute_opid_outcome_advantage(
+        advantages, returns, seed_adv_metrics = core_gigpo.compute_seed_outcome_advantage(
             token_level_rewards=data.batch['token_level_rewards'],
             step_rewards=data.batch['step_rewards'],
             response_mask=data.batch['response_mask'],
@@ -461,18 +461,18 @@ def compute_advantage(
             step_advantage_w=step_advantage_w,
             episode_skill_teacher_advantage_w=episode_skill_teacher_advantage_w,
             step_skill_teacher_advantage_w=step_skill_teacher_advantage_w,
-            mode=opid_mode,
-            enable_similarity=opid_enable_similarity,
-            similarity_thresh=opid_similarity_thresh,
-            normalize_teacher_adv=opid_normalize_teacher_adv,
-            clip_teacher_adv=opid_clip_teacher_adv,
+            mode=seed_mode,
+            enable_similarity=seed_enable_similarity,
+            similarity_thresh=seed_similarity_thresh,
+            normalize_teacher_adv=seed_normalize_teacher_adv,
+            clip_teacher_adv=seed_clip_teacher_adv,
             return_metrics=True,
         )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
         if data.meta_info is None:
             data.meta_info = {}
-        data.meta_info["opid_adv_metrics"] = opid_adv_metrics
+        data.meta_info["seed_adv_metrics"] = seed_adv_metrics
     else:
         raise NotImplementedError
     return data
@@ -534,11 +534,11 @@ class RayPPOTrainer:
         self.val_reward_fn = val_reward_fn
         self.envs = envs
         self.val_envs = val_envs
-        self._opid_analyzer = None
-        self._opid_teacher_adv_last_enabled_state = None
-        self._opid_failed_only_last_enabled_state = None
-        self._opid_analysis_last_enabled_state = None
-        self._opid_teacher_signal_executor = None
+        self._seed_analyzer = None
+        self._seed_teacher_adv_last_enabled_state = None
+        self._seed_failed_only_last_enabled_state = None
+        self._seed_analysis_last_enabled_state = None
+        self._seed_teacher_signal_executor = None
         self.traj_collector = traj_collector
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
@@ -573,7 +573,7 @@ class RayPPOTrainer:
             AdvantageEstimator.RLOO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
             AdvantageEstimator.GiGPO,
-            AdvantageEstimator.OPID,
+            AdvantageEstimator.SEED,
         ]:
             self.use_critic = False
         else:
@@ -582,48 +582,48 @@ class RayPPOTrainer:
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
-    def _get_opid_opd_stop_after_steps(self) -> Optional[int]:
-        stop_after_steps = OmegaConf.select(self.config, "algorithm.opid.opd_stop_after_steps")
+    def _get_seed_opd_stop_after_steps(self) -> Optional[int]:
+        stop_after_steps = OmegaConf.select(self.config, "algorithm.seed.opd_stop_after_steps")
         if stop_after_steps is None:
             return None
         return int(stop_after_steps)
 
-    def _get_opid_opd_start_after_steps(self) -> Optional[int]:
-        start_after_steps = OmegaConf.select(self.config, "algorithm.opid.opd_start_after_steps")
+    def _get_seed_opd_start_after_steps(self) -> Optional[int]:
+        start_after_steps = OmegaConf.select(self.config, "algorithm.seed.opd_start_after_steps")
         if start_after_steps is None:
             # Backward compatibility for older launch commands.
-            start_after_steps = OmegaConf.select(self.config, "algorithm.opid.teacher_advantage_start_after_steps")
+            start_after_steps = OmegaConf.select(self.config, "algorithm.seed.teacher_advantage_start_after_steps")
         if start_after_steps is None:
             return None
         return int(start_after_steps)
 
-    def _get_opid_failed_only_after_steps(self) -> Optional[int]:
-        failed_only_after_steps = OmegaConf.select(self.config, "algorithm.opid.failed_only_after_steps")
+    def _get_seed_failed_only_after_steps(self) -> Optional[int]:
+        failed_only_after_steps = OmegaConf.select(self.config, "algorithm.seed.failed_only_after_steps")
         if failed_only_after_steps is None:
             return None
         return int(failed_only_after_steps)
 
-    def _should_opid_analyze_failed_only(self) -> bool:
-        failed_only_after_steps = self._get_opid_failed_only_after_steps()
+    def _should_seed_analyze_failed_only(self) -> bool:
+        failed_only_after_steps = self._get_seed_failed_only_after_steps()
         if failed_only_after_steps is None:
-            enabled = bool(OmegaConf.select(self.config, "algorithm.opid.failed_only"))
+            enabled = bool(OmegaConf.select(self.config, "algorithm.seed.failed_only"))
             schedule_text = "static config"
         else:
             enabled = self.global_steps > failed_only_after_steps
             schedule_text = f"after step {failed_only_after_steps}"
 
-        if self._opid_failed_only_last_enabled_state != enabled:
+        if self._seed_failed_only_last_enabled_state != enabled:
             module_logger.info(
-                "OPID failed-only episode analysis is %s at global_step=%s (%s).",
+                "SEED failed-only episode analysis is %s at global_step=%s (%s).",
                 "enabled" if enabled else "disabled",
                 self.global_steps,
                 schedule_text,
             )
-            self._opid_failed_only_last_enabled_state = enabled
+            self._seed_failed_only_last_enabled_state = enabled
         return enabled
 
-    def _is_opid_analysis_enabled(self) -> bool:
-        configured = OmegaConf.select(self.config, "algorithm.opid.enable_analysis")
+    def _is_seed_analysis_enabled(self) -> bool:
+        configured = OmegaConf.select(self.config, "algorithm.seed.enable_analysis")
         if configured is None:
             enabled = True
         elif isinstance(configured, str):
@@ -631,20 +631,20 @@ class RayPPOTrainer:
         else:
             enabled = bool(configured)
 
-        if self._opid_analysis_last_enabled_state != enabled:
+        if self._seed_analysis_last_enabled_state != enabled:
             module_logger.info(
-                "OPID analysis and teacher signal construction are %s at global_step=%s.",
+                "SEED analysis and teacher signal construction are %s at global_step=%s.",
                 "enabled" if enabled else "disabled",
                 self.global_steps,
             )
-            self._opid_analysis_last_enabled_state = enabled
+            self._seed_analysis_last_enabled_state = enabled
         return enabled
 
-    def _is_opid_policy_vllm_backend(self) -> bool:
-        backend = OmegaConf.select(self.config, "algorithm.opid.analysis_backend")
+    def _is_seed_policy_vllm_backend(self) -> bool:
+        backend = OmegaConf.select(self.config, "algorithm.seed.analysis_backend")
         return str(backend or "") == "policy_vllm"
 
-    def _is_opid_sdar_loss_enabled(self) -> bool:
+    def _is_seed_sdar_loss_enabled(self) -> bool:
         sdar_loss_coef = OmegaConf.select(self.config, "actor_rollout_ref.actor.sdar_loss_coef")
         return float(sdar_loss_coef or 0.0) > 0.0
 
@@ -657,16 +657,16 @@ class RayPPOTrainer:
             return value.lower() in ("1", "true", "yes", "on")
         return bool(value)
 
-    def _is_opid_skill_gen_enabled(self) -> bool:
-        enabled = OmegaConf.select(self.config, "algorithm.opid.skill_gen.enable")
+    def _is_seed_skill_gen_enabled(self) -> bool:
+        enabled = OmegaConf.select(self.config, "algorithm.seed.skill_gen.enable")
         loss_coef = OmegaConf.select(self.config, "actor_rollout_ref.actor.skill_gen_loss_coef")
         if isinstance(enabled, str):
             enabled = enabled.lower() in ("1", "true", "yes", "on")
         return bool(enabled) and float(loss_coef or 0.0) > 0.0
 
-    def _get_opid_skill_gen_reward_config(self) -> SkillGenRewardConfig:
+    def _get_seed_skill_gen_reward_config(self) -> SkillGenRewardConfig:
         def _select(name: str, default):
-            value = OmegaConf.select(self.config, f"algorithm.opid.skill_gen.{name}")
+            value = OmegaConf.select(self.config, f"algorithm.seed.skill_gen.{name}")
             return default if value is None else value
 
         reward_clip = _select("reward_clip", 2.0)
@@ -680,21 +680,21 @@ class RayPPOTrainer:
             failed_reward_mode=str(_select("failed_reward_mode", "zero")),
         )
 
-    def _collect_opid_skill_gen_samples(
+    def _collect_seed_skill_gen_samples(
         self,
         episode_analysis: Dict[object, Dict[str, object]],
         analysis_tasks: Dict[object, Dict[str, object]],
         metrics: Dict[str, float],
     ) -> List[Dict[str, object]]:
-        if not self._is_opid_skill_gen_enabled():
-            metrics["opid/skill_gen_enabled"] = 0.0
-            metrics["opid/skill_gen_samples_collected"] = 0.0
+        if not self._is_seed_skill_gen_enabled():
+            metrics["seed/skill_gen_enabled"] = 0.0
+            metrics["seed/skill_gen_samples_collected"] = 0.0
             return []
 
-        metrics["opid/skill_gen_enabled"] = 1.0
-        if not self._is_opid_policy_vllm_backend():
-            metrics["opid/skill_gen_skipped_non_policy_vllm"] = 1.0
-            metrics["opid/skill_gen_samples_collected"] = 0.0
+        metrics["seed/skill_gen_enabled"] = 1.0
+        if not self._is_seed_policy_vllm_backend():
+            metrics["seed/skill_gen_skipped_non_policy_vllm"] = 1.0
+            metrics["seed/skill_gen_samples_collected"] = 0.0
             return []
 
         samples: List[Dict[str, object]] = []
@@ -722,7 +722,7 @@ class RayPPOTrainer:
             }
             samples.append(sample)
 
-        max_samples_value = OmegaConf.select(self.config, "algorithm.opid.skill_gen.max_samples")
+        max_samples_value = OmegaConf.select(self.config, "algorithm.seed.skill_gen.max_samples")
         if max_samples_value is None:
             max_samples = 0
         elif isinstance(max_samples_value, str) and max_samples_value.lower() in (
@@ -737,8 +737,8 @@ class RayPPOTrainer:
         if max_samples > 0 and len(samples) > max_samples:
             samples = samples[:max_samples]
 
-        metrics["opid/skill_gen_samples_collected"] = float(len(samples))
-        metrics["opid/skill_gen_skipped_non_policy_vllm"] = 0.0
+        metrics["seed/skill_gen_samples_collected"] = float(len(samples))
+        metrics["seed/skill_gen_skipped_non_policy_vllm"] = 0.0
         return samples
 
     @staticmethod
@@ -748,7 +748,7 @@ class RayPPOTrainer:
         if len(shapes) == 1:
             return torch.stack(tensors, dim=0)
         if not all(tensor.dim() == 1 for tensor in tensors):
-            raise ValueError(f"Cannot pad OPID skill_gen tensor key={key!r} with shapes={sorted(shapes)}.")
+            raise ValueError(f"Cannot pad SEED skill_gen tensor key={key!r} with shapes={sorted(shapes)}.")
         max_len = max(int(tensor.size(0)) for tensor in tensors)
         padded = []
         for tensor in tensors:
@@ -759,12 +759,12 @@ class RayPPOTrainer:
             padded.append(torch.cat([tensor, pad], dim=0))
         return torch.stack(padded, dim=0)
 
-    def _build_opid_skill_gen_payload(
+    def _build_seed_skill_gen_payload(
         self,
         batch: DataProto,
         samples: Optional[List[Dict[str, object]]],
     ) -> Optional[Dict[str, object]]:
-        if not self._is_opid_skill_gen_enabled() or not samples:
+        if not self._is_seed_skill_gen_enabled() or not samples:
             return None
 
         traj_uids = list(batch.non_tensor_batch.get("traj_uid", []))
@@ -787,8 +787,8 @@ class RayPPOTrainer:
         else:
             teacher_gap = torch.zeros_like(response_mask, dtype=torch.float32)
 
-        success_threshold = self._get_opid_failure_success_threshold()
-        reward_config = self._get_opid_skill_gen_reward_config()
+        success_threshold = self._get_seed_failure_success_threshold()
+        reward_config = self._get_seed_skill_gen_reward_config()
         rewards = []
         reward_components: Dict[str, List[float]] = defaultdict(list)
         kept_samples: List[Dict[str, object]] = []
@@ -841,9 +841,9 @@ class RayPPOTrainer:
             "metrics": payload_metrics,
         }
 
-    def _is_opid_teacher_signal_enabled(self) -> bool:
-        start_after_steps = self._get_opid_opd_start_after_steps()
-        stop_after_steps = self._get_opid_opd_stop_after_steps()
+    def _is_seed_teacher_signal_enabled(self) -> bool:
+        start_after_steps = self._get_seed_opd_start_after_steps()
+        stop_after_steps = self._get_seed_opd_stop_after_steps()
 
         enabled = True
         disabled_reason = None
@@ -854,7 +854,7 @@ class RayPPOTrainer:
             enabled = False
             disabled_reason = "after_stop"
 
-        if self._opid_teacher_adv_last_enabled_state != enabled:
+        if self._seed_teacher_adv_last_enabled_state != enabled:
             if enabled:
                 schedule_parts = []
                 if start_after_steps is not None:
@@ -863,26 +863,26 @@ class RayPPOTrainer:
                     schedule_parts.append(f"until step {stop_after_steps}")
                 schedule_text = f" ({', '.join(schedule_parts)})" if schedule_parts else ""
                 module_logger.info(
-                    "OPID teacher/OPD signal is enabled at global_step=%s%s.",
+                    "SEED teacher/OPD signal is enabled at global_step=%s%s.",
                     self.global_steps,
                     schedule_text,
                 )
             elif disabled_reason == "before_start":
                 module_logger.info(
-                    "OPID teacher/OPD signal is disabled at global_step=%s until after step %s.",
+                    "SEED teacher/OPD signal is disabled at global_step=%s until after step %s.",
                     self.global_steps,
                     start_after_steps,
                 )
             else:
                 module_logger.info(
-                    "OPID teacher/OPD signal is disabled at global_step=%s because opd_stop_after_steps=%s.",
+                    "SEED teacher/OPD signal is disabled at global_step=%s because opd_stop_after_steps=%s.",
                     self.global_steps,
                     stop_after_steps,
                 )
-            self._opid_teacher_adv_last_enabled_state = enabled
+            self._seed_teacher_adv_last_enabled_state = enabled
         return enabled
 
-    def _set_zero_opid_teacher_signals(self, batch: DataProto, metrics: Dict[str, float]) -> DataProto:
+    def _set_zero_seed_teacher_signals(self, batch: DataProto, metrics: Dict[str, float]) -> DataProto:
         batch_size = len(batch)
         batch.batch["teacher_log_prob"] = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
         batch.batch["episode_teacher_log_prob"] = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
@@ -902,23 +902,23 @@ class RayPPOTrainer:
             dtype=torch.bool,
             device=batch.batch["responses"].device,
         )
-        metrics["opid/critical_step_ratio"] = 0.0
-        metrics["opid/teacher_batch_size"] = 0.0
-        metrics["opid/teacher_available"] = 0.0
-        metrics["opid/episode_skill_teacher/enabled"] = 0.0
-        metrics["opid/step_skill_teacher/step_skill_step_ratio"] = 0.0
-        metrics["opid/step_skill_teacher/step_skills_applied"] = 0.0
+        metrics["seed/critical_step_ratio"] = 0.0
+        metrics["seed/teacher_batch_size"] = 0.0
+        metrics["seed/teacher_available"] = 0.0
+        metrics["seed/episode_skill_teacher/enabled"] = 0.0
+        metrics["seed/step_skill_teacher/step_skill_step_ratio"] = 0.0
+        metrics["seed/step_skill_teacher/step_skills_applied"] = 0.0
         return batch
 
-    def _lazy_init_opid_teacher_signal_executor(self):
-        if self._opid_teacher_signal_executor is None:
-            self._opid_teacher_signal_executor = ThreadPoolExecutor(
+    def _lazy_init_seed_teacher_signal_executor(self):
+        if self._seed_teacher_signal_executor is None:
+            self._seed_teacher_signal_executor = ThreadPoolExecutor(
                 max_workers=1,
-                thread_name_prefix="opid-teacher-signal",
+                thread_name_prefix="seed-teacher-signal",
             )
-        return self._opid_teacher_signal_executor
+        return self._seed_teacher_signal_executor
 
-    def _build_opid_teacher_signal_snapshot(self, batch: DataProto) -> DataProto:
+    def _build_seed_teacher_signal_snapshot(self, batch: DataProto) -> DataProto:
         tensors = {
             "responses": batch.batch["responses"].clone(),
             "attention_mask": batch.batch["attention_mask"].clone(),
@@ -936,6 +936,7 @@ class RayPPOTrainer:
             "episode_success",
             "episode_rewards",
             "multi_modal_inputs",
+            "is_action_valid",
         ]
         non_tensors = {}
         for key in non_tensor_keys:
@@ -948,16 +949,16 @@ class RayPPOTrainer:
             meta_info=deepcopy(batch.meta_info),
         )
 
-    def _prepare_opid_teacher_signals_async_task(self, batch: DataProto, teacher_enabled: bool):
+    def _prepare_seed_teacher_signals_async_task(self, batch: DataProto, teacher_enabled: bool):
         local_metrics: Dict[str, float] = {}
-        output_batch = self._prepare_opid_teacher_signals(
+        output_batch = self._prepare_seed_teacher_signals(
             batch=batch,
             metrics=local_metrics,
             teacher_enabled=teacher_enabled,
         )
         return output_batch, local_metrics
 
-    def _merge_async_opid_teacher_signals(
+    def _merge_async_seed_teacher_signals(
         self,
         batch: DataProto,
         teacher_signal_batch: DataProto,
@@ -1004,14 +1005,14 @@ class RayPPOTrainer:
         batch.batch["critical_step_mask"] = critical_step_mask
         batch.batch["step_skill_mask"] = step_skill_mask
         batch.batch["teacher_signal_mask"] = teacher_signal_mask
-        skill_gen_payload = self._build_opid_skill_gen_payload(
+        skill_gen_payload = self._build_seed_skill_gen_payload(
             batch=batch,
-            samples=teacher_signal_batch.meta_info.get("opid_skill_gen_samples"),
+            samples=teacher_signal_batch.meta_info.get("seed_skill_gen_samples"),
         )
         if skill_gen_payload is not None:
-            batch.meta_info["opid_skill_gen"] = skill_gen_payload
+            batch.meta_info["seed_skill_gen"] = skill_gen_payload
         else:
-            batch.meta_info.pop("opid_skill_gen", None)
+            batch.meta_info.pop("seed_skill_gen", None)
         batch.non_tensor_batch.pop("_batch_source_idx", None)
         return batch
 
@@ -1019,58 +1020,58 @@ class RayPPOTrainer:
         config = self.config
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
-        opd_stop_after_steps = OmegaConf.select(config, "algorithm.opid.opd_stop_after_steps")
-        opd_start_after_steps = OmegaConf.select(config, "algorithm.opid.opd_start_after_steps")
+        opd_stop_after_steps = OmegaConf.select(config, "algorithm.seed.opd_stop_after_steps")
+        opd_start_after_steps = OmegaConf.select(config, "algorithm.seed.opd_start_after_steps")
         legacy_teacher_advantage_start_after_steps = OmegaConf.select(
             config,
-            "algorithm.opid.teacher_advantage_start_after_steps",
+            "algorithm.seed.teacher_advantage_start_after_steps",
         )
         if opd_start_after_steps is None:
             opd_start_after_steps = legacy_teacher_advantage_start_after_steps
         elif legacy_teacher_advantage_start_after_steps is not None and int(legacy_teacher_advantage_start_after_steps) != int(opd_start_after_steps):
             module_logger.warning(
-                "Both algorithm.opid.opd_start_after_steps=%s and legacy algorithm.opid.teacher_advantage_start_after_steps=%s are set; using opd_start_after_steps.",
+                "Both algorithm.seed.opd_start_after_steps=%s and legacy algorithm.seed.teacher_advantage_start_after_steps=%s are set; using opd_start_after_steps.",
                 opd_start_after_steps,
                 legacy_teacher_advantage_start_after_steps,
             )
-        failed_only_after_steps = OmegaConf.select(config, "algorithm.opid.failed_only_after_steps")
+        failed_only_after_steps = OmegaConf.select(config, "algorithm.seed.failed_only_after_steps")
         if opd_stop_after_steps is not None and int(opd_stop_after_steps) < 0:
-            raise ValueError("algorithm.opid.opd_stop_after_steps must be null or a non-negative integer.")
+            raise ValueError("algorithm.seed.opd_stop_after_steps must be null or a non-negative integer.")
         if opd_start_after_steps is not None and int(opd_start_after_steps) < 0:
-            raise ValueError("algorithm.opid.opd_start_after_steps must be null or a non-negative integer.")
+            raise ValueError("algorithm.seed.opd_start_after_steps must be null or a non-negative integer.")
         if failed_only_after_steps is not None and int(failed_only_after_steps) < 0:
-            raise ValueError("algorithm.opid.failed_only_after_steps must be null or a non-negative integer.")
-        if failed_only_after_steps is not None and bool(OmegaConf.select(config, "algorithm.opid.failed_only")):
+            raise ValueError("algorithm.seed.failed_only_after_steps must be null or a non-negative integer.")
+        if failed_only_after_steps is not None and bool(OmegaConf.select(config, "algorithm.seed.failed_only")):
             module_logger.warning(
-                "algorithm.opid.failed_only_after_steps=%s is set, so scheduled all-then-failed analysis overrides algorithm.opid.failed_only=True until after that step.",
+                "algorithm.seed.failed_only_after_steps=%s is set, so scheduled all-then-failed analysis overrides algorithm.seed.failed_only=True until after that step.",
                 failed_only_after_steps,
             )
         episode_skill_teacher_advantage_w = float(
-            OmegaConf.select(config, "algorithm.opid.episode_skill_teacher_advantage_w") or 0.0
+            OmegaConf.select(config, "algorithm.seed.episode_skill_teacher_advantage_w") or 0.0
         )
         step_skill_teacher_advantage_w = float(
-            OmegaConf.select(config, "algorithm.opid.step_skill_teacher_advantage_w") or 0.0
+            OmegaConf.select(config, "algorithm.seed.step_skill_teacher_advantage_w") or 0.0
         )
-        skill_mode = str(OmegaConf.select(config, "algorithm.opid.skill_mode") or "episode_step")
-        skill_teacher_mode = str(OmegaConf.select(config, "algorithm.opid.skill_teacher_mode") or "step_priority")
+        skill_mode = str(OmegaConf.select(config, "algorithm.seed.skill_mode") or "episode_step")
+        skill_teacher_mode = str(OmegaConf.select(config, "algorithm.seed.skill_teacher_mode") or "step_priority")
         if skill_mode not in SKILL_MODES:
             raise ValueError(
-                f"algorithm.opid.skill_mode must be one of {SKILL_MODES}, got {skill_mode!r}."
+                f"algorithm.seed.skill_mode must be one of {SKILL_MODES}, got {skill_mode!r}."
             )
         if episode_skill_teacher_advantage_w < 0:
-            raise ValueError("algorithm.opid.episode_skill_teacher_advantage_w must be non-negative.")
+            raise ValueError("algorithm.seed.episode_skill_teacher_advantage_w must be non-negative.")
         if step_skill_teacher_advantage_w < 0:
-            raise ValueError("algorithm.opid.step_skill_teacher_advantage_w must be non-negative.")
+            raise ValueError("algorithm.seed.step_skill_teacher_advantage_w must be non-negative.")
         if skill_teacher_mode not in SKILL_TEACHER_MODES:
             raise ValueError(
-                f"algorithm.opid.skill_teacher_mode must be one of {SKILL_TEACHER_MODES}, got {skill_teacher_mode!r}."
+                f"algorithm.seed.skill_teacher_mode must be one of {SKILL_TEACHER_MODES}, got {skill_teacher_mode!r}."
             )
-        if config.algorithm.adv_estimator == AdvantageEstimator.OPID or str(config.algorithm.adv_estimator) == AdvantageEstimator.OPID.value:
-            analysis_backend = str(OmegaConf.select(config, "algorithm.opid.analysis_backend") or "openai")
-            analysis_prompt_version = core_opid.validate_analysis_prompt_version(
-                OmegaConf.select(config, "algorithm.opid.analysis_prompt_version") or "opid"
+        if config.algorithm.adv_estimator == AdvantageEstimator.SEED or str(config.algorithm.adv_estimator) == AdvantageEstimator.SEED.value:
+            analysis_backend = str(OmegaConf.select(config, "algorithm.seed.analysis_backend") or "openai")
+            analysis_prompt_version = core_seed.validate_analysis_prompt_version(
+                OmegaConf.select(config, "algorithm.seed.analysis_prompt_version") or "seed"
             )
-            analysis_enabled_config = OmegaConf.select(config, "algorithm.opid.enable_analysis")
+            analysis_enabled_config = OmegaConf.select(config, "algorithm.seed.enable_analysis")
             if analysis_enabled_config is None:
                 analysis_enabled = True
             elif isinstance(analysis_enabled_config, str):
@@ -1078,15 +1079,15 @@ class RayPPOTrainer:
             else:
                 analysis_enabled = bool(analysis_enabled_config)
             if analysis_backend not in {"openai", "policy_vllm"}:
-                raise ValueError("algorithm.opid.analysis_backend must be 'openai' or 'policy_vllm'.")
+                raise ValueError("algorithm.seed.analysis_backend must be 'openai' or 'policy_vllm'.")
             if analysis_backend == "policy_vllm" and analysis_enabled:
                 if str(config.actor_rollout_ref.rollout.name) != "vllm":
-                    raise ValueError("algorithm.opid.analysis_backend=policy_vllm requires actor_rollout_ref.rollout.name=vllm.")
+                    raise ValueError("algorithm.seed.analysis_backend=policy_vllm requires actor_rollout_ref.rollout.name=vllm.")
                 analysis_context_length = int(
-                    OmegaConf.select(config, "algorithm.opid.analysis_context_length") or 16384
+                    OmegaConf.select(config, "algorithm.seed.analysis_context_length") or 16384
                 )
                 analysis_max_completion_tokens = int(
-                    OmegaConf.select(config, "algorithm.opid.analysis_max_completion_tokens") or 4096
+                    OmegaConf.select(config, "algorithm.seed.analysis_max_completion_tokens") or 4096
                 )
                 effective_max_model_len = int(
                     OmegaConf.select(config, "actor_rollout_ref.rollout.max_model_len")
@@ -1098,19 +1099,19 @@ class RayPPOTrainer:
                 required_max_model_len = analysis_context_length + analysis_max_completion_tokens
                 if effective_max_model_len < required_max_model_len:
                     raise ValueError(
-                        "policy_vllm OPID analysis requires actor_rollout_ref.rollout.max_model_len "
+                        "policy_vllm SEED analysis requires actor_rollout_ref.rollout.max_model_len "
                         f">= {required_max_model_len}, got {effective_max_model_len}."
                     )
-            if float(OmegaConf.select(config, "algorithm.opid.step_advantage_w") or 0.0) != 0.0:
+            if float(OmegaConf.select(config, "algorithm.seed.step_advantage_w") or 0.0) != 0.0:
                 raise ValueError(
-                    "Episode-level OPID OPD requires algorithm.opid.step_advantage_w=0.0."
+                    "Episode-level SEED OPD requires algorithm.seed.step_advantage_w=0.0."
                 )
-            if str(OmegaConf.select(config, "algorithm.opid.selector")) != "llm":
-                raise ValueError("Episode-level OPID OPD requires algorithm.opid.selector=llm.")
+            if str(OmegaConf.select(config, "algorithm.seed.selector")) != "llm":
+                raise ValueError("Episode-level SEED OPD requires algorithm.seed.selector=llm.")
         if opd_start_after_steps is not None and opd_stop_after_steps is not None:
             if int(opd_start_after_steps) >= int(opd_stop_after_steps):
                 module_logger.warning(
-                    "algorithm.opid.opd_start_after_steps=%s is not earlier than opd_stop_after_steps=%s, so teacher advantage will never be enabled.",
+                    "algorithm.seed.opd_start_after_steps=%s is not earlier than opd_stop_after_steps=%s, so teacher advantage will never be enabled.",
                     opd_start_after_steps,
                     opd_stop_after_steps,
                 )
@@ -1357,24 +1358,24 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
-    def _get_opid_analysis_dump_dir(self) -> Optional[str]:
-        save_analysis = OmegaConf.select(self.config, "algorithm.opid.save_analysis")
+    def _get_seed_analysis_dump_dir(self) -> Optional[str]:
+        save_analysis = OmegaConf.select(self.config, "algorithm.seed.save_analysis")
         if not save_analysis:
             return None
 
-        dump_dir = OmegaConf.select(self.config, "algorithm.opid.analysis_dump_dir")
+        dump_dir = OmegaConf.select(self.config, "algorithm.seed.analysis_dump_dir")
         if dump_dir:
             return dump_dir
 
-        return os.path.join(self.config.trainer.default_local_dir, "opid_analysis")
+        return os.path.join(self.config.trainer.default_local_dir, "seed_analysis")
 
-    def _dump_opid_analysis(
+    def _dump_seed_analysis(
         self,
         analysis_tasks: Dict[object, Dict[str, object]],
         episode_analysis: Dict[object, Dict[str, object]],
         selector: str,
     ) -> None:
-        dump_dir = self._get_opid_analysis_dump_dir()
+        dump_dir = self._get_seed_analysis_dump_dir()
         if dump_dir is None or not analysis_tasks:
             return
 
@@ -1389,22 +1390,22 @@ class RayPPOTrainer:
                     "traj_uid": str(traj_uid),
                     "selector": selector,
                     "analysis_mode": analysis.get("analysis_mode"),
-                    "skill_mode": analysis.get("skill_mode", self._get_opid_skill_mode()),
+                    "skill_mode": analysis.get("skill_mode", self._get_seed_skill_mode()),
                     "analysis_prompt_version": analysis.get(
                         "analysis_prompt_version",
-                        self._get_opid_analysis_prompt_version(),
+                        self._get_seed_analysis_prompt_version(),
                     ),
                     "analysis_backend_requested": analysis.get(
                         "analysis_backend_requested",
-                        self.config.algorithm.opid.analysis_backend,
+                        self.config.algorithm.seed.analysis_backend,
                     ),
                     "analysis_backend_used": analysis.get(
                         "analysis_backend_used",
-                        self.config.algorithm.opid.analysis_backend,
+                        self.config.algorithm.seed.analysis_backend,
                     ),
                     "include_episode_summary": self._config_bool(
                         self.config,
-                        "algorithm.opid.analysis_include_episode_summary",
+                        "algorithm.seed.analysis_include_episode_summary",
                         True,
                     ),
                     "analysis_error": analysis.get("analysis_error"),
@@ -1426,30 +1427,30 @@ class RayPPOTrainer:
                 }
                 f.write(_safe_json_dumps(entry) + "\n")
 
-        module_logger.info("Dumped OPID analysis results to %s", filename)
+        module_logger.info("Dumped SEED analysis results to %s", filename)
 
-    def _get_opid_augmented_observation_dump_dir(self) -> Optional[str]:
+    def _get_seed_augmented_observation_dump_dir(self) -> Optional[str]:
         save_augmented_observations = OmegaConf.select(
             self.config,
-            "algorithm.opid.save_augmented_observations",
+            "algorithm.seed.save_augmented_observations",
         )
         if not save_augmented_observations:
             return None
 
         dump_dir = OmegaConf.select(
             self.config,
-            "algorithm.opid.augmented_observation_dump_dir",
+            "algorithm.seed.augmented_observation_dump_dir",
         )
         if dump_dir:
             return dump_dir
 
         return os.path.join(
             self.config.trainer.default_local_dir,
-            "opid_augmented_observations",
+            "seed_augmented_observations",
         )
 
-    def _dump_opid_augmented_observations(self, entries: List[Dict[str, object]]) -> None:
-        dump_dir = self._get_opid_augmented_observation_dump_dir()
+    def _dump_seed_augmented_observations(self, entries: List[Dict[str, object]]) -> None:
+        dump_dir = self._get_seed_augmented_observation_dump_dir()
         if dump_dir is None or not entries:
             return
 
@@ -1459,26 +1460,26 @@ class RayPPOTrainer:
             for entry in entries:
                 f.write(_safe_json_dumps(entry) + "\n")
 
-        module_logger.info("Dumped OPID augmented observations to %s", filename)
+        module_logger.info("Dumped SEED augmented observations to %s", filename)
 
-    def _get_opid_state_group_dump_dir(self) -> Optional[str]:
+    def _get_seed_state_group_dump_dir(self) -> Optional[str]:
         save_state_group_metrics = OmegaConf.select(
             self.config,
-            "algorithm.opid.save_state_group_metrics",
+            "algorithm.seed.save_state_group_metrics",
         )
         if save_state_group_metrics is False:
             return None
 
         dump_dir = OmegaConf.select(
             self.config,
-            "algorithm.opid.state_group_dump_dir",
+            "algorithm.seed.state_group_dump_dir",
         )
         if dump_dir:
             return dump_dir
 
         return os.path.join(
             self.config.trainer.default_local_dir,
-            "opid_state_group",
+            "seed_state_group",
         )
 
     @staticmethod
@@ -1504,27 +1505,27 @@ class RayPPOTrainer:
         return str(value)
 
     @staticmethod
-    def _extract_opid_state_group_histogram(
+    def _extract_seed_state_group_histogram(
         state_group_metrics: Dict[str, Any],
     ) -> List[Dict[str, float]]:
         histogram = []
         for key, value in state_group_metrics.items():
-            if not key.startswith(OPID_STATE_GROUP_METRIC_PREFIX):
+            if not key.startswith(SEED_STATE_GROUP_METRIC_PREFIX):
                 continue
-            metric_name = key[len(OPID_STATE_GROUP_METRIC_PREFIX):]
+            metric_name = key[len(SEED_STATE_GROUP_METRIC_PREFIX):]
             if not metric_name.startswith("size_") or not metric_name.endswith("_group_count"):
                 continue
             label = metric_name[len("size_"):-len("_group_count")]
             count = float(value)
             group_prop = float(
                 state_group_metrics.get(
-                    f"{OPID_STATE_GROUP_METRIC_PREFIX}size_{label}_group_prop",
+                    f"{SEED_STATE_GROUP_METRIC_PREFIX}size_{label}_group_prop",
                     0.0,
                 )
             )
             sample_prop = float(
                 state_group_metrics.get(
-                    f"{OPID_STATE_GROUP_METRIC_PREFIX}size_{label}_sample_prop",
+                    f"{SEED_STATE_GROUP_METRIC_PREFIX}size_{label}_sample_prop",
                     0.0,
                 )
             )
@@ -1547,7 +1548,7 @@ class RayPPOTrainer:
         return histogram
 
     @staticmethod
-    def _build_opid_state_group_svg(
+    def _build_seed_state_group_svg(
         *,
         global_step: int,
         histogram: List[Dict[str, float]],
@@ -1567,7 +1568,7 @@ class RayPPOTrainer:
         bar_width = (
             (plot_width - bar_gap * max(len(histogram) - 1, 0)) / max(len(histogram), 1)
         )
-        title = f"OPID State Group Size Distribution - Step {global_step}"
+        title = f"SEED State Group Size Distribution - Step {global_step}"
         subtitle = (
             f"groups={summary.get('num_groups', 0)}, samples={summary.get('num_samples', 0)}, "
             f"mean={float(summary.get('mean', 0.0)):.2f}, std={float(summary.get('std', 0.0)):.2f}"
@@ -1618,16 +1619,16 @@ class RayPPOTrainer:
         parts.append("</svg>")
         return "\n".join(parts)
 
-    def _dump_and_remove_opid_state_group_metrics(self, metrics: Dict[str, Any]) -> None:
+    def _dump_and_remove_seed_state_group_metrics(self, metrics: Dict[str, Any]) -> None:
         state_group_metrics = {
             key: metrics.pop(key)
             for key in list(metrics.keys())
-            if key.startswith(OPID_STATE_GROUP_METRIC_PREFIX)
+            if key.startswith(SEED_STATE_GROUP_METRIC_PREFIX)
         }
         if not state_group_metrics:
             return
 
-        dump_dir = self._get_opid_state_group_dump_dir()
+        dump_dir = self._get_seed_state_group_dump_dir()
         if dump_dir is None:
             return
 
@@ -1636,19 +1637,19 @@ class RayPPOTrainer:
             key: self._metric_value_to_json(value)
             for key, value in sorted(state_group_metrics.items())
         }
-        histogram = self._extract_opid_state_group_histogram(raw_metrics)
+        histogram = self._extract_seed_state_group_histogram(raw_metrics)
         summary = {
-            key[len(OPID_STATE_GROUP_METRIC_PREFIX):]: value
+            key[len(SEED_STATE_GROUP_METRIC_PREFIX):]: value
             for key, value in raw_metrics.items()
-            if key.startswith(OPID_STATE_GROUP_METRIC_PREFIX)
-            and not key[len(OPID_STATE_GROUP_METRIC_PREFIX):].startswith("size_")
-            and not key[len(OPID_STATE_GROUP_METRIC_PREFIX):].startswith("raw_")
+            if key.startswith(SEED_STATE_GROUP_METRIC_PREFIX)
+            and not key[len(SEED_STATE_GROUP_METRIC_PREFIX):].startswith("size_")
+            and not key[len(SEED_STATE_GROUP_METRIC_PREFIX):].startswith("raw_")
         }
         payload = {
             "global_step": int(self.global_steps),
             "raw_metrics": raw_metrics,
             "raw_group_sizes": raw_metrics.get(
-                f"{OPID_STATE_GROUP_METRIC_PREFIX}raw_group_sizes",
+                f"{SEED_STATE_GROUP_METRIC_PREFIX}raw_group_sizes",
                 [],
             ),
             "histogram": histogram,
@@ -1661,14 +1662,14 @@ class RayPPOTrainer:
             f.write(_safe_json_dumps(payload, indent=2))
         with open(svg_path, "w", encoding="utf-8") as f:
             f.write(
-                self._build_opid_state_group_svg(
+                self._build_seed_state_group_svg(
                     global_step=int(self.global_steps),
                     histogram=histogram,
                     summary=summary,
                 )
             )
 
-        module_logger.info("Dumped OPID state-group metrics to %s and %s", json_path, svg_path)
+        module_logger.info("Dumped SEED state-group metrics to %s and %s", json_path, svg_path)
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1743,6 +1744,7 @@ class RayPPOTrainer:
                 "recompute_log_prob": False,
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
+                "global_step": int(self.global_steps),
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
@@ -1920,55 +1922,55 @@ class RayPPOTrainer:
                 worker_group=self.actor_rollout_wg,
             )
 
-    def _lazy_init_opid_analyzer(self):
-        if self._opid_analyzer is None:
+    def _lazy_init_seed_analyzer(self):
+        if self._seed_analyzer is None:
             max_step_skills_per_traj = OmegaConf.select(
                 self.config,
-                "algorithm.opid.analysis_max_step_skills_per_traj",
+                "algorithm.seed.analysis_max_step_skills_per_traj",
             )
             if max_step_skills_per_traj is None:
                 max_step_skills_per_traj = 1
             include_episode_summary = self._config_bool(
                 self.config,
-                "algorithm.opid.analysis_include_episode_summary",
+                "algorithm.seed.analysis_include_episode_summary",
                 True,
             )
             module_logger.info(
-                "Initializing OPID analyzer with backend=%s, max_completion_tokens=%s, max_step_skills_per_traj=%s, skill_mode=%s, analysis_prompt_version=%s, include_episode_summary=%s",
-                self.config.algorithm.opid.analysis_backend,
-                self.config.algorithm.opid.analysis_max_completion_tokens,
+                "Initializing SEED analyzer with backend=%s, max_completion_tokens=%s, max_step_skills_per_traj=%s, skill_mode=%s, analysis_prompt_version=%s, include_episode_summary=%s",
+                self.config.algorithm.seed.analysis_backend,
+                self.config.algorithm.seed.analysis_max_completion_tokens,
                 max_step_skills_per_traj,
-                self._get_opid_skill_mode(),
-                self._get_opid_analysis_prompt_version(),
+                self._get_seed_skill_mode(),
+                self._get_seed_analysis_prompt_version(),
                 include_episode_summary,
             )
-            self._opid_analyzer = core_opid.OPIDEpisodeAnalyzer(
-                backend=self.config.algorithm.opid.analysis_backend,
-                max_completion_tokens=self.config.algorithm.opid.analysis_max_completion_tokens,
+            self._seed_analyzer = core_seed.SEEDEpisodeAnalyzer(
+                backend=self.config.algorithm.seed.analysis_backend,
+                max_completion_tokens=self.config.algorithm.seed.analysis_max_completion_tokens,
                 max_step_skills_per_traj=max_step_skills_per_traj,
-                skill_mode=self._get_opid_skill_mode(),
-                analysis_prompt_version=self._get_opid_analysis_prompt_version(),
+                skill_mode=self._get_seed_skill_mode(),
+                analysis_prompt_version=self._get_seed_analysis_prompt_version(),
                 include_episode_summary=include_episode_summary,
             )
-        return self._opid_analyzer
+        return self._seed_analyzer
 
-    def _get_opid_failure_success_threshold(self) -> float:
-        threshold = OmegaConf.select(self.config, "algorithm.opid.failure_success_threshold")
+    def _get_seed_failure_success_threshold(self) -> float:
+        threshold = OmegaConf.select(self.config, "algorithm.seed.failure_success_threshold")
         return 1.0 if threshold is None else float(threshold)
 
-    def _get_opid_skill_mode(self) -> str:
-        return validate_skill_mode(OmegaConf.select(self.config, "algorithm.opid.skill_mode") or "episode_step")
+    def _get_seed_skill_mode(self) -> str:
+        return validate_skill_mode(OmegaConf.select(self.config, "algorithm.seed.skill_mode") or "episode_step")
 
-    def _get_opid_analysis_prompt_version(self) -> str:
-        return core_opid.validate_analysis_prompt_version(
-            OmegaConf.select(self.config, "algorithm.opid.analysis_prompt_version") or "opid"
+    def _get_seed_analysis_prompt_version(self) -> str:
+        return core_seed.validate_analysis_prompt_version(
+            OmegaConf.select(self.config, "algorithm.seed.analysis_prompt_version") or "seed"
         )
 
-    def _build_opid_traj_success_map(self, batch: DataProto) -> Dict[object, float]:
+    def _build_seed_traj_success_map(self, batch: DataProto) -> Dict[object, float]:
         if "episode_success" in batch.non_tensor_batch:
             episode_success_np = np.asarray(batch.non_tensor_batch["episode_success"], dtype=np.float32)
         elif "episode_rewards" in batch.non_tensor_batch:
-            threshold = self._get_opid_failure_success_threshold()
+            threshold = self._get_seed_failure_success_threshold()
             episode_success_np = (
                 np.asarray(batch.non_tensor_batch["episode_rewards"], dtype=np.float32) >= threshold
             ).astype(np.float32)
@@ -1981,7 +1983,7 @@ class RayPPOTrainer:
                 traj_success[traj_uid] = float(episode_success_np[sample_idx])
         return traj_success
 
-    def _opid_prompt_dict_to_text(self, prompt: Dict[str, Any]) -> str:
+    def _seed_prompt_dict_to_text(self, prompt: Dict[str, Any]) -> str:
         messages = prompt.get("messages", []) if isinstance(prompt, dict) else []
         if len(messages) == 1 and messages[0].get("role") == "user":
             return str(messages[0].get("content", ""))
@@ -1990,7 +1992,79 @@ class RayPPOTrainer:
             for message in messages
         )
 
-    def _finalize_policy_vllm_opid_analysis(
+    @staticmethod
+    def _is_image_like_value(value: Any) -> bool:
+        if value is None or isinstance(value, (str, bytes, np.str_)):
+            return False
+        if torch.is_tensor(value):
+            return value.dim() >= 2
+        if isinstance(value, np.ndarray):
+            return value.ndim >= 2
+        return hasattr(value, "size") and hasattr(value, "mode")
+
+    def _extract_step_observation_images(self, batch: DataProto) -> Optional[np.ndarray]:
+        if "multi_modal_inputs" not in batch.non_tensor_batch:
+            return None
+        candidates = (
+            batch.non_tensor_batch.get("anchor_obs"),
+            batch.non_tensor_batch.get("obs_image"),
+        )
+        for values in candidates:
+            if values is None:
+                continue
+            images = []
+            for idx in range(len(batch)):
+                try:
+                    value = values[idx]
+                except Exception:
+                    value = None
+                images.append(value if self._is_image_like_value(value) else None)
+            if any(image is not None for image in images):
+                return np.asarray(images, dtype=object)
+        return None
+
+    @staticmethod
+    def _extract_policy_vllm_prompt_images(steps: List[Dict[str, object]], prompt_text: str) -> List[Any]:
+        if "<image>" not in prompt_text:
+            return []
+        images = [
+            step.get("observation_image")
+            for step in steps
+            if step.get("observation_image") is not None
+        ]
+        placeholder_count = prompt_text.count("<image>")
+        if images and len(images) != placeholder_count:
+            raise RuntimeError(
+                "SEED policy_vllm visual analysis prompt has "
+                f"{placeholder_count} image placeholder(s) but {len(images)} image(s)."
+            )
+        if placeholder_count != len(images):
+            raise RuntimeError(
+                "SEED policy_vllm visual analysis prompt has "
+                f"{placeholder_count} image placeholder(s) but {len(images)} image(s)."
+            )
+        return images
+
+    @staticmethod
+    def _append_response_position_ids(prompt_position_ids: torch.Tensor, response_length: int) -> torch.Tensor:
+        batch_size = prompt_position_ids.size(0)
+        delta_position_id = torch.arange(
+            1,
+            int(response_length) + 1,
+            device=prompt_position_ids.device,
+            dtype=prompt_position_ids.dtype,
+        )
+        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+        if prompt_position_ids.dim() == 3:
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(
+                batch_size,
+                prompt_position_ids.size(1),
+                -1,
+            )
+        response_position_ids = prompt_position_ids[..., -1:] + delta_position_id
+        return torch.cat([prompt_position_ids, response_position_ids], dim=-1)
+
+    def _finalize_policy_vllm_seed_analysis(
         self,
         analyzer,
         *,
@@ -2034,9 +2108,10 @@ class RayPPOTrainer:
         parsed["llm_raw_output"] = content
         return parsed
 
-    def _analyze_opid_episodes_with_policy_vllm(self, analyzer, analysis_tasks: Dict[object, Dict[str, object]]):
+    def _analyze_seed_episodes_with_policy_vllm(self, analyzer, analysis_tasks: Dict[object, Dict[str, object]]):
         traj_uids = list(analysis_tasks.keys())
         prompt_texts = []
+        prompt_images = []
         prompt_by_traj: Dict[object, Dict[str, Any]] = {}
         for traj_uid in traj_uids:
             task = analysis_tasks[traj_uid]
@@ -2049,13 +2124,22 @@ class RayPPOTrainer:
                 task_description=task.get("task_description"),
             )
             prompt_by_traj[traj_uid] = prompt
-            prompt_texts.append(self._opid_prompt_dict_to_text(prompt))
+            prompt_text = self._seed_prompt_dict_to_text(prompt)
+            prompt_texts.append(prompt_text)
+            prompt_images.append(
+                self._extract_policy_vllm_prompt_images(task["steps"], prompt_text)
+            )
 
         analysis_context_length = int(
-            OmegaConf.select(self.config, "algorithm.opid.analysis_context_length") or 16384
+            OmegaConf.select(self.config, "algorithm.seed.analysis_context_length") or 16384
         )
-        max_completion_tokens = int(self.config.algorithm.opid.analysis_max_completion_tokens)
-        prompt_batch = self.traj_collector.build_text_prompt_batch(
+        max_completion_tokens = int(self.config.algorithm.seed.analysis_max_completion_tokens)
+        use_visual_prompts = any(bool(images) for images in prompt_images)
+        if use_visual_prompts and not all(bool(images) for images in prompt_images):
+            raise RuntimeError(
+                "SEED policy_vllm received a mixed visual/text analysis batch."
+            )
+        prompt_batch = self.traj_collector.build_prompt_batch(
             obs_contents=prompt_texts,
             data_sources=[None] * len(prompt_texts),
             meta_info={
@@ -2073,20 +2157,25 @@ class RayPPOTrainer:
                 },
             },
             max_prompt_length=analysis_context_length,
+            images=prompt_images if use_visual_prompts else None,
         )
         prompt_lengths = prompt_batch.batch["attention_mask"].sum(dim=-1).detach().cpu().numpy()
         module_logger.info(
-            "OPID policy_vllm analysis prompt lengths: min=%s, mean=%.2f, max=%s, max_completion_tokens=%s",
+            "SEED policy_vllm analysis prompt lengths: min=%s, mean=%.2f, max=%s, max_completion_tokens=%s, visual=%s",
             int(prompt_lengths.min()),
             float(prompt_lengths.mean()),
             int(prompt_lengths.max()),
             max_completion_tokens,
+            bool(use_visual_prompts),
         )
 
         gen_meta_info = deepcopy(prompt_batch.meta_info)
+        non_tensor_batch_keys = ["raw_prompt_ids"]
+        if "multi_modal_data" in prompt_batch.non_tensor_batch:
+            non_tensor_batch_keys.append("multi_modal_data")
         gen_prompt_batch = prompt_batch.pop(
             batch_keys=["input_ids", "attention_mask", "position_ids"],
-            non_tensor_batch_keys=["raw_prompt_ids"],
+            non_tensor_batch_keys=non_tensor_batch_keys,
         )
         gen_prompt_batch.meta_info = gen_meta_info
         gen_prompt_batch_padded, pad_size = pad_dataproto_to_divisor(
@@ -2106,7 +2195,7 @@ class RayPPOTrainer:
                 skip_special_tokens=True,
             )
             task = analysis_tasks[traj_uid]
-            analysis = self._finalize_policy_vllm_opid_analysis(
+            analysis = self._finalize_policy_vllm_seed_analysis(
                 analyzer,
                 content=content,
                 prompt=prompt_by_traj[traj_uid],
@@ -2125,36 +2214,36 @@ class RayPPOTrainer:
             results[traj_uid] = analysis
         return results, 1
 
-    def _analyze_opid_episodes(self, analyzer, analysis_tasks: Dict[object, Dict[str, object]]):
+    def _analyze_seed_episodes(self, analyzer, analysis_tasks: Dict[object, Dict[str, object]]):
         """
-        Analyze multiple trajectories for OPID. Azure-backed analysis is run with
+        Analyze multiple trajectories for SEED. Azure-backed analysis is run with
         a thread pool to hide per-request latency.
         """
         if not analysis_tasks:
             return {}, 0
 
-        backend = self.config.algorithm.opid.analysis_backend
-        configured_workers = int(self.config.algorithm.opid.analysis_num_workers)
+        backend = self.config.algorithm.seed.analysis_backend
+        configured_workers = int(self.config.algorithm.seed.analysis_num_workers)
         max_workers = max(1, min(configured_workers, len(analysis_tasks)))
 
         module_logger.info(
-            "Running OPID episode analysis for %s trajectories with backend=%s and num_workers=%s",
+            "Running SEED episode analysis for %s trajectories with backend=%s and num_workers=%s",
             len(analysis_tasks),
             backend,
             max_workers,
         )
-        print(f"OPID analysis backend: {backend}, configured_workers: {configured_workers}, max_workers: {max_workers}")
+        print(f"SEED analysis backend: {backend}, configured_workers: {configured_workers}, max_workers: {max_workers}")
 
         if backend == "policy_vllm":
-            return self._analyze_opid_episodes_with_policy_vllm(
+            return self._analyze_seed_episodes_with_policy_vllm(
                 analyzer=analyzer,
                 analysis_tasks=analysis_tasks,
             )
         if backend != "openai":
-            raise ValueError(f"Unsupported OPID analysis backend: {backend}")
+            raise ValueError(f"Unsupported SEED analysis backend: {backend}")
 
         results = {}
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="opid-analysis") as executor:
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="seed-analysis") as executor:
             future_to_traj = {
                 executor.submit(
                     analyzer.analyze_episode,
@@ -2172,7 +2261,7 @@ class RayPPOTrainer:
                 except Exception as exc:
                     task = analysis_tasks.get(traj_uid, {})
                     module_logger.warning(
-                        "OPID episode analysis failed for traj_uid=%s; skipping teacher signal for this trajectory: %s",
+                        "SEED episode analysis failed for traj_uid=%s; skipping teacher signal for this trajectory: %s",
                         traj_uid,
                         exc,
                     )
@@ -2190,14 +2279,14 @@ class RayPPOTrainer:
                     }
         return results, max_workers
 
-    def _prepare_opid_teacher_signals(
+    def _prepare_seed_teacher_signals(
         self,
         batch: DataProto,
         metrics: Dict[str, float],
         teacher_enabled: bool,
     ) -> DataProto:
         """
-        Run OPID analysis for the current batch and optionally compute teacher
+        Run SEED analysis for the current batch and optionally compute teacher
         log-probs during the bootstrap phase.
         """
         batch_size = len(batch)
@@ -2209,9 +2298,9 @@ class RayPPOTrainer:
         traj_uids = batch.non_tensor_batch.get("traj_uid", [])
         num_trajectories = len(set(traj_uids)) if len(traj_uids) > 0 else 0
 
-        if not self._is_opid_analysis_enabled():
+        if not self._is_seed_analysis_enabled():
             module_logger.info(
-                "Skipping OPID analysis and teacher signal construction for batch_size=%s, num_trajectories=%s.",
+                "Skipping SEED analysis and teacher signal construction for batch_size=%s, num_trajectories=%s.",
                 batch_size,
                 num_trajectories,
             )
@@ -2220,74 +2309,81 @@ class RayPPOTrainer:
             batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["critical_step_mask"] = zero_critical_mask
             batch.batch["step_skill_mask"] = zero_step_skill_mask
-            metrics["opid/analysis_enabled"] = 0.0
-            metrics["opid/analysis_disabled"] = 1.0
-            metrics["opid/analysis_num_requests"] = 0.0
-            metrics["opid/analysis_num_workers"] = 0.0
-            metrics["opid/critical_step_ratio"] = 0.0
-            metrics["opid/teacher_batch_size"] = 0.0
-            metrics["opid/teacher_available"] = 0.0
-            metrics["opid/teacher_skipped_analysis_disabled"] = 1.0
-            metrics["opid/episode_skill_teacher/enabled"] = 0.0
-            metrics["opid/step_skill_teacher/step_skill_step_ratio"] = 0.0
-            metrics["opid/step_skill_teacher/step_skills_applied"] = 0.0
+            metrics["seed/analysis_enabled"] = 0.0
+            metrics["seed/analysis_disabled"] = 1.0
+            metrics["seed/analysis_num_requests"] = 0.0
+            metrics["seed/analysis_num_workers"] = 0.0
+            metrics["seed/critical_step_ratio"] = 0.0
+            metrics["seed/teacher_batch_size"] = 0.0
+            metrics["seed/teacher_available"] = 0.0
+            metrics["seed/teacher_skipped_analysis_disabled"] = 1.0
+            metrics["seed/episode_skill_teacher/enabled"] = 0.0
+            metrics["seed/step_skill_teacher/step_skill_step_ratio"] = 0.0
+            metrics["seed/step_skill_teacher/step_skills_applied"] = 0.0
             return batch
 
-        metrics["opid/analysis_enabled"] = 1.0
-        metrics["opid/analysis_disabled"] = 0.0
-        metrics["opid/episode_skill_teacher/enabled"] = 0.0
-        configured_failed_only = bool(OmegaConf.select(self.config, "algorithm.opid.failed_only"))
-        failed_only_after_steps = self._get_opid_failed_only_after_steps()
-        failed_only = self._should_opid_analyze_failed_only()
+        metrics["seed/analysis_enabled"] = 1.0
+        metrics["seed/analysis_disabled"] = 0.0
+        metrics["seed/episode_skill_teacher/enabled"] = 0.0
+        configured_failed_only = bool(OmegaConf.select(self.config, "algorithm.seed.failed_only"))
+        failed_only_after_steps = self._get_seed_failed_only_after_steps()
+        failed_only = self._should_seed_analyze_failed_only()
         analysis_mode = "failed_episode_opd" if failed_only else "teacher_bootstrap"
 
         module_logger.info(
-            "Preparing OPID analysis for batch_size=%s, num_trajectories=%s, selector=%s, analysis_backend=%s, analysis_mode=%s, failed_only_after_steps=%s",
+            "Preparing SEED analysis for batch_size=%s, num_trajectories=%s, selector=%s, analysis_backend=%s, analysis_mode=%s, failed_only_after_steps=%s",
             batch_size,
             num_trajectories,
-            self.config.algorithm.opid.selector,
-            self.config.algorithm.opid.analysis_backend,
+            self.config.algorithm.seed.selector,
+            self.config.algorithm.seed.analysis_backend,
             analysis_mode,
             failed_only_after_steps,
         )
-        metrics["opid/analysis_mode_teacher_bootstrap"] = 1.0 if not failed_only else 0.0
-        metrics["opid/analysis_mode_failed_episode_opd"] = 1.0 if failed_only else 0.0
+        metrics["seed/analysis_mode_teacher_bootstrap"] = 1.0 if not failed_only else 0.0
+        metrics["seed/analysis_mode_failed_episode_opd"] = 1.0 if failed_only else 0.0
 
         if "obs_text" not in batch.non_tensor_batch:
-            module_logger.warning("OPID teacher signal skipped because obs_text is missing from the rollout batch.")
+            module_logger.warning("SEED teacher signal skipped because obs_text is missing from the rollout batch.")
             batch.batch["teacher_log_prob"] = zero_teacher_log_prob
             batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["critical_step_mask"] = zero_critical_mask
             batch.batch["step_skill_mask"] = zero_step_skill_mask
-            metrics["opid/critical_step_ratio"] = 0.0
-            metrics["opid/teacher_batch_size"] = 0.0
-            metrics["opid/teacher_available"] = 0.0
-            metrics["opid/episode_skill_teacher/enabled"] = 0.0
-            metrics["opid/step_skill_teacher/step_skill_step_ratio"] = 0.0
-            metrics["opid/step_skill_teacher/step_skills_applied"] = 0.0
+            metrics["seed/critical_step_ratio"] = 0.0
+            metrics["seed/teacher_batch_size"] = 0.0
+            metrics["seed/teacher_available"] = 0.0
+            metrics["seed/episode_skill_teacher/enabled"] = 0.0
+            metrics["seed/step_skill_teacher/step_skill_step_ratio"] = 0.0
+            metrics["seed/step_skill_teacher/step_skills_applied"] = 0.0
             return batch
 
-        step_indices = core_opid.build_traj_step_indices(batch.non_tensor_batch["traj_uid"])
+        step_indices = core_seed.build_traj_step_indices(batch.non_tensor_batch["traj_uid"])
         batch.non_tensor_batch["step_idx"] = step_indices
 
-        selector = self.config.algorithm.opid.selector
-        analyzer = self._lazy_init_opid_analyzer()
-        metrics["opid/failed_only"] = 1.0 if failed_only else 0.0
-        metrics["opid/failed_only_config"] = 1.0 if configured_failed_only else 0.0
-        metrics["opid/failed_only_after_steps"] = (
+        selector = self.config.algorithm.seed.selector
+        analyzer = self._lazy_init_seed_analyzer()
+        metrics["seed/failed_only"] = 1.0 if failed_only else 0.0
+        metrics["seed/failed_only_config"] = 1.0 if configured_failed_only else 0.0
+        metrics["seed/failed_only_after_steps"] = (
             float(failed_only_after_steps) if failed_only_after_steps is not None else -1.0
         )
-        metrics["opid/failed_only_schedule_active"] = 1.0 if failed_only_after_steps is not None else 0.0
-        metrics["opid/failure_success_threshold"] = self._get_opid_failure_success_threshold()
+        metrics["seed/failed_only_schedule_active"] = 1.0 if failed_only_after_steps is not None else 0.0
+        metrics["seed/failure_success_threshold"] = self._get_seed_failure_success_threshold()
         critical_mask_np = np.zeros(batch_size, dtype=bool)
         base_obs_texts = batch.non_tensor_batch.get("obs_text_base", batch.non_tensor_batch["obs_text"])
         analysis_obs_texts = base_obs_texts
+        analysis_obs_images = self._extract_step_observation_images(batch)
+        if analyzer.analysis_prompt_version == "sokoban_visual":
+            if analysis_obs_images is None or any(image is None for image in analysis_obs_images):
+                raise RuntimeError(
+                    "sokoban_visual SEED analysis requires an observation image for every rollout step."
+                )
 
-        episodes = core_opid.build_episode_records(
+        episodes = core_seed.build_episode_records(
             tokenizer=self.tokenizer,
             obs_texts=analysis_obs_texts,
             obs_raws=batch.non_tensor_batch.get("anchor_obs"),
+            obs_images=analysis_obs_images,
             responses=batch.batch["responses"],
             response_mask=response_mask,
             traj_index=batch.non_tensor_batch["traj_uid"],
@@ -2298,21 +2394,21 @@ class RayPPOTrainer:
         if episodes:
             episode_lengths = [len(steps) for steps in episodes.values()]
             module_logger.info(
-                "Built OPID episode records for %s trajectories (min_steps=%s, mean_steps=%.2f, max_steps=%s)",
+                "Built SEED episode records for %s trajectories (min_steps=%s, mean_steps=%.2f, max_steps=%s)",
                 len(episodes),
                 min(episode_lengths),
                 float(np.mean(episode_lengths)),
                 max(episode_lengths),
             )
         else:
-            module_logger.info("No OPID episode records were built for the current batch.")
+            module_logger.info("No SEED episode records were built for the current batch.")
 
         episode_analysis: Dict[object, Dict[str, object]] = {}
         analysis_tasks: Dict[object, Dict[str, object]] = {}
-        traj_success = self._build_opid_traj_success_map(batch)
+        traj_success = self._build_seed_traj_success_map(batch)
         if failed_only and not traj_success:
             module_logger.warning(
-                "OPID failed_only is enabled, but episode_success/episode_rewards are missing; analyzing all trajectories."
+                "SEED failed_only is enabled, but episode_success/episode_rewards are missing; analyzing all trajectories."
             )
 
         def _should_analyze_traj(traj_uid: object) -> bool:
@@ -2330,16 +2426,16 @@ class RayPPOTrainer:
                 if _should_analyze_traj(traj_uid)
             )
         )
-        metrics["opid/analyzed_traj_count"] = analyzed_traj_count
-        metrics["opid/failed_traj_count"] = analyzed_traj_count
-        metrics["opid/skipped_success_traj_count"] = float(
+        metrics["seed/analyzed_traj_count"] = analyzed_traj_count
+        metrics["seed/failed_traj_count"] = analyzed_traj_count
+        metrics["seed/skipped_success_traj_count"] = float(
             sum(1 for traj_uid in episodes if not _should_analyze_traj(traj_uid))
         )
         if selector != "llm":
-            raise ValueError("Episode-level OPID OPD requires algorithm.opid.selector=llm.")
+            raise ValueError("Episode-level SEED OPD requires algorithm.seed.selector=llm.")
 
         module_logger.info(
-            "OPID LLM analyzer will build episode-level teacher skills for %s/%s trajectories.",
+            "SEED LLM analyzer will build episode-level teacher skills for %s/%s trajectories.",
             int(analyzed_traj_count),
             len(episodes),
         )
@@ -2353,22 +2449,22 @@ class RayPPOTrainer:
                 "analysis_mode": analysis_mode,
                 "episode_success": traj_success.get(traj_uid),
             }
-        analyzed, analysis_workers = self._analyze_opid_episodes(analyzer=analyzer, analysis_tasks=analysis_tasks)
+        analyzed, analysis_workers = self._analyze_seed_episodes(analyzer=analyzer, analysis_tasks=analysis_tasks)
         episode_analysis.update(analyzed)
-        skill_gen_samples = self._collect_opid_skill_gen_samples(
+        skill_gen_samples = self._collect_seed_skill_gen_samples(
             episode_analysis=episode_analysis,
             analysis_tasks=analysis_tasks,
             metrics=metrics,
         )
         if skill_gen_samples:
-            batch.meta_info["opid_skill_gen_samples"] = skill_gen_samples
+            batch.meta_info["seed_skill_gen_samples"] = skill_gen_samples
         else:
-            batch.meta_info.pop("opid_skill_gen_samples", None)
+            batch.meta_info.pop("seed_skill_gen_samples", None)
 
         def _has_successful_analysis(traj_uid: object, analysis: Dict[str, object]) -> bool:
             if analysis.get("analysis_error"):
                 return False
-            if self._get_opid_skill_mode() == "step_only":
+            if self._get_seed_skill_mode() == "step_only":
                 return bool(analysis.get("step_skills"))
             return bool(str(analysis.get("episode_skill", "")).strip())
 
@@ -2385,23 +2481,23 @@ class RayPPOTrainer:
             if sample_traj_uid in analyzed_traj_uids:
                 critical_mask_np[sample_idx] = True
         module_logger.info(
-            "OPID episode-level OPD selected %s steps from %s successful analyzed trajectories (%s failed/skipped).",
+            "SEED episode-level OPD selected %s steps from %s successful analyzed trajectories (%s failed/skipped).",
             int(critical_mask_np.sum()),
             len(analyzed_traj_uids),
             failed_analysis_count,
         )
-        metrics["opid/analysis_num_requests"] = float(len(analysis_tasks))
-        metrics["opid/analysis_num_workers"] = float(analysis_workers)
-        metrics["opid/analysis_succeeded_traj_count"] = float(len(successful_episode_analysis))
-        metrics["opid/analysis_failed_traj_count"] = float(failed_analysis_count)
+        metrics["seed/analysis_num_requests"] = float(len(analysis_tasks))
+        metrics["seed/analysis_num_workers"] = float(analysis_workers)
+        metrics["seed/analysis_succeeded_traj_count"] = float(len(successful_episode_analysis))
+        metrics["seed/analysis_failed_traj_count"] = float(failed_analysis_count)
         module_logger.info(
-            "OPID episode analysis finished: requests=%s, workers=%s, successful_trajectories=%s, failed_trajectories=%s",
+            "SEED episode analysis finished: requests=%s, workers=%s, successful_trajectories=%s, failed_trajectories=%s",
             len(analysis_tasks),
             analysis_workers,
             len(successful_episode_analysis),
             failed_analysis_count,
         )
-        self._dump_opid_analysis(
+        self._dump_seed_analysis(
             analysis_tasks=analysis_tasks,
             episode_analysis=episode_analysis,
             selector=selector,
@@ -2415,15 +2511,15 @@ class RayPPOTrainer:
         )
         batch.batch["critical_step_mask"] = critical_mask
 
-        metrics["opid/critical_step_ratio"] = float(critical_mask_np.mean()) if batch_size > 0 else 0.0
-        metrics["opid/teacher_batch_size"] = float(len(critical_indices))
-        metrics["opid/teacher_available"] = 1.0
-        metrics["opid/step_skill_teacher/step_skill_step_ratio"] = 0.0
-        metrics["opid/step_skill_teacher/step_skills_applied"] = 0.0
+        metrics["seed/critical_step_ratio"] = float(critical_mask_np.mean()) if batch_size > 0 else 0.0
+        metrics["seed/teacher_batch_size"] = float(len(critical_indices))
+        metrics["seed/teacher_available"] = 1.0
+        metrics["seed/step_skill_teacher/step_skill_step_ratio"] = 0.0
+        metrics["seed/step_skill_teacher/step_skills_applied"] = 0.0
         module_logger.info(
-            "OPID finalized %s OPD-scored steps (step_ratio=%.4f, analysis_mode=%s).",
+            "SEED finalized %s OPD-scored steps (step_ratio=%.4f, analysis_mode=%s).",
             len(critical_indices),
-            metrics["opid/critical_step_ratio"],
+            metrics["seed/critical_step_ratio"],
             analysis_mode,
         )
 
@@ -2433,17 +2529,17 @@ class RayPPOTrainer:
             batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["critical_step_mask"] = critical_mask
             batch.batch["step_skill_mask"] = zero_step_skill_mask
-            metrics["opid/teacher_batch_size"] = 0.0
-            metrics["opid/teacher_available"] = 0.0
-            teacher_start_after_steps = self._get_opid_opd_start_after_steps()
-            teacher_stop_after_steps = self._get_opid_opd_stop_after_steps()
-            metrics["opid/teacher_skipped_by_schedule"] = 1.0
-            metrics["opid/teacher_skipped_before_start"] = (
+            metrics["seed/teacher_batch_size"] = 0.0
+            metrics["seed/teacher_available"] = 0.0
+            teacher_start_after_steps = self._get_seed_opd_start_after_steps()
+            teacher_stop_after_steps = self._get_seed_opd_stop_after_steps()
+            metrics["seed/teacher_skipped_by_schedule"] = 1.0
+            metrics["seed/teacher_skipped_before_start"] = (
                 1.0
                 if teacher_start_after_steps is not None and self.global_steps <= teacher_start_after_steps
                 else 0.0
             )
-            metrics["opid/teacher_skipped_after_opd_stop"] = (
+            metrics["seed/teacher_skipped_after_opd_stop"] = (
                 1.0
                 if teacher_stop_after_steps is not None and self.global_steps > teacher_stop_after_steps
                 else 0.0
@@ -2451,59 +2547,52 @@ class RayPPOTrainer:
             return batch
 
         if len(critical_indices) == 0:
-            module_logger.info("OPID has no episode-level OPD steps for the current batch.")
+            module_logger.info("SEED has no episode-level OPD steps for the current batch.")
             batch.batch["teacher_log_prob"] = zero_teacher_log_prob
             batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
             batch.batch["step_skill_mask"] = zero_step_skill_mask
-            metrics["opid/teacher_available"] = 0.0
-            return batch
-
-        if "multi_modal_inputs" in batch.non_tensor_batch:
-            module_logger.warning("OPID teacher signal skipped for the current batch because multi_modal_inputs are present.")
-            batch.batch["teacher_log_prob"] = zero_teacher_log_prob
-            batch.batch["episode_teacher_log_prob"] = zero_teacher_log_prob.clone()
-            batch.batch["step_teacher_log_prob"] = zero_teacher_log_prob.clone()
-            batch.batch["critical_step_mask"] = zero_critical_mask
-            batch.batch["step_skill_mask"] = zero_step_skill_mask
-            batch.batch["teacher_signal_mask"] = zero_critical_mask
-            metrics["opid/teacher_skipped_multimodal"] = 1.0
+            metrics["seed/teacher_available"] = 0.0
             return batch
 
         episode_obs_texts = []
         episode_data_sources = []
+        episode_prompt_images = []
         episode_skill_indices = []
         step_obs_texts = []
         step_data_sources = []
+        step_prompt_images = []
         step_skill_indices = []
         augmented_observation_dump_entries: List[Dict[str, object]] = []
         critical_preview = []
         step_skill_guided_steps = 0
-        sdar_loss_enabled = self._is_opid_sdar_loss_enabled()
-        skill_mode = self._get_opid_skill_mode()
+        teacher_obs_images = self._extract_step_observation_images(batch)
+        metrics["seed/teacher_multimodal"] = 1.0 if teacher_obs_images is not None else 0.0
+        sdar_loss_enabled = self._is_seed_sdar_loss_enabled()
+        skill_mode = self._get_seed_skill_mode()
         episode_skill_teacher_weight = float(
-            OmegaConf.select(self.config, "algorithm.opid.episode_skill_teacher_advantage_w") or 0.0
+            OmegaConf.select(self.config, "algorithm.seed.episode_skill_teacher_advantage_w") or 0.0
         )
         episode_skill_teacher_enabled = episode_skill_teacher_weight > 0.0 or sdar_loss_enabled
         if skill_mode == "step_only":
             episode_skill_teacher_enabled = False
         step_skill_teacher_enabled = (
-            float(OmegaConf.select(self.config, "algorithm.opid.step_skill_teacher_advantage_w") or 0.0) > 0.0
+            float(OmegaConf.select(self.config, "algorithm.seed.step_skill_teacher_advantage_w") or 0.0) > 0.0
             or sdar_loss_enabled
         )
         if skill_mode == "episode_only":
             step_skill_teacher_enabled = False
         skill_teacher_mode = str(
-            OmegaConf.select(self.config, "algorithm.opid.skill_teacher_mode") or "step_priority"
+            OmegaConf.select(self.config, "algorithm.seed.skill_teacher_mode") or "step_priority"
         )
-        metrics["opid/episode_skill_teacher/enabled"] = 1.0 if episode_skill_teacher_enabled else 0.0
-        metrics["opid/sdar_loss_enabled"] = 1.0 if sdar_loss_enabled else 0.0
-        metrics["opid/episode_skill_teacher_skipped_zero_weight"] = (
+        metrics["seed/episode_skill_teacher/enabled"] = 1.0 if episode_skill_teacher_enabled else 0.0
+        metrics["seed/sdar_loss_enabled"] = 1.0 if sdar_loss_enabled else 0.0
+        metrics["seed/episode_skill_teacher_skipped_zero_weight"] = (
             0.0 if episode_skill_teacher_enabled else 1.0
         )
-        metrics["opid/skill_mode_step_only"] = 1.0 if skill_mode == "step_only" else 0.0
-        metrics["opid/skill_mode_episode_only"] = 1.0 if skill_mode == "episode_only" else 0.0
-        metrics["opid/skill_teacher_mode_additive"] = 1.0 if skill_teacher_mode == "additive" else 0.0
+        metrics["seed/skill_mode_step_only"] = 1.0 if skill_mode == "step_only" else 0.0
+        metrics["seed/skill_mode_episode_only"] = 1.0 if skill_mode == "episode_only" else 0.0
+        metrics["seed/skill_teacher_mode_additive"] = 1.0 if skill_teacher_mode == "additive" else 0.0
 
         for sample_idx in critical_indices:
             traj_uid = batch.non_tensor_batch["traj_uid"][sample_idx]
@@ -2534,6 +2623,9 @@ class RayPPOTrainer:
                 )
                 episode_obs_texts.append(episode_enhanced_obs)
                 episode_data_sources.append(data_source)
+                episode_prompt_images.append(
+                    None if teacher_obs_images is None else teacher_obs_images[sample_idx]
+                )
                 episode_skill_indices.append(int(sample_idx))
             if use_step_skill:
                 step_skill_guided_steps += 1
@@ -2543,6 +2635,9 @@ class RayPPOTrainer:
                 )
                 step_obs_texts.append(step_enhanced_obs)
                 step_data_sources.append(data_source)
+                step_prompt_images.append(
+                    None if teacher_obs_images is None else teacher_obs_images[sample_idx]
+                )
                 step_skill_indices.append(int(sample_idx))
             augmented_observation_dump_entries.append(
                 {
@@ -2572,26 +2667,27 @@ class RayPPOTrainer:
                 )
 
         if len(critical_indices) > 0:
-            metrics["opid/step_skill_teacher/step_skill_step_ratio"] = float(
+            metrics["seed/step_skill_teacher/step_skill_step_ratio"] = float(
                 step_skill_guided_steps / len(critical_indices)
             )
-            metrics["opid/episode_skill_teacher/episode_skill_step_ratio"] = float(
+            metrics["seed/episode_skill_teacher/episode_skill_step_ratio"] = float(
                 len(episode_skill_indices) / len(critical_indices)
             )
-        metrics["opid/step_skill_teacher/step_skills_applied"] = float(step_skill_guided_steps)
-        metrics["opid/episode_skill_teacher/episode_skills_applied"] = float(len(episode_skill_indices))
-        metrics["opid/teacher_batch_size"] = float(len(episode_skill_indices) + len(step_skill_indices))
-        metrics["opid/teacher_available"] = 1.0 if (episode_skill_indices or step_skill_indices) else 0.0
+        metrics["seed/step_skill_teacher/step_skills_applied"] = float(step_skill_guided_steps)
+        metrics["seed/episode_skill_teacher/episode_skills_applied"] = float(len(episode_skill_indices))
+        metrics["seed/teacher_batch_size"] = float(len(episode_skill_indices) + len(step_skill_indices))
+        metrics["seed/teacher_available"] = 1.0 if (episode_skill_indices or step_skill_indices) else 0.0
 
         module_logger.info(
-            "OPID built %s episode-skill and %s step-skill observations for teacher scoring across %s trajectories.",
+            "SEED built %s episode-skill and %s step-skill observations for teacher scoring across %s trajectories.",
             len(episode_obs_texts),
             len(step_obs_texts),
             len({batch.non_tensor_batch['traj_uid'][sample_idx] for sample_idx in critical_indices}),
         )
         if critical_preview and module_logger.isEnabledFor(logging.DEBUG):
-            module_logger.debug("OPID episode-level OPD preview: %s", critical_preview)
-        self._dump_opid_augmented_observations(augmented_observation_dump_entries)
+            module_logger.debug("SEED episode-level OPD preview: %s", critical_preview)
+        self._dump_seed_augmented_observations(augmented_observation_dump_entries)
+        visual_teacher_required = analyzer.analysis_prompt_version == "sokoban_visual"
 
         def _compute_skill_log_probs(
             *,
@@ -2600,21 +2696,36 @@ class RayPPOTrainer:
             responses: torch.Tensor,
             response_masks: torch.Tensor,
             data_sources: List[object],
+            prompt_images: Optional[List[Any]] = None,
         ) -> torch.Tensor:
             teacher_meta_info = deepcopy(batch.meta_info)
-            teacher_meta_info.pop("opid_skill_gen_samples", None)
-            teacher_prompt_batch = self.traj_collector.build_text_prompt_batch(
+            teacher_meta_info.pop("seed_skill_gen_samples", None)
+            use_prompt_images = prompt_images is not None and any(
+                image is not None for image in prompt_images
+            )
+            if visual_teacher_required and (
+                prompt_images is None or not all(image is not None for image in prompt_images)
+            ):
+                raise RuntimeError("sokoban_visual SEED teacher scoring requires an image for every prompt.")
+            if use_prompt_images and not all(image is not None for image in prompt_images):
+                raise RuntimeError(
+                    "SEED %s teacher scoring received a mixed visual/text prompt batch."
+                    % label
+                )
+            teacher_prompt_batch = self.traj_collector.build_prompt_batch(
                 obs_contents=obs_texts,
                 data_sources=data_sources,
                 meta_info=teacher_meta_info,
+                images=prompt_images if use_prompt_images else None,
             )
             prompt_lengths = teacher_prompt_batch.batch["attention_mask"].sum(dim=-1).detach().cpu().numpy()
             module_logger.info(
-                "OPID %s teacher prompt lengths: min=%s, mean=%.2f, max=%s",
+                "SEED %s teacher prompt lengths: min=%s, mean=%.2f, max=%s, visual=%s",
                 label,
                 int(prompt_lengths.min()),
                 float(prompt_lengths.mean()),
                 int(prompt_lengths.max()),
+                bool(use_prompt_images),
             )
 
             teacher_input_ids = torch.cat([teacher_prompt_batch.batch["input_ids"], responses], dim=-1)
@@ -2625,7 +2736,13 @@ class RayPPOTrainer:
                 ],
                 dim=-1,
             )
-            teacher_position_ids = torch.clip(torch.cumsum(teacher_attention_mask, dim=-1) - 1, min=0)
+            teacher_position_ids = self._append_response_position_ids(
+                teacher_prompt_batch.batch["position_ids"],
+                responses.size(-1),
+            )
+            teacher_non_tensors = {}
+            if "multi_modal_inputs" in teacher_prompt_batch.non_tensor_batch:
+                teacher_non_tensors["multi_modal_inputs"] = teacher_prompt_batch.non_tensor_batch["multi_modal_inputs"]
             teacher_batch = DataProto.from_dict(
                 tensors={
                     "responses": responses,
@@ -2633,6 +2750,7 @@ class RayPPOTrainer:
                     "attention_mask": teacher_attention_mask,
                     "position_ids": teacher_position_ids,
                 },
+                non_tensors=teacher_non_tensors,
                 meta_info=teacher_meta_info,
             )
             teacher_batch_padded, teacher_pad_size = pad_dataproto_to_divisor(
@@ -2646,8 +2764,8 @@ class RayPPOTrainer:
         full_episode_teacher_log_prob = zero_teacher_log_prob.clone()
         episode_skill_mask_np = np.zeros(batch_size, dtype=bool)
         active_teacher_log_prob_chunks = []
-        metrics["opid/teacher_log_prob_mean"] = 0.0
-        metrics["opid/episode_skill_teacher_log_prob_mean"] = 0.0
+        metrics["seed/teacher_log_prob_mean"] = 0.0
+        metrics["seed/episode_skill_teacher_log_prob_mean"] = 0.0
         if episode_skill_indices:
             episode_skill_mask_np[episode_skill_indices] = True
             episode_skill_tensor_indices = torch.as_tensor(
@@ -2661,15 +2779,16 @@ class RayPPOTrainer:
                 responses=batch.batch["responses"].index_select(0, episode_skill_tensor_indices),
                 response_masks=response_mask.index_select(0, episode_skill_tensor_indices),
                 data_sources=episode_data_sources,
+                prompt_images=episode_prompt_images,
             )
             full_episode_teacher_log_prob[episode_skill_indices] = episode_teacher_lp
             active_teacher_log_prob_chunks.append(episode_teacher_lp.reshape(-1))
-            metrics["opid/episode_skill_teacher_log_prob_mean"] = float(
+            metrics["seed/episode_skill_teacher_log_prob_mean"] = float(
                 episode_teacher_lp.mean().detach().cpu().item()
             )
         full_step_teacher_log_prob = zero_teacher_log_prob.clone()
         step_skill_mask_np = np.zeros(batch_size, dtype=bool)
-        metrics["opid/step_skill_teacher_log_prob_mean"] = 0.0
+        metrics["seed/step_skill_teacher_log_prob_mean"] = 0.0
         if step_skill_indices:
             step_skill_mask_np[step_skill_indices] = True
             step_skill_tensor_indices = torch.as_tensor(
@@ -2683,10 +2802,11 @@ class RayPPOTrainer:
                 responses=batch.batch["responses"].index_select(0, step_skill_tensor_indices),
                 response_masks=response_mask.index_select(0, step_skill_tensor_indices),
                 data_sources=step_data_sources,
+                prompt_images=step_prompt_images,
             )
             full_step_teacher_log_prob[step_skill_indices] = step_teacher_lp
             active_teacher_log_prob_chunks.append(step_teacher_lp.reshape(-1))
-            metrics["opid/step_skill_teacher_log_prob_mean"] = float(
+            metrics["seed/step_skill_teacher_log_prob_mean"] = float(
                 step_teacher_lp.mean().detach().cpu().item()
             )
 
@@ -2704,7 +2824,7 @@ class RayPPOTrainer:
         full_teacher_log_prob = full_episode_teacher_log_prob.clone()
         full_teacher_log_prob[step_skill_mask] = full_step_teacher_log_prob[step_skill_mask]
         if active_teacher_log_prob_chunks:
-            metrics["opid/teacher_log_prob_mean"] = float(
+            metrics["seed/teacher_log_prob_mean"] = float(
                 torch.cat(active_teacher_log_prob_chunks).mean().detach().cpu().item()
             )
 
@@ -2717,7 +2837,7 @@ class RayPPOTrainer:
 
         if episode_skill_indices:
             module_logger.info(
-                "OPID computed episode-skill teacher log-probs for %s steps (token_mean=%.6f, token_min=%.6f, token_max=%.6f).",
+                "SEED computed episode-skill teacher log-probs for %s steps (token_mean=%.6f, token_min=%.6f, token_max=%.6f).",
                 len(episode_skill_indices),
                 float(episode_teacher_lp.mean().detach().cpu().item()),
                 float(episode_teacher_lp.min().detach().cpu().item()),
@@ -2725,11 +2845,11 @@ class RayPPOTrainer:
             )
         elif not episode_skill_teacher_enabled:
             module_logger.info(
-                "OPID skipped episode-skill teacher log-probs because episode_skill_teacher_advantage_w is %.6f.",
+                "SEED skipped episode-skill teacher log-probs because episode_skill_teacher_advantage_w is %.6f.",
                 episode_skill_teacher_weight,
             )
         else:
-            module_logger.info("OPID skipped episode-skill teacher log-probs because all OPD-scored steps have step skills.")
+            module_logger.info("SEED skipped episode-skill teacher log-probs because all OPD-scored steps have step skills.")
         return batch
 
     def _save_checkpoint(self):
@@ -2893,16 +3013,16 @@ class RayPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with _timer("step", timing_raw):
-                    opid_teacher_future = None
-                    opid_teacher_snapshot = None
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.OPID:
-                        opid_teacher_schedule_enabled = self._is_opid_teacher_signal_enabled()
-                        opid_analysis_enabled = self._is_opid_analysis_enabled()
-                        opid_sdar_loss_enabled = self._is_opid_sdar_loss_enabled()
-                        opid_skill_gen_enabled = self._is_opid_skill_gen_enabled()
-                        opid_teacher_signal_enabled = opid_teacher_schedule_enabled and opid_analysis_enabled
-                        opid_teacher_adv_enabled = opid_teacher_signal_enabled and not opid_sdar_loss_enabled
-                        opid_policy_vllm_backend = self._is_opid_policy_vllm_backend()
+                    seed_teacher_future = None
+                    seed_teacher_snapshot = None
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.SEED:
+                        seed_teacher_schedule_enabled = self._is_seed_teacher_signal_enabled()
+                        seed_analysis_enabled = self._is_seed_analysis_enabled()
+                        seed_sdar_loss_enabled = self._is_seed_sdar_loss_enabled()
+                        seed_skill_gen_enabled = self._is_seed_skill_gen_enabled()
+                        seed_teacher_signal_enabled = seed_teacher_schedule_enabled and seed_analysis_enabled
+                        seed_teacher_adv_enabled = seed_teacher_signal_enabled and not seed_sdar_loss_enabled
+                        seed_policy_vllm_backend = self._is_seed_policy_vllm_backend()
                     # generate a batch
                     with _timer("gen", timing_raw):
                         # if not self.async_rollout_mode:
@@ -2913,6 +3033,7 @@ class RayPPOTrainer:
                         #     self.async_rollout_manager.sleep()
 
                         ################ agent-environment loop ###############
+                        gen_batch.meta_info["global_step"] = int(self.global_steps)
                         gen_batch_output = self.traj_collector.multi_turn_loop(
                                                                 gen_batch=gen_batch,
                                                                 actor_rollout_wg=self.actor_rollout_wg,
@@ -2942,40 +3063,40 @@ class RayPPOTrainer:
                     del batch
                     batch = gen_batch_output
 
-                    if self.config.algorithm.adv_estimator in [AdvantageEstimator.GiGPO, AdvantageEstimator.OPID]:
+                    if self.config.algorithm.adv_estimator in [AdvantageEstimator.GiGPO, AdvantageEstimator.SEED]:
                         step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
                             batch=batch,
                             gamma=self.config.algorithm.gamma
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.OPID:
-                        metrics["opid/teacher_enabled"] = 1.0 if opid_teacher_signal_enabled else 0.0
-                        metrics["opid/teacher_signal_enabled"] = 1.0 if opid_teacher_signal_enabled else 0.0
-                        metrics["opid/teacher_advantage_enabled"] = 1.0 if opid_teacher_adv_enabled else 0.0
-                        metrics["opid/sdar_loss_enabled"] = 1.0 if opid_sdar_loss_enabled else 0.0
-                        metrics["opid/skill_gen_enabled"] = 1.0 if opid_skill_gen_enabled else 0.0
-                        metrics["opid/teacher_disabled_by_schedule"] = 0.0 if opid_teacher_schedule_enabled else 1.0
-                        metrics["opid/teacher_disabled_by_analysis"] = (
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.SEED:
+                        metrics["seed/teacher_enabled"] = 1.0 if seed_teacher_signal_enabled else 0.0
+                        metrics["seed/teacher_signal_enabled"] = 1.0 if seed_teacher_signal_enabled else 0.0
+                        metrics["seed/teacher_advantage_enabled"] = 1.0 if seed_teacher_adv_enabled else 0.0
+                        metrics["seed/sdar_loss_enabled"] = 1.0 if seed_sdar_loss_enabled else 0.0
+                        metrics["seed/skill_gen_enabled"] = 1.0 if seed_skill_gen_enabled else 0.0
+                        metrics["seed/teacher_disabled_by_schedule"] = 0.0 if seed_teacher_schedule_enabled else 1.0
+                        metrics["seed/teacher_disabled_by_analysis"] = (
                             1.0
-                            if opid_teacher_schedule_enabled and not opid_analysis_enabled
+                            if seed_teacher_schedule_enabled and not seed_analysis_enabled
                             else 0.0
                         )
-                        metrics["opid/analysis_enabled"] = 1.0 if opid_analysis_enabled else 0.0
-                        metrics["opid/analysis_disabled"] = 0.0 if opid_analysis_enabled else 1.0
-                        if opid_analysis_enabled:
-                            opid_teacher_snapshot = self._build_opid_teacher_signal_snapshot(batch)
-                            if not opid_policy_vllm_backend:
-                                opid_teacher_future = self._lazy_init_opid_teacher_signal_executor().submit(
-                                    self._prepare_opid_teacher_signals_async_task,
-                                    opid_teacher_snapshot,
-                                    opid_teacher_signal_enabled,
+                        metrics["seed/analysis_enabled"] = 1.0 if seed_analysis_enabled else 0.0
+                        metrics["seed/analysis_disabled"] = 0.0 if seed_analysis_enabled else 1.0
+                        if seed_analysis_enabled:
+                            seed_teacher_snapshot = self._build_seed_teacher_signal_snapshot(batch)
+                            if not seed_policy_vllm_backend:
+                                seed_teacher_future = self._lazy_init_seed_teacher_signal_executor().submit(
+                                    self._prepare_seed_teacher_signals_async_task,
+                                    seed_teacher_snapshot,
+                                    seed_teacher_signal_enabled,
                                 )
-                                opid_teacher_snapshot = None
+                                seed_teacher_snapshot = None
                     
                     batch = adjust_batch(
                         self.config,
                         batch,
-                        track_source_indices=self.config.algorithm.adv_estimator == AdvantageEstimator.OPID,
+                        track_source_indices=self.config.algorithm.adv_estimator == AdvantageEstimator.SEED,
                     )
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
@@ -3050,44 +3171,49 @@ class RayPPOTrainer:
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.OPID:
-                        with _timer("opid_teacher", timing_raw):
-                            if opid_teacher_future is None and opid_teacher_snapshot is None:
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.SEED:
+                        with _timer("seed_teacher", timing_raw):
+                            if seed_teacher_future is None and seed_teacher_snapshot is None:
                                 module_logger.info(
-                                    "OPID analysis is disabled; using zero teacher signals for this batch."
+                                    "SEED analysis is disabled; using zero teacher signals for this batch."
                                 )
-                                batch = self._set_zero_opid_teacher_signals(batch=batch, metrics=metrics)
-                                metrics["opid/analysis_enabled"] = 0.0
-                                metrics["opid/analysis_disabled"] = 1.0
-                                metrics["opid/analysis_num_requests"] = 0.0
-                                metrics["opid/analysis_num_workers"] = 0.0
-                                metrics["opid/teacher_skipped_analysis_disabled"] = 1.0
+                                batch = self._set_zero_seed_teacher_signals(batch=batch, metrics=metrics)
+                                metrics["seed/analysis_enabled"] = 0.0
+                                metrics["seed/analysis_disabled"] = 1.0
+                                metrics["seed/analysis_num_requests"] = 0.0
+                                metrics["seed/analysis_num_workers"] = 0.0
+                                metrics["seed/teacher_skipped_analysis_disabled"] = 1.0
                                 batch.non_tensor_batch.pop("_batch_source_idx", None)
-                            elif opid_teacher_snapshot is not None:
-                                teacher_signal_batch, teacher_signal_metrics = self._prepare_opid_teacher_signals_async_task(
-                                    opid_teacher_snapshot,
-                                    opid_teacher_signal_enabled,
+                            elif seed_teacher_snapshot is not None:
+                                teacher_signal_batch, teacher_signal_metrics = self._prepare_seed_teacher_signals_async_task(
+                                    seed_teacher_snapshot,
+                                    seed_teacher_signal_enabled,
                                 )
                                 metrics.update(teacher_signal_metrics)
-                                batch = self._merge_async_opid_teacher_signals(
+                                batch = self._merge_async_seed_teacher_signals(
                                     batch=batch,
                                     teacher_signal_batch=teacher_signal_batch,
                                 )
                             else:
                                 try:
-                                    teacher_signal_batch, teacher_signal_metrics = opid_teacher_future.result()
+                                    teacher_signal_batch, teacher_signal_metrics = seed_teacher_future.result()
                                     metrics.update(teacher_signal_metrics)
-                                    batch = self._merge_async_opid_teacher_signals(
+                                    batch = self._merge_async_seed_teacher_signals(
                                         batch=batch,
                                         teacher_signal_batch=teacher_signal_batch,
                                     )
                                 except Exception as exc:
+                                    if (
+                                        str(OmegaConf.select(self.config, "algorithm.seed.analysis_prompt_version") or "")
+                                        == "sokoban_visual"
+                                    ):
+                                        raise
                                     module_logger.warning(
-                                        "Asynchronous OPID teacher signal preparation failed; falling back to zero teacher signals for this batch: %s",
+                                        "Asynchronous SEED teacher signal preparation failed; falling back to zero teacher signals for this batch: %s",
                                         exc,
                                     )
                                     batch.non_tensor_batch.pop("_batch_source_idx", None)
-                                    batch = self._set_zero_opid_teacher_signals(batch=batch, metrics=metrics)
+                                    batch = self._set_zero_seed_teacher_signals(batch=batch, metrics=metrics)
 
                     with _timer("adv", timing_raw):
                         # we combine with rule-based rm
@@ -3117,19 +3243,19 @@ class RayPPOTrainer:
                         # compute advantages, executed on the driver process
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
-                        if self.config.algorithm.adv_estimator == AdvantageEstimator.OPID:
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.SEED:
                             episode_skill_teacher_advantage_w = (
-                                float(OmegaConf.select(self.config, "algorithm.opid.episode_skill_teacher_advantage_w") or 0.0)
-                                if opid_teacher_adv_enabled
+                                float(OmegaConf.select(self.config, "algorithm.seed.episode_skill_teacher_advantage_w") or 0.0)
+                                if seed_teacher_adv_enabled
                                 else 0.0
                             )
                             step_skill_teacher_advantage_w = (
-                                float(OmegaConf.select(self.config, "algorithm.opid.step_skill_teacher_advantage_w") or 0.0)
-                                if opid_teacher_adv_enabled
+                                float(OmegaConf.select(self.config, "algorithm.seed.step_skill_teacher_advantage_w") or 0.0)
+                                if seed_teacher_adv_enabled
                                 else 0.0
                             )
-                            metrics["opid/episode_skill_teacher_advantage_w_current"] = float(episode_skill_teacher_advantage_w)
-                            metrics["opid/step_skill_teacher_advantage_w_current"] = float(step_skill_teacher_advantage_w)
+                            metrics["seed/episode_skill_teacher_advantage_w_current"] = float(episode_skill_teacher_advantage_w)
+                            metrics["seed/step_skill_teacher_advantage_w_current"] = float(step_skill_teacher_advantage_w)
                         else:
                             episode_skill_teacher_advantage_w = 0.0
                             step_skill_teacher_advantage_w = 0.0
@@ -3146,8 +3272,8 @@ class RayPPOTrainer:
                             pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
                             pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
                             step_advantage_w=(
-                                self.config.algorithm.opid.step_advantage_w
-                                if self.config.algorithm.adv_estimator == AdvantageEstimator.OPID
+                                self.config.algorithm.seed.step_advantage_w
+                                if self.config.algorithm.adv_estimator == AdvantageEstimator.SEED
                                 else self.config.algorithm.gigpo.step_advantage_w
                             ),
                             gigpo_mode=self.config.algorithm.gigpo.mode,
@@ -3155,14 +3281,14 @@ class RayPPOTrainer:
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
                             episode_skill_teacher_advantage_w=episode_skill_teacher_advantage_w,
                             step_skill_teacher_advantage_w=step_skill_teacher_advantage_w,
-                            opid_mode=self.config.algorithm.opid.mode,
-                            opid_enable_similarity=self.config.algorithm.opid.enable_similarity,
-                            opid_similarity_thresh=self.config.algorithm.opid.similarity_thresh,
-                            opid_normalize_teacher_adv=self.config.algorithm.opid.normalize_teacher_adv,
-                            opid_clip_teacher_adv=self.config.algorithm.opid.clip_teacher_adv,
+                            seed_mode=self.config.algorithm.seed.mode,
+                            seed_enable_similarity=self.config.algorithm.seed.enable_similarity,
+                            seed_similarity_thresh=self.config.algorithm.seed.similarity_thresh,
+                            seed_normalize_teacher_adv=self.config.algorithm.seed.normalize_teacher_adv,
+                            seed_clip_teacher_adv=self.config.algorithm.seed.clip_teacher_adv,
                         )
-                        if self.config.algorithm.adv_estimator == AdvantageEstimator.OPID:
-                            metrics.update(batch.meta_info.pop("opid_adv_metrics", {}))
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.SEED:
+                            metrics.update(batch.meta_info.pop("seed_adv_metrics", {}))
                         elif self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
                             metrics.update(batch.meta_info.pop("gigpo_adv_metrics", {}))
 
@@ -3200,6 +3326,9 @@ class RayPPOTrainer:
                                     "step_id",
                                     "uid",
                                     "traj_uid",
+                                    "obs_text",
+                                    "obs_text_base",
+                                    "is_action_valid",
                                 )
                                 if key in batch.non_tensor_batch
                             }
@@ -3239,7 +3368,7 @@ class RayPPOTrainer:
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
                 # TODO: make a canonical logger that supports various backend
-                self._dump_and_remove_opid_state_group_metrics(metrics)
+                self._dump_and_remove_seed_state_group_metrics(metrics)
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)

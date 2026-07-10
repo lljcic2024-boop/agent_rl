@@ -12,19 +12,21 @@ if [[ -f "$ENV_FILE" ]]; then
     source "$ENV_FILE"
     set +a
 fi
+# shellcheck source=../sft_teacher_naming.sh
+source "$PROJECT_ROOT/scripts/sft_teacher_naming.sh"
 
 MODELS_ROOT="${MODELS_ROOT:?Please set MODELS_ROOT in $ENV_FILE.}"
 
-DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/webshop_episode_skill_pipeline_v2_filtered_qwen25_3b}"
+DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/webshop_episode_skill_pipeline_v2_filtered_qwen25_3b_${SFT_SELF_DIR_SUFFIX}}"
 SFT_BASE_MODEL_PATH="${SFT_BASE_MODEL_PATH:-$MODELS_ROOT/Qwen2.5-3B-Instruct}"
-SFT_EXPORT_MODEL_DIR="${SFT_EXPORT_MODEL_DIR:-$MODELS_ROOT/Qwen2.5-3B-Instruct-webshop-episode-skill-sft}"
+SFT_EXPORT_MODEL_DIR="${SFT_EXPORT_MODEL_DIR:-$MODELS_ROOT/Qwen2.5-3B-Instruct-webshop-episode-skill-sft-${SFT_SELF_SUFFIX}}"
 SFT_TOTAL_EPOCHS="${SFT_TOTAL_EPOCHS:-3}"
 SFT_MAX_LENGTH="${SFT_MAX_LENGTH:-12288}"
 SFT_TRAIN_BATCH_SIZE="${SFT_TRAIN_BATCH_SIZE:-8}"
 SFT_MICRO_BATCH_SIZE_PER_GPU="${SFT_MICRO_BATCH_SIZE_PER_GPU:-1}"
 
-RL_SCRIPT="${RL_SCRIPT:-$PROJECT_ROOT/examples/policy_vllm_opid_trainer/run_webshop_episode_no_skill_loss_sft.sh}"
-RL_EXPERIMENT_NAME="${RL_EXPERIMENT_NAME:-opid-grpo_qwen2.5_3b_webshop_episode_no_skill_loss_sft_filtered_policy-vllm}"
+RL_SCRIPT="${RL_SCRIPT:-$PROJECT_ROOT/examples/seed/run_webshop_episode_no_skill_loss_sft.sh}"
+RL_EXPERIMENT_NAME="${RL_EXPERIMENT_NAME:-seed-grpo_qwen2.5_3b_webshop_episode_no_skill_loss_sft_filtered_policy-vllm}"
 RL_OUTPUT_DIR="${RL_OUTPUT_DIR:-$MODELS_ROOT/ckpt/$RL_EXPERIMENT_NAME}"
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"

@@ -54,9 +54,9 @@ actor_rollout_ref:
     clip_ratio_high: 0.2
     clip_ratio_c: 3.0 # lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729
     loss_agg_mode: "token-mean" # / "seq-mean-token-sum" / "seq-mean-token-mean"
-    sdar_loss_coef: 0.0 # SDAR-style gated auxiliary distillation loss; 0 disables it. For OPID, enabling this uses teacher/OPD signals as loss instead of teacher advantage.
+    sdar_loss_coef: 0.0 # SDAR-style gated auxiliary distillation loss; 0 disables it. For SEED, enabling this uses teacher/OPD signals as loss instead of teacher advantage.
     sdar_gate_beta: 5.0 # sigmoid sharpness for SDAR teacher-student gap gating
-    skill_gen_loss_coef: 0.0 # OPID skill-generation reward-weighted LM loss; 0 disables it.
+    skill_gen_loss_coef: 0.0 # SEED skill-generation reward-weighted LM loss; 0 disables it.
     skill_gen_micro_batch_size_per_gpu: null # per-GPU micro batch size for long policy-vllm skill generation samples
     skill_gen_micro_batch_size: 1 # deprecated alias for skill_gen_micro_batch_size_per_gpu
     sp_coef: 0.0 # EnvRL-style state prediction auxiliary LM loss; 0 disables it
@@ -267,16 +267,16 @@ algorithm:
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
-  opid:
-    step_advantage_w: 0.0 # OPID uses episode-level advantage only.
+  seed:
+    step_advantage_w: 0.0 # SEED uses episode-level advantage only.
     episode_skill_teacher_advantage_w: 1.0 # separate weight for episode-skill teacher advantage; ignored when actor.sdar_loss_coef > 0
     step_skill_teacher_advantage_w: 0.0 # separate weight for step-skill-only teacher advantage; ignored when actor.sdar_loss_coef > 0
     skill_mode: "episode_step" # "episode_step" generates episode_skill + step_skills; "step_only" uses step_skills only; "episode_only" applies episode_skill to all selected steps
     skill_teacher_mode: "step_priority" # "step_priority" uses episode skills only where no step skill is active; "additive" scores both prompts and adds both advantages
-    opd_start_after_steps: null # null -> enable OPID teacher/OPD signal from the first training step; otherwise enable after this many completed steps
-    opd_stop_after_steps: null # null -> keep OPID teacher/OPD signal enabled; otherwise disable after this many completed steps
+    opd_start_after_steps: null # null -> enable SEED teacher/OPD signal from the first training step; otherwise enable after this many completed steps
+    opd_stop_after_steps: null # null -> keep SEED teacher/OPD signal enabled; otherwise disable after this many completed steps
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
-    enable_analysis: True # False skips OPID analysis and teacher signal construction while keeping the OPID estimator
+    enable_analysis: True # False skips SEED analysis and teacher signal construction while keeping the SEED estimator
     enable_similarity: False
     similarity_thresh: 0.95
     selector: "llm"
@@ -284,7 +284,7 @@ algorithm:
     failed_only_after_steps: null # null -> use failed_only; otherwise analyze all episodes through this step, then failed episodes only
     failure_success_threshold: 1.0 # when episode_success is unavailable, episode_rewards >= this value counts as success
     analysis_backend: "openai"
-    analysis_prompt_version: "opid" # "opid" uses original OPID; "strategy_bank" is WebShop-style; "search_strategy_bank" is Search QA-style; "search_skill_only" omits episode_summary
+    analysis_prompt_version: "seed" # "seed" uses original SEED; "sokoban_visual" analyzes Sokoban image trajectories; "strategy_bank" is WebShop-style; "search_strategy_bank" is Search QA-style; "search_skill_only" omits episode_summary
     analysis_num_workers: 8
     analysis_context_length: 16384
     analysis_max_completion_tokens: 1024
@@ -301,11 +301,11 @@ algorithm:
       reward_clip: 2.0
       failed_reward_mode: zero # "zero" ignores failed rollout gain; "negate" rewards skills that reduce failed-action logprob
     save_analysis: True
-    analysis_dump_dir: null # null -> ${trainer.default_local_dir}/opid_analysis
+    analysis_dump_dir: null # null -> ${trainer.default_local_dir}/seed_analysis
     save_augmented_observations: True
-    augmented_observation_dump_dir: null # null -> ${trainer.default_local_dir}/opid_augmented_observations
+    augmented_observation_dump_dir: null # null -> ${trainer.default_local_dir}/seed_augmented_observations
     save_state_group_metrics: False
-    state_group_dump_dir: null # null -> ${trainer.default_local_dir}/opid_state_group
+    state_group_dump_dir: null # null -> ${trainer.default_local_dir}/seed_state_group
     normalize_teacher_adv: False
     clip_teacher_adv: null
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
@@ -367,6 +367,8 @@ env:
     num_boxes: 1
     search_depth: 30
     mode: tiny_rgb_array
+    save_images: False
+    image_save_dir: null # null -> ${trainer.default_local_dir}/sokoban_images
   webshop:
     use_small: True
     human_goals: False

@@ -12,6 +12,8 @@ if [[ -f "$ENV_FILE" ]]; then
     source "$ENV_FILE"
     set +a
 fi
+# shellcheck source=../sft_teacher_naming.sh
+source "$PROJECT_ROOT/scripts/sft_teacher_naming.sh"
 
 CONDA_ENV="${CONDA_ENV:-skillrl}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -22,10 +24,10 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 MICRO_BATCH_SIZE_PER_GPU="${MICRO_BATCH_SIZE_PER_GPU:-1}"
 ULYSSES_SEQUENCE_PARALLEL_SIZE="${ULYSSES_SEQUENCE_PARALLEL_SIZE:-1}"
 EXPORT_MODEL_AFTER_TRAIN="${EXPORT_MODEL_AFTER_TRAIN:-true}"
-EXPORT_MODEL_NAME="${EXPORT_MODEL_NAME:-Qwen3-1.7B-alfworld-episode-skill-sft}"
+EXPORT_MODEL_NAME="${EXPORT_MODEL_NAME:-Qwen3-1.7B-alfworld-episode-skill-sft-${SFT_SELF_SUFFIX}}"
 TRAINER_LOGGER="${TRAINER_LOGGER:-['console','wandb']}"
 
-DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/alfworld_episode_skill_pipeline_v2_qwen3_1_7b}"
+DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/alfworld_episode_skill_pipeline_v2_qwen3_1_7b_${SFT_SELF_DIR_SUFFIX}}"
 TRAIN_DATA="${TRAIN_DATA:-$DATA_DIR/sft_episode_skill_train.parquet}"
 VAL_DATA="${VAL_DATA:-$DATA_DIR/sft_episode_skill_val.parquet}"
 

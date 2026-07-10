@@ -38,10 +38,11 @@ from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, PreTrainedModel
 
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.dataset import SFTDataset
+from verl.utils.dataset.sft_dataset import VisionSFTDataset
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.distributed import initialize_global_process_group
@@ -85,12 +86,13 @@ def extract_step(path):
 
 
 class FSDPSFTTrainer:
-    def __init__(self, config, device_mesh: DeviceMesh, ulysses_device_mesh: DeviceMesh, tokenizer, train_dataset: Dataset, val_dataset: Dataset):
+    def __init__(self, config, device_mesh: DeviceMesh, ulysses_device_mesh: DeviceMesh, tokenizer, train_dataset: Dataset, val_dataset: Dataset, processor=None):
         self.config = config
         self.device_mesh = device_mesh
         self.ulysses_device_mesh = ulysses_device_mesh
         self.sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self.tokenizer = tokenizer
+        self.processor = processor
         if self.config.data.chat_template is not None:
             raise ValueError("Apply Chat template from config is not supported yet.")
 
@@ -190,7 +192,8 @@ class FSDPSFTTrainer:
         init_context = get_init_weight_context_manager(use_meta_tensor=not config.tie_word_embeddings, mesh=self.device_mesh)
 
         with init_context():
-            self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+            model_cls = AutoModelForImageTextToText if self.processor is not None else AutoModelForCausalLM
+            self.model: PreTrainedModel = model_cls.from_pretrained(
                 local_model_path,
                 config=config,
                 torch_dtype=torch.float32,
@@ -303,6 +306,9 @@ class FSDPSFTTrainer:
     def _compute_loss_and_backward(self, batch, do_backward=True):
         """Compute loss with optional sequence parallelism and remove padding features"""
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
+        is_multimodal_batch = "pixel_values" in batch.keys()
+        if is_multimodal_batch and use_sp:
+            raise NotImplementedError("Vision SFT does not support ulysses sequence parallelism yet.")
 
         # Move inputs to GPU and prepare loss mask
         input_ids = batch["input_ids"].to(self.device_name)
@@ -317,7 +323,31 @@ class FSDPSFTTrainer:
             if not use_sp:
                 # Standard forward pass without sequence parallel
                 labels = input_ids[:, 1:].contiguous()
-                output = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False)
+                model_inputs = {}
+                if is_multimodal_batch:
+                    if position_ids.dim() == 3:
+                        position_ids = position_ids.transpose(0, 1)
+                    for key in (
+                        "pixel_values",
+                        "pixel_values_videos",
+                        "image_grid_thw",
+                        "video_grid_thw",
+                    ):
+                        if key not in batch.keys():
+                            continue
+                        value = batch[key].to(self.device_name)
+                        if key.startswith("pixel_values") and value.dim() >= 3:
+                            value = value.reshape(-1, *value.shape[2:])
+                        elif key.endswith("_grid_thw") and value.dim() >= 3:
+                            value = value.reshape(-1, value.shape[-1])
+                        model_inputs[key] = value
+                output = self.fsdp_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    **model_inputs,
+                )
                 logits = output.logits
 
                 shift_logits = logits[..., :-1, :].contiguous()
@@ -465,6 +495,8 @@ class FSDPSFTTrainer:
                 os.makedirs(path, exist_ok=True)
                 self.model.save_pretrained(path, state_dict=state_dict)
                 self.tokenizer.save_pretrained(path)
+                if self.processor is not None:
+                    self.processor.save_pretrained(path)
         elif fsdp_strategy == "fsdp2":
             # FSDP2 checkpoint saving
             from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
@@ -479,6 +511,8 @@ class FSDPSFTTrainer:
                 self.model.save_pretrained(path, state_dict=state_dict)
                 self.model_config.save_pretrained(path)
                 self.tokenizer.save_pretrained(path)
+                if self.processor is not None:
+                    self.processor.save_pretrained(path)
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
 
@@ -571,19 +605,30 @@ def main(config):
     dp_size = world_size // config.ulysses_sequence_parallel_size
     ulysses_device_mesh = init_device_mesh(device_type=device_name, mesh_shape=(dp_size, config.ulysses_sequence_parallel_size), mesh_dim_names=("dp", "sp"))
     # build tokenizer and datasets first
-    from verl.utils import hf_tokenizer
+    from verl.utils import hf_processor, hf_tokenizer
 
     local_model_path = copy_to_local(src=config.model.partial_pretrain, verbose=True)
     tokenizer = hf_tokenizer(local_model_path, trust_remote_code=config.model.trust_remote_code)
-    train_dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer)
-    val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
+    processor = None
+    if config.data.get("image_key", None):
+        processor = hf_processor(local_model_path, trust_remote_code=config.model.trust_remote_code)
+    train_dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer, processor)
+    val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer, processor)
 
-    trainer = FSDPSFTTrainer(config=config, device_mesh=device_mesh, ulysses_device_mesh=ulysses_device_mesh, tokenizer=tokenizer, train_dataset=train_dataset, val_dataset=val_dataset)
+    trainer = FSDPSFTTrainer(
+        config=config,
+        device_mesh=device_mesh,
+        ulysses_device_mesh=ulysses_device_mesh,
+        tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        processor=processor,
+    )
 
     trainer.fit()
 
 
-def create_sft_dataset(data_paths, data_config, tokenizer):
+def create_sft_dataset(data_paths, data_config, tokenizer, processor=None):
     """Create a dataset."""
     # build dataset
     # First check if a custom dataset class is specified
@@ -592,6 +637,8 @@ def create_sft_dataset(data_paths, data_config, tokenizer):
 
         dataset_cls = load_extern_type(data_config.custom_cls.path, data_config.custom_cls.name)
     # Then check if multi-turn dataset should be used
+    elif processor is not None and data_config.get("image_key", None):
+        dataset_cls = VisionSFTDataset
     elif data_config.get("multiturn", {}).get("enable", False):
         dataset_cls = MultiTurnSFTDataset
     # Default to single-turn dataset
@@ -599,7 +646,10 @@ def create_sft_dataset(data_paths, data_config, tokenizer):
         dataset_cls = SFTDataset
 
     # Create datasets based on the selected class
-    dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config)
+    if dataset_cls is VisionSFTDataset:
+        dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, processor=processor, config=data_config)
+    else:
+        dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config)
     return dataset
 
 

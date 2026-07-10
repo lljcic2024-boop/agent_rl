@@ -12,6 +12,8 @@ if [[ -f "$ENV_FILE" ]]; then
     source "$ENV_FILE"
     set +a
 fi
+# shellcheck source=../sft_teacher_naming.sh
+source "$PROJECT_ROOT/scripts/sft_teacher_naming.sh"
 
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-3}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
@@ -22,10 +24,10 @@ if [[ -z "${MODELS_ROOT:-}" ]]; then
 fi
 
 export RUN_ID
-export DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/webshop_episode_skill_pipeline_v2_qwen25_3b}"
+export DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/webshop_episode_skill_pipeline_v2_qwen25_3b_${SFT_SELF_DIR_SUFFIX}}"
 export MODEL_PATH="${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-7B-Instruct}"
 export MAX_LENGTH="${MAX_LENGTH:-12288}"
-export EXPORT_MODEL_NAME="${EXPORT_MODEL_NAME:-Qwen2.5-7B-Instruct-webshop-episode-skill-sft}"
+export EXPORT_MODEL_NAME="${EXPORT_MODEL_NAME:-Qwen2.5-7B-Instruct-webshop-episode-skill-sft-${SFT_SELF_SUFFIX}}"
 export PROJECT_NAME="${PROJECT_NAME:-webshop-episode-skill-sft}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen25-7b-webshop-episode-skill-sft-v2-ep${TOTAL_EPOCHS}}"
 export OUTPUT_DIR="${OUTPUT_DIR:-$MODELS_ROOT/outputs/sft/webshop_episode_skill_analyzer_v2_qwen25_7b_ep${TOTAL_EPOCHS}_${RUN_ID}}"
