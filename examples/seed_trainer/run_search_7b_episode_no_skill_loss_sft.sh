@@ -40,17 +40,7 @@ export SEED_SKILL_GEN_LOSS_ENABLE="${SEED_SKILL_GEN_LOSS_ENABLE:-False}"
 export SEED_SKILL_GEN_LOSS_COEF="${SEED_SKILL_GEN_LOSS_COEF:-0.0}"
 export SEED_ANALYSIS_BACKEND="${SEED_ANALYSIS_BACKEND:-policy_vllm}"
 if [[ -z "${SEED_ANALYSIS_PROMPT_VERSION:-}" ]]; then
-    if [[ "$(basename "$HF_MODEL_PATH")" == *"skill_only"* ]]; then
-        export SEED_ANALYSIS_PROMPT_VERSION="search_skill_only"
-    elif [[ "$(basename "$HF_MODEL_PATH")" == *"strategy_bank"* ]]; then
-        export SEED_ANALYSIS_PROMPT_VERSION="search_strategy_bank"
-    else
-        export SEED_ANALYSIS_PROMPT_VERSION="seed"
-    fi
-elif [[ "$SEED_ANALYSIS_PROMPT_VERSION" == "strategy_bank" ]]; then
-    export SEED_ANALYSIS_PROMPT_VERSION="search_strategy_bank"
-elif [[ "$SEED_ANALYSIS_PROMPT_VERSION" == "skill_only" ]]; then
-    export SEED_ANALYSIS_PROMPT_VERSION="search_skill_only"
+    export SEED_ANALYSIS_PROMPT_VERSION="seed"
 fi
 
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-seed_qwen2.5_7b_search_sft}"

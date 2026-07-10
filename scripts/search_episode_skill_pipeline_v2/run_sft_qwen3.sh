@@ -28,11 +28,7 @@ TRAINER_LOGGER="${TRAINER_LOGGER:-['console','wandb']}"
 QWEN3_ENABLE_THINKING="${QWEN3_ENABLE_THINKING:-False}"
 
 SKILL_PROMPT_VERSION="${SKILL_PROMPT_VERSION:-seed}"
-if [[ "$SKILL_PROMPT_VERSION" == "strategy_bank" ]]; then
-    SKILL_PROMPT_VERSION="search_strategy_bank"
-elif [[ "$SKILL_PROMPT_VERSION" == "skill_only" ]]; then
-    SKILL_PROMPT_VERSION="search_skill_only"
-elif [[ "$SKILL_PROMPT_VERSION" == "summary_skill" ]] \
+if [[ "$SKILL_PROMPT_VERSION" == "summary_skill" ]] \
     || [[ "$SKILL_PROMPT_VERSION" == "glm" ]] \
     || [[ "$SKILL_PROMPT_VERSION" == "search_glm" ]]; then
     SKILL_PROMPT_VERSION="search_summary_skill_glm"
@@ -43,17 +39,7 @@ elif [[ "$SKILL_PROMPT_VERSION" == "self" ]] \
     SKILL_PROMPT_VERSION="search_summary_skill_glm_self"
 fi
 
-if [[ "$SKILL_PROMPT_VERSION" == "search_strategy_bank" ]]; then
-    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_strategy_bank_qwen25_3b_${SFT_SELF_DIR_SUFFIX}"
-    DEFAULT_EXPORT_MODEL_NAME="Qwen3-1.7B-search-episode-skill-sft-v2-strategy_bank-${SFT_SELF_SUFFIX}"
-    DEFAULT_EXPERIMENT_NAME="qwen3-1.7b-search-episode-skill-sft-v2-strategy_bank-ep${TOTAL_EPOCHS}"
-    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_strategy_bank_qwen3_1_7b_ep${TOTAL_EPOCHS}"
-elif [[ "$SKILL_PROMPT_VERSION" == "search_skill_only" ]]; then
-    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_skill_only_qwen25_3b_${SFT_SELF_DIR_SUFFIX}"
-    DEFAULT_EXPORT_MODEL_NAME="Qwen3-1.7B-search-episode-skill-sft-v2-skill_only-${SFT_SELF_SUFFIX}"
-    DEFAULT_EXPERIMENT_NAME="qwen3-1.7b-search-episode-skill-sft-v2-skill_only-ep${TOTAL_EPOCHS}"
-    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_skill_only_qwen3_1_7b_ep${TOTAL_EPOCHS}"
-elif [[ "$SKILL_PROMPT_VERSION" == "search_summary_skill_glm" ]]; then
+if [[ "$SKILL_PROMPT_VERSION" == "search_summary_skill_glm" ]]; then
     DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_3b_glm"
     DEFAULT_EXPORT_MODEL_NAME="Qwen3-1.7B-search-episode-skill-sft-glm"
     DEFAULT_EXPERIMENT_NAME="qwen3-1.7b-search-episode-skill-sft-glm-ep${TOTAL_EPOCHS}"

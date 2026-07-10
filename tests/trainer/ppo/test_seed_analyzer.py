@@ -30,6 +30,26 @@ def _sample_steps():
     ]
 
 
+def test_strategy_bank_prompt_version_is_not_supported():
+    with pytest.raises(ValueError, match="Unsupported SEED analysis_prompt_version"):
+        SEEDEpisodeAnalyzer(analysis_prompt_version="strategy_bank")
+
+
+def test_search_skill_only_prompt_version_is_not_supported():
+    with pytest.raises(ValueError, match="Unsupported SEED analysis_prompt_version"):
+        SEEDEpisodeAnalyzer(analysis_prompt_version="search_skill_only")
+
+
+def test_search_strategy_bank_prompt_version_is_not_supported():
+    with pytest.raises(ValueError, match="Unsupported SEED analysis_prompt_version"):
+        SEEDEpisodeAnalyzer(analysis_prompt_version="search_strategy_bank")
+
+
+def test_sokoban_visual_prompt_version_is_not_supported():
+    with pytest.raises(ValueError, match="Unsupported SEED analysis_prompt_version"):
+        SEEDEpisodeAnalyzer(analysis_prompt_version="sokoban_visual")
+
+
 def test_seed_openai_prompt_requests_episode_skill_and_step_skills():
     analyzer = SEEDEpisodeAnalyzer()
 
@@ -100,6 +120,45 @@ def test_seed_episode_only_no_summary_prompt_requests_only_episode_skill():
     assert "episode_summary" not in user_prompt
     assert '"step_skills": {' not in user_prompt
     assert "Return only this top-level field: episode_skill" in user_prompt
+
+
+def test_seed_visual_episode_only_prompt_omits_step_skills():
+    analyzer = SEEDEpisodeAnalyzer(
+        skill_mode="episode_only",
+        analysis_prompt_version="seed_visual",
+    )
+
+    prompt = analyzer._build_episode_analysis_prompt(
+        steps=[
+            {
+                "step_index": 0,
+                "has_observation_image": True,
+                "response": "<think>route around the box</think><action>right</action>",
+                "action_valid": True,
+                "step_reward": 0.0,
+            },
+            {
+                "step_index": 1,
+                "has_observation_image": True,
+                "response": "<think>push toward target</think><action>up</action>",
+                "action_valid": True,
+                "step_reward": 1.0,
+            },
+        ],
+        candidate_step_indices=[0, 1],
+        episode_success=1.0,
+    )
+    user_prompt = prompt["messages"][0]["content"]
+
+    assert "episode_skill" in user_prompt
+    assert "episode_summary" in user_prompt
+    assert "step_skills" not in user_prompt
+    assert "Candidate step indices" not in user_prompt
+    assert "Return format:" in user_prompt
+    assert "successful trajectory into workflow" in user_prompt
+    assert "Observation: <image>" in user_prompt
+    assert "Board observation:" not in user_prompt
+    assert "visual Sokoban" not in user_prompt
 
 
 def test_seed_episode_step_no_summary_prompt_requests_skill_fields_without_summary():

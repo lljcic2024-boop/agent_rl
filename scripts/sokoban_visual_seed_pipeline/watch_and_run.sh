@@ -15,10 +15,18 @@ fi
 
 MODELS_ROOT="${MODELS_ROOT:?Please set MODELS_ROOT in $ENV_FILE or the environment.}"
 
+# shellcheck source=../sft_teacher_naming.sh
+source "$PROJECT_ROOT/scripts/sft_teacher_naming.sh"
+SOKOBAN_SELF_DIR_SUFFIX="${SOKOBAN_SELF_DIR_SUFFIX:-$SFT_SELF_DIR_SUFFIX}"
+if [[ "$SOKOBAN_SELF_DIR_SUFFIX" == "teacher_self" ]]; then
+    SOKOBAN_SELF_DIR_SUFFIX="self"
+fi
+
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-PIPELINE_ROOT="${PIPELINE_ROOT:-$PROJECT_ROOT/outputs/sokoban_visual_seed_pipeline/$RUN_ID}"
+PIPELINE_BASE_NAME="${PIPELINE_BASE_NAME:-sokoban_visual_seed_pipeline_qwen25_vl_3b_${SOKOBAN_SELF_DIR_SUFFIX}}"
+PIPELINE_ROOT="${PIPELINE_ROOT:-$PROJECT_ROOT/outputs/$PIPELINE_BASE_NAME}"
 LOG_DIR="${LOG_DIR:-$PIPELINE_ROOT/logs}"
-DATA_DIR="${DATA_DIR:-$PIPELINE_ROOT/sft_data}"
+DATA_DIR="${DATA_DIR:-$PIPELINE_ROOT}"
 mkdir -p "$PIPELINE_ROOT" "$LOG_DIR" "$DATA_DIR"
 
 PIPELINE_CONDA_ENV="${PIPELINE_CONDA_ENV:-${CONDA_ENV:-skillrl}}"
@@ -115,10 +123,11 @@ BASE_MODEL_PATH="${BASE_MODEL_PATH:-$MODELS_ROOT/Qwen2.5-VL-3B-Instruct}"
 BASELINE_ROLLOUT_DIR="${BASELINE_ROLLOUT_DIR:-}"
 BASELINE_IMAGE_ROOT="${BASELINE_IMAGE_ROOT:-}"
 BASELINE_EXPERIMENT_NAME="${BASELINE_EXPERIMENT_NAME:-seed_sokoban_visual_baseline_rollouts_$RUN_ID}"
-BASELINE_LOCAL_DIR="${BASELINE_LOCAL_DIR:-$MODELS_ROOT/ckpt/$BASELINE_EXPERIMENT_NAME}"
+BASELINE_LOCAL_DIR="${BASELINE_LOCAL_DIR:-$PIPELINE_ROOT/baseline_rollout_raw}"
+BASELINE_ROLLOUTS_JSONL="${BASELINE_ROLLOUTS_JSONL:-$PIPELINE_ROOT/baseline_rollouts.jsonl}"
 
 if [[ -z "$BASELINE_ROLLOUT_DIR" ]]; then
-    log "Stage 1/4: running short visual Sokoban baseline rollouts."
+    log "Stage 1/5: running short visual Sokoban baseline rollouts."
     BASELINE_LOG="${BASELINE_LOG:-$LOG_DIR/baseline_rollouts.log}"
     BASELINE_TRAIN_DATA_SIZE="${BASELINE_TRAIN_DATA_SIZE:-32}"
     BASELINE_VAL_DATA_SIZE="${BASELINE_VAL_DATA_SIZE:-128}"
@@ -127,6 +136,7 @@ if [[ -z "$BASELINE_ROLLOUT_DIR" ]]; then
     BASELINE_TOTAL_TRAINING_STEPS="${BASELINE_TOTAL_TRAINING_STEPS:-1}"
     BASELINE_ENGINE="${BASELINE_ENGINE:-vllm}"
     BASELINE_PROJECT_NAME="${BASELINE_PROJECT_NAME:-agentic_sokoban}"
+    BASELINE_IMAGE_ROOT="${BASELINE_IMAGE_ROOT:-$PIPELINE_ROOT/sokoban_images}"
 
     env \
         MODELS_ROOT="$MODELS_ROOT" \
@@ -139,6 +149,7 @@ if [[ -z "$BASELINE_ROLLOUT_DIR" ]]; then
         VAL_DATA_SIZE="$BASELINE_VAL_DATA_SIZE" \
         GROUP_SIZE="$BASELINE_GROUP_SIZE" \
         SOKOBAN_SAVE_IMAGES=True \
+        SOKOBAN_IMAGE_SAVE_DIR="$BASELINE_IMAGE_ROOT" \
         VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-TORCH_SDPA}" \
         bash "$PROJECT_ROOT/examples/grpo_trainer/run_sokoban.sh" \
             trainer.total_epochs="$BASELINE_TOTAL_EPOCHS" \
@@ -153,7 +164,9 @@ if [[ -z "$BASELINE_ROLLOUT_DIR" ]]; then
 fi
 
 if [[ -z "$BASELINE_IMAGE_ROOT" ]]; then
-    if [[ -d "$BASELINE_ROLLOUT_DIR/sokoban_images" ]]; then
+    if [[ -d "$PIPELINE_ROOT/sokoban_images" ]]; then
+        BASELINE_IMAGE_ROOT="$PIPELINE_ROOT/sokoban_images"
+    elif [[ -d "$BASELINE_ROLLOUT_DIR/sokoban_images" ]]; then
         BASELINE_IMAGE_ROOT="$BASELINE_ROLLOUT_DIR/sokoban_images"
     else
         BASELINE_IMAGE_ROOT="$BASELINE_ROLLOUT_DIR"
@@ -165,20 +178,86 @@ if ! compgen -G "$BASELINE_ROLLOUT_DIR/*.jsonl" >/dev/null; then
     exit 1
 fi
 
-log "Stage 2/4: building visual Sokoban SFT parquet data."
-BUILD_SFT_LOG="${BUILD_SFT_LOG:-$LOG_DIR/build_sft.log}"
-python3 "$PROJECT_ROOT/scripts/sokoban_visual_seed_pipeline/build_sft_from_rollouts.py" \
+log "Exporting visual Sokoban baseline rollouts to $BASELINE_ROLLOUTS_JSONL."
+python3 "$PROJECT_ROOT/scripts/sokoban_visual_seed_pipeline/export_baseline_rollouts.py" \
     --rollout-dir "$BASELINE_ROLLOUT_DIR" \
     --image-root "$BASELINE_IMAGE_ROOT" \
-    --output-dir "$DATA_DIR" \
-    --val-ratio "${SFT_VAL_RATIO:-0.1}" \
-    --seed "${SFT_DATA_SEED:-2026}" \
-    --max-records "${SFT_MAX_RECORDS:-0}" \
+    --output-path "$BASELINE_ROLLOUTS_JSONL" \
+    2>&1 | tee "$LOG_DIR/export_baseline_rollouts.log"
+
+log "Stage 2/5: generating visual Sokoban episode skills with OpenAI."
+SKILL_GEN_LOG="${SKILL_GEN_LOG:-$LOG_DIR/generate_candidate_skills.log}"
+CANDIDATE_SKILLS_JSONL="${CANDIDATE_SKILLS_JSONL:-$PIPELINE_ROOT/candidate_skills.jsonl}"
+SOKOBAN_SKILL_GEN_WORKERS="${SOKOBAN_SKILL_GEN_WORKERS:-4}"
+SOKOBAN_SKILL_MAX_COMPLETION_TOKENS="${SOKOBAN_SKILL_MAX_COMPLETION_TOKENS:-2048}"
+SOKOBAN_SKILL_PARSE_ATTEMPTS="${SOKOBAN_SKILL_PARSE_ATTEMPTS:-2}"
+SOKOBAN_INCLUDE_EPISODE_SUMMARY="${SOKOBAN_INCLUDE_EPISODE_SUMMARY:-true}"
+SOKOBAN_SKILL_RESUME="${SOKOBAN_SKILL_RESUME:-true}"
+SOKOBAN_REGENERATE_CANDIDATES="${SOKOBAN_REGENERATE_CANDIDATES:-false}"
+SOKOBAN_MAX_CANDIDATES="${SOKOBAN_MAX_CANDIDATES:-null}"
+SOKOBAN_SKILL_MODEL="${SOKOBAN_SKILL_MODEL:-${SKILL_MODEL:-${OPENAI_MODEL:-}}}"
+SOKOBAN_SKILL_BASE_URL="${SOKOBAN_SKILL_BASE_URL:-${OPENAI_BASE_URL:-}}"
+SOKOBAN_SKILL_API_KEY="${SOKOBAN_SKILL_API_KEY:-${OPENAI_API_KEY:-}}"
+
+skill_gen_args=(
+    --baseline-rollouts "$BASELINE_ROLLOUTS_JSONL"
+    --output-dir "$PIPELINE_ROOT"
+    --skill-gen-workers "$SOKOBAN_SKILL_GEN_WORKERS"
+    --skill-max-completion-tokens "$SOKOBAN_SKILL_MAX_COMPLETION_TOKENS"
+    --skill-parse-attempts "$SOKOBAN_SKILL_PARSE_ATTEMPTS"
+)
+if [[ "$SOKOBAN_INCLUDE_EPISODE_SUMMARY" != "true" ]]; then
+    skill_gen_args+=(--no-include-episode-summary)
+fi
+if [[ "$SOKOBAN_SKILL_RESUME" == "true" ]]; then
+    skill_gen_args+=(--resume)
+fi
+if [[ "$SOKOBAN_REGENERATE_CANDIDATES" == "true" ]]; then
+    skill_gen_args+=(--regenerate-candidates)
+fi
+if [[ "$SOKOBAN_MAX_CANDIDATES" != "null" ]]; then
+    skill_gen_args+=(--max-candidates "$SOKOBAN_MAX_CANDIDATES")
+fi
+if [[ -n "$SOKOBAN_SKILL_MODEL" ]]; then
+    skill_gen_args+=(--skill-model "$SOKOBAN_SKILL_MODEL")
+fi
+if [[ -n "$SOKOBAN_SKILL_BASE_URL" ]]; then
+    skill_gen_args+=(--skill-base-url "$SOKOBAN_SKILL_BASE_URL")
+fi
+if [[ -n "$SOKOBAN_SKILL_API_KEY" ]]; then
+    skill_gen_args+=(--skill-api-key "$SOKOBAN_SKILL_API_KEY")
+fi
+
+python3 "$PROJECT_ROOT/scripts/sokoban_visual_seed_pipeline/generate_candidate_skills.py" \
+    "${skill_gen_args[@]}" \
+    2>&1 | tee "$SKILL_GEN_LOG"
+
+if [[ ! -f "$CANDIDATE_SKILLS_JSONL" ]]; then
+    log "Candidate skills JSONL not found: $CANDIDATE_SKILLS_JSONL"
+    exit 1
+fi
+
+log "Stage 3/5: building visual Sokoban skill SFT parquet data."
+BUILD_SFT_LOG="${BUILD_SFT_LOG:-$LOG_DIR/build_sft.log}"
+build_sft_args=(
+    --rollout-dir "$(dirname "$BASELINE_ROLLOUTS_JSONL")"
+    --image-root "$BASELINE_IMAGE_ROOT"
+    --output-dir "$DATA_DIR"
+    --candidate-skills "$CANDIDATE_SKILLS_JSONL"
+    --val-ratio "${SFT_VAL_RATIO:-0.1}"
+    --seed "${SFT_DATA_SEED:-2026}"
+    --max-records "${SFT_MAX_RECORDS:-0}"
+)
+if [[ "$SOKOBAN_INCLUDE_EPISODE_SUMMARY" != "true" ]]; then
+    build_sft_args+=(--no-include-episode-summary)
+fi
+python3 "$PROJECT_ROOT/scripts/sokoban_visual_seed_pipeline/build_sft_from_rollouts.py" \
+    "${build_sft_args[@]}" \
     2>&1 | tee "$BUILD_SFT_LOG"
 
 SFT_EXPORT_MODEL_DIR="${SFT_EXPORT_MODEL_DIR:-$MODELS_ROOT/Qwen2.5-VL-3B-Instruct-sokoban-visual-sft}"
 
-log "Stage 3/4: running visual SFT."
+log "Stage 4/5: running visual SFT."
 SFT_LOG="${SFT_LOG:-$LOG_DIR/sft.log}"
 env \
     MODELS_ROOT="$MODELS_ROOT" \
@@ -195,7 +274,7 @@ if [[ ! -d "$SFT_EXPORT_MODEL_DIR" ]]; then
 fi
 stop_ray_if_requested
 
-log "Stage 4/4: running visual Sokoban seed RL from the SFT model."
+log "Stage 5/5: running visual Sokoban seed RL from the SFT model."
 SEED_RL_EXPERIMENT_NAME="${SEED_RL_EXPERIMENT_NAME:-seed_qwen2.5_vl_3b_sokoban_visual_sft_$RUN_ID}"
 SEED_RL_DEFAULT_LOCAL_DIR="${SEED_RL_DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$SEED_RL_EXPERIMENT_NAME}"
 SEED_RL_LOG="${SEED_RL_LOG:-$LOG_DIR/seed_rl.log}"
@@ -225,7 +304,9 @@ SUMMARY_FILE="$PIPELINE_ROOT/pipeline_summary.env"
     printf 'RUN_ID=%s\n' "$RUN_ID"
     printf 'PIPELINE_ROOT=%s\n' "$PIPELINE_ROOT"
     printf 'BASELINE_ROLLOUT_DIR=%s\n' "$BASELINE_ROLLOUT_DIR"
+    printf 'BASELINE_ROLLOUTS_JSONL=%s\n' "$BASELINE_ROLLOUTS_JSONL"
     printf 'BASELINE_IMAGE_ROOT=%s\n' "$BASELINE_IMAGE_ROOT"
+    printf 'CANDIDATE_SKILLS_JSONL=%s\n' "$CANDIDATE_SKILLS_JSONL"
     printf 'DATA_DIR=%s\n' "$DATA_DIR"
     printf 'SFT_EXPORT_MODEL_DIR=%s\n' "$SFT_EXPORT_MODEL_DIR"
     printf 'SEED_RL_DEFAULT_LOCAL_DIR=%s\n' "$SEED_RL_DEFAULT_LOCAL_DIR"

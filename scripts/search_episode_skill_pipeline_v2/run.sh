@@ -18,11 +18,6 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 SKILL_PROMPT_VERSION="${SKILL_PROMPT_VERSION:-seed}"
-if [[ "$SKILL_PROMPT_VERSION" == "strategy_bank" ]]; then
-    SKILL_PROMPT_VERSION="search_strategy_bank"
-elif [[ "$SKILL_PROMPT_VERSION" == "skill_only" ]]; then
-    SKILL_PROMPT_VERSION="search_skill_only"
-fi
 
 : "${MODELS_ROOT:?Please set MODELS_ROOT in $ENV_FILE.}"
 DATA_ROOT="${DATA_ROOT:-$HOME/data}"
@@ -55,13 +50,7 @@ fi
 # shellcheck source=../sft_teacher_naming.sh
 source "$PROJECT_ROOT/scripts/sft_teacher_naming.sh"
 if [[ -z "${OUTPUT_DIR:-}" ]]; then
-    if [[ "$SKILL_PROMPT_VERSION" == "search_strategy_bank" ]]; then
-        OUTPUT_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_strategy_bank_qwen25_3b_${SFT_SELF_DIR_SUFFIX}"
-    elif [[ "$SKILL_PROMPT_VERSION" == "search_skill_only" ]]; then
-        OUTPUT_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_skill_only_qwen25_3b_${SFT_SELF_DIR_SUFFIX}"
-    else
-        OUTPUT_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_3b_${SFT_SELF_DIR_SUFFIX}"
-    fi
+    OUTPUT_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_3b_${SFT_SELF_DIR_SUFFIX}"
 fi
 SKILL_TEMPERATURE="${SKILL_TEMPERATURE:-0.0}"
 SKILL_MAX_COMPLETION_TOKENS="${SKILL_MAX_COMPLETION_TOKENS:-1024}"

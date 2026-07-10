@@ -26,28 +26,14 @@ ULYSSES_SEQUENCE_PARALLEL_SIZE="${ULYSSES_SEQUENCE_PARALLEL_SIZE:-1}"
 EXPORT_MODEL_AFTER_TRAIN="${EXPORT_MODEL_AFTER_TRAIN:-true}"
 TRAINER_LOGGER="${TRAINER_LOGGER:-['console','wandb']}"
 SKILL_PROMPT_VERSION="${SKILL_PROMPT_VERSION:-seed}"
-if [[ "$SKILL_PROMPT_VERSION" == "strategy_bank" ]]; then
-    SKILL_PROMPT_VERSION="search_strategy_bank"
-elif [[ "$SKILL_PROMPT_VERSION" == "skill_only" ]]; then
-    SKILL_PROMPT_VERSION="search_skill_only"
-elif [[ "$SKILL_PROMPT_VERSION" == "self" ]] \
+if [[ "$SKILL_PROMPT_VERSION" == "self" ]] \
     || [[ "$SKILL_PROMPT_VERSION" == "self_glm" ]] \
     || [[ "$SKILL_PROMPT_VERSION" == "glm_self" ]] \
     || [[ "$SKILL_PROMPT_VERSION" == "search_self_glm" ]]; then
     SKILL_PROMPT_VERSION="search_summary_skill_glm_self"
 fi
 
-if [[ "$SKILL_PROMPT_VERSION" == "search_strategy_bank" ]]; then
-    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_strategy_bank_qwen25_7b_${SFT_SELF_DIR_SUFFIX}"
-    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-7B-Instruct-search-episode-skill-sft-v2-strategy_bank-${SFT_SELF_SUFFIX}"
-    DEFAULT_EXPERIMENT_NAME="qwen25-7b-search-episode-skill-sft-v2-strategy_bank-ep${TOTAL_EPOCHS}"
-    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_strategy_bank_qwen25_7b_ep${TOTAL_EPOCHS}"
-elif [[ "$SKILL_PROMPT_VERSION" == "search_skill_only" ]]; then
-    DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_skill_only_qwen25_7b_${SFT_SELF_DIR_SUFFIX}"
-    DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-7B-Instruct-search-episode-skill-sft-v2-skill_only-${SFT_SELF_SUFFIX}"
-    DEFAULT_EXPERIMENT_NAME="qwen25-7b-search-episode-skill-sft-v2-skill_only-ep${TOTAL_EPOCHS}"
-    DEFAULT_OUTPUT_STEM="search_episode_skill_analyzer_v2_skill_only_qwen25_7b_ep${TOTAL_EPOCHS}"
-elif [[ "$SKILL_PROMPT_VERSION" == "search_summary_skill_glm_self" ]]; then
+if [[ "$SKILL_PROMPT_VERSION" == "search_summary_skill_glm_self" ]]; then
     DEFAULT_DATA_DIR="$PROJECT_ROOT/outputs/search_episode_skill_pipeline_v2_qwen25_7b_${SFT_SELF_DIR_SUFFIX}"
     DEFAULT_EXPORT_MODEL_NAME="Qwen2.5-7B-Instruct-search-episode-skill-sft-${SFT_SELF_SUFFIX}"
     DEFAULT_EXPERIMENT_NAME="qwen25-7b-search-episode-skill-sft-glm-self-ep${TOTAL_EPOCHS}"

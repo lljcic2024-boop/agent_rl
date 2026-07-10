@@ -130,25 +130,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skill-prompt-version",
         default="seed",
-        choices=("seed", "strategy_bank", "search_strategy_bank", "skill_only", "search_skill_only"),
-        help=(
-            "Episode-skill prompt version. Use 'search_strategy_bank' for the "
-            "search QA strategy-bank prompt, or 'search_skill_only' for an "
-            "episode-skill-only prompt without episode_summary. "
-            "'strategy_bank' and 'skill_only' are accepted as aliases."
-        ),
+        choices=("seed",),
+        help="Episode-skill prompt version.",
     )
     parser.add_argument("--sft-val-ratio", type=float, default=0.1)
     return parser.parse_args()
 
 
 def normalize_search_skill_prompt_version(version: object) -> str:
-    value = str(version or "seed").strip()
-    if value == "strategy_bank":
-        return "search_strategy_bank"
-    if value == "skill_only":
-        return "search_skill_only"
-    return value
+    return str(version or "seed").strip()
 
 
 def prepare_output_dir(
@@ -816,15 +806,10 @@ def build_sft_exports_from_candidates(
         if not messages:
             continue
         analysis_prompt_version = str(candidate.get("analysis_prompt_version", "seed"))
-        if analysis_prompt_version == "search_skill_only":
-            response_payload = {
-                "episode_skill": candidate.get("episode_skill", ""),
-            }
-        else:
-            response_payload = {
-                "episode_summary": candidate.get("episode_summary", ""),
-                "episode_skill": candidate.get("episode_skill", ""),
-            }
+        response_payload = {
+            "episode_summary": candidate.get("episode_summary", ""),
+            "episode_skill": candidate.get("episode_skill", ""),
+        }
         sft_records.append(
             {
                 "prompt": str(messages[-1].get("content", "")),

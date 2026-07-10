@@ -27,7 +27,13 @@ TRAINER_LOGGER="${TRAINER_LOGGER:-['console','wandb']}"
 
 MODELS_ROOT="${MODELS_ROOT:?Please set MODELS_ROOT in $ENV_FILE or the environment.}"
 MODEL_PATH="${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-VL-3B-Instruct}"
-DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/sokoban_visual_seed_pipeline}"
+# shellcheck source=../sft_teacher_naming.sh
+source "$PROJECT_ROOT/scripts/sft_teacher_naming.sh"
+SOKOBAN_SELF_DIR_SUFFIX="${SOKOBAN_SELF_DIR_SUFFIX:-$SFT_SELF_DIR_SUFFIX}"
+if [[ "$SOKOBAN_SELF_DIR_SUFFIX" == "teacher_self" ]]; then
+    SOKOBAN_SELF_DIR_SUFFIX="self"
+fi
+DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/sokoban_visual_seed_pipeline_qwen25_vl_3b_${SOKOBAN_SELF_DIR_SUFFIX}}"
 TRAIN_DATA="${TRAIN_DATA:-$DATA_DIR/sft_sokoban_visual_train.parquet}"
 VAL_DATA="${VAL_DATA:-$DATA_DIR/sft_sokoban_visual_val.parquet}"
 

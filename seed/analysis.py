@@ -1,9 +1,14 @@
 import ast
+import base64
+import io
 import json
 import logging
+import mimetypes
 import os
 import re
 from collections import defaultdict
+from copy import deepcopy
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -26,10 +31,7 @@ _TASK_DESCRIPTION_PATTERNS = (
 
 _ANALYSIS_PROMPT_VERSIONS = {
     "seed",
-    "sokoban_visual",
-    "strategy_bank",
-    "search_strategy_bank",
-    "search_skill_only",
+    "seed_visual",
 }
 
 
@@ -322,8 +324,114 @@ class SEEDEpisodeAnalyzer:
 
     def _analysis_has_required_skill(self, parsed: Dict[str, object]) -> bool:
         if self.skill_mode == "step_only":
-            return bool(parsed.get("step_skills"))
-        return bool(str(parsed.get("episode_skill", "")).strip())
+            step_skills = parsed.get("step_skills")
+            if not isinstance(step_skills, dict):
+                return False
+            return any(self._is_nontrivial_skill_text(skill) for skill in step_skills.values())
+        return self._is_nontrivial_skill_text(parsed.get("episode_skill", ""))
+
+    @staticmethod
+    def _is_nontrivial_skill_text(value: object) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        if text in {"...", "…"} or re.fullmatch(r"[\s.。…,_-]+", text):
+            return False
+        return len(text.split()) >= 5
+
+    @staticmethod
+    def _extract_step_image(step: Dict[str, object]) -> Optional[Any]:
+        if step.get("observation_image") is not None:
+            return step.get("observation_image")
+        images = step.get("images")
+        if isinstance(images, list) and images:
+            first = images[0]
+            if isinstance(first, dict):
+                return first.get("image")
+            return first
+        return None
+
+    @staticmethod
+    def _image_to_data_url(image: Any) -> str:
+        if isinstance(image, dict):
+            image = image.get("image") or image.get("url") or image.get("path")
+        if isinstance(image, (str, os.PathLike)):
+            image_text = str(image)
+            if image_text.startswith(("data:", "http://", "https://")):
+                return image_text
+            path = Path(image_text).expanduser()
+            mime_type = mimetypes.guess_type(str(path))[0] or "image/png"
+            payload = base64.b64encode(path.read_bytes()).decode("ascii")
+            return f"data:{mime_type};base64,{payload}"
+        if isinstance(image, bytes):
+            payload = base64.b64encode(image).decode("ascii")
+            return f"data:image/png;base64,{payload}"
+        if torch.is_tensor(image):
+            image = image.detach().cpu().numpy()
+        if isinstance(image, np.ndarray):
+            from PIL import Image
+
+            array = image
+            if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
+                array = np.moveaxis(array, 0, -1)
+            if np.issubdtype(array.dtype, np.floating):
+                scale = 255.0 if float(np.nanmax(array)) <= 1.0 else 1.0
+                array = np.clip(array * scale, 0, 255).astype(np.uint8)
+            elif array.dtype != np.uint8:
+                array = np.clip(array, 0, 255).astype(np.uint8)
+            image = Image.fromarray(array)
+        if hasattr(image, "save"):
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            payload = base64.b64encode(buffer.getvalue()).decode("ascii")
+            return f"data:image/png;base64,{payload}"
+        raise TypeError(f"Unsupported image value for OpenAI multimodal prompt: {type(image)!r}")
+
+    def _build_openai_prompt_with_images(
+        self,
+        prompt: Dict[str, Any],
+        steps: List[Dict[str, object]],
+    ) -> Dict[str, Any]:
+        messages = prompt.get("messages", []) if isinstance(prompt, dict) else []
+        placeholder_count = sum(str(message.get("content", "")).count("<image>") for message in messages)
+        if placeholder_count == 0:
+            return prompt
+
+        images = [
+            self._extract_step_image(step)
+            for step in steps
+            if self._extract_step_image(step) is not None
+        ]
+        if len(images) != placeholder_count:
+            raise ValueError(
+                f"OpenAI multimodal SEED prompt has {placeholder_count} image placeholder(s) "
+                f"but {len(images)} image(s)."
+            )
+
+        image_urls = [self._image_to_data_url(image) for image in images]
+        image_index = 0
+        prompt_with_images = deepcopy(prompt)
+        prompt_with_images["messages"] = []
+        for message in messages:
+            copied = dict(deepcopy(message))
+            content = copied.get("content")
+            if isinstance(content, str) and "<image>" in content:
+                parts = []
+                segments = content.split("<image>")
+                for segment_index, segment in enumerate(segments):
+                    if segment:
+                        parts.append({"type": "text", "text": segment})
+                    if segment_index + 1 < len(segments):
+                        parts.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_urls[image_index]},
+                            }
+                        )
+                        image_index += 1
+                copied["content"] = parts
+            prompt_with_images["messages"].append(copied)
+        return prompt_with_images
 
     def _analyze_episode_with_openai(
         self,
@@ -361,7 +469,7 @@ class SEEDEpisodeAnalyzer:
             content = chat_completion_with_retry(
                 client=self._get_openai_client(),
                 model=self.model,
-                prompt=prompt_for_attempt,
+                prompt=self._build_openai_prompt_with_images(prompt_for_attempt, steps),
                 retries=max(1, int(os.environ.get("OPENAI_API_RETRIES", "5"))),
                 retry_delay=float(os.environ.get("OPENAI_API_RETRY_DELAY", "1.0")),
                 max_completion_tokens=self.max_completion_tokens,
@@ -447,11 +555,7 @@ class SEEDEpisodeAnalyzer:
                 original_user_prompt = str(message.get("content", ""))
                 break
         invalid_preview = str(invalid_response or "")[-2000:]
-        if self.analysis_prompt_version == "search_skill_only":
-            schema_text = """{
-  "episode_skill": "string"
-}"""
-        elif self.skill_mode == "step_only":
+        if self.skill_mode == "step_only":
             schema_text = """{
   "episode_summary": "string",
   "step_skills": {}
@@ -722,7 +826,7 @@ Episode context:
 """
         return build_prompt_dict(user_prompt=prompt_text)
 
-    def _build_strategy_bank_episode_analysis_prompt(
+    def _build_seed_visual_episode_analysis_prompt(
         self,
         steps: List[Dict[str, object]],
         candidate_step_indices: Sequence[int],
@@ -730,354 +834,22 @@ Episode context:
         episode_success: Optional[float] = None,
         task_description: Optional[str] = None,
     ) -> Dict[str, Any]:
-        task_description = _clean_task_description(task_description) or self._infer_task_description(steps)
-        max_skill_count = min(self.max_step_skills_per_traj, len(candidate_step_indices))
-
-        outcome_label = "unknown"
-        if episode_success is not None:
-            try:
-                outcome_label = "success" if float(episode_success) >= 1.0 else "failure"
-            except (TypeError, ValueError):
-                outcome_label = "unknown"
-
-        field_instructions = (
-            "1. episode_summary: one concise sentence describing what the agent did and the main success/failure reason.\n"
-            "2. episode_skill: one reusable strategy that another policy can apply across similar WebShop tasks."
-        )
-        return_fields = "episode_summary, episode_skill"
-        return_format = """{
-  "episode_summary": "string",
-  "episode_skill": "string"
-}"""
-        if self.skill_mode == "step_only":
-            field_instructions = (
-                "1. episode_summary: one concise sentence describing what the agent did and the main success/failure reason.\n"
-                f"2. step_skills: provide concise, action-oriented decision skills for at most {max_skill_count} critical step(s) from the candidate set."
-            )
-            return_fields = "episode_summary, step_skills"
-            return_format = """{
-  "episode_summary": "string",
-  "step_skills": {
-    "0": "skill for step 0",
-    "2": "skill for step 2"
-  }
-}"""
-        elif self.skill_mode == "episode_step":
-            field_instructions += (
-                f"\n3. step_skills: provide concise, action-oriented decision skills for at most {max_skill_count} critical step(s) from the candidate set."
-            )
-            return_fields = "episode_summary, episode_skill, step_skills"
-            return_format = """{
-  "episode_summary": "string",
-  "episode_skill": "string",
-  "step_skills": {
-    "0": "skill for step 0",
-    "2": "skill for step 2"
-  }
-}"""
-
-        prompt_text = f"""Analyze the following WebShop agent episode and return ONLY valid JSON.
-
-Your job is to distill reusable shopping skills in the style of a curated WebShop skill bank.
-
-You need to complete these fields:
-{field_instructions}
-
-Important constraints for reusable skills:
-- Use this format: "<Short Skill Name>: <imperative reusable rule>. Apply this when <observable trigger condition>."
-- Make the skill category-aware but not task-bound. Mentally choose the relevant category from apparel, footwear, home_decor, electronics, accessories, beauty_health, or other, but do not output the category field.
-- Generalize away from this exact episode. Do not mention ASINs, product IDs, exact product titles, brand names, exact prices, exact dimensions, exact sizes, or unusual one-off query terms unless they are generic attribute types.
-- Prefer stable shopping behaviors: concise keyword search, query refinement, scanning result titles/prices before clicking, verifying product category and hard constraints, selecting mandatory variants, opening details/features for hidden attributes, checking variant-specific price, avoiding page/filter loops, and buying only after all constraints are confirmed.
-- If the episode succeeded, extract the workflow and decision order that made it work.
-- If the episode failed, extract the root mistake as an avoidance rule with a clear trigger.
-- Write skills as policy-facing advice, not as retrospective explanation of this trajectory.
-- Keep the episode-level skill to one or two sentences when it is requested.
-- Return only these top-level fields: {return_fields}.
-
-Style examples for episode_skill:
-- "Prioritize Core Keywords: Search with the product type plus the few hard constraints that most determine relevance, then add secondary descriptors only after results are too broad. Apply this before the first search or when an over-specific query yields few useful results."
-- "Verify Early, Abort Fast: On each product page, immediately check category, core attributes, and price; leave the page as soon as a hard constraint is violated. Apply this right after opening any candidate product."
-- "Set Mandatory Variants: Select required color, size, capacity, or pack options before evaluating price or buying. Apply this whenever the product page offers variants and the user specified variant-dependent constraints."
-
-Return format:
-{return_format}
-
-Episode context:
-- Task description: {task_description or "(not available)"}
-- episode_success: {outcome_label}
-- analysis_mode: {analysis_mode}
-- Candidate step indices: {list(candidate_step_indices)}
-- Interaction trajectory: {self._format_episode_steps(steps)}
-"""
-        return build_prompt_dict(user_prompt=prompt_text)
-
-    def _build_search_strategy_bank_episode_analysis_prompt(
-        self,
-        steps: List[Dict[str, object]],
-        candidate_step_indices: Sequence[int],
-        analysis_mode: str = "teacher_bootstrap",
-        episode_success: Optional[float] = None,
-        task_description: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        task_description = _clean_task_description(task_description) or self._infer_task_description(steps)
-        max_skill_count = min(self.max_step_skills_per_traj, len(candidate_step_indices))
-
-        outcome_label = "unknown"
-        if episode_success is not None:
-            try:
-                outcome_label = "success" if float(episode_success) >= 1.0 else "failure"
-            except (TypeError, ValueError):
-                outcome_label = "unknown"
-
-        field_instructions = (
-            "1. episode_summary: one concise sentence describing what the agent did and the main success/failure reason.\n"
-            "2. episode_skill: one reusable strategy that another policy can apply across similar search QA tasks."
-        )
-        return_fields = "episode_summary, episode_skill"
-        return_format = """{
-  "episode_summary": "string",
-  "episode_skill": "string"
-}"""
-        if self.skill_mode == "step_only":
-            field_instructions = (
-                "1. episode_summary: one concise sentence describing what the agent did and the main success/failure reason.\n"
-                f"2. step_skills: provide concise, action-oriented decision skills for at most {max_skill_count} critical step(s) from the candidate set."
-            )
-            return_fields = "episode_summary, step_skills"
-            return_format = """{
-  "episode_summary": "string",
-  "step_skills": {
-    "0": "skill for step 0",
-    "2": "skill for step 2"
-  }
-}"""
-        elif self.skill_mode == "episode_step":
-            field_instructions += (
-                f"\n3. step_skills: provide concise, action-oriented decision skills for at most {max_skill_count} critical step(s) from the candidate set."
-            )
-            return_fields = "episode_summary, episode_skill, step_skills"
-            return_format = """{
-  "episode_summary": "string",
-  "episode_skill": "string",
-  "step_skills": {
-    "0": "skill for step 0",
-    "2": "skill for step 2"
-  }
-}"""
-
-        prompt_text = f"""Analyze the following search QA agent episode and return ONLY valid JSON.
-
-Your job is to distill reusable question-answering search skills in the style of a curated search strategy bank.
-
-You need to complete these fields:
-{field_instructions}
-
-Important constraints for reusable skills:
-- Use this format: "<Short Skill Name>: <imperative reusable rule>. Apply this when <observable trigger condition>."
-- Make the skill task-type-aware but not task-bound. Mentally choose the relevant task type from direct_retrieval, multi_hop_reasoning, entity_attribute_lookup, compare, freshness_sensitive, ambiguity_resolution, or other, but do not output the task type field.
-- Generalize away from this exact episode. Do not mention exact entity names, question wording, retrieved snippets, URLs, document titles, or final answers unless they are generic attribute types.
-- Prefer stable search behaviors: decomposing complex questions, crafting precise entity-plus-attribute queries, using quotes for distinctive phrases, refining failed queries with aliases or context, resolving ambiguous entities, chaining intermediate attributes, checking freshness, cross-checking critical facts, normalizing comparable values, and answering only after evidence supports the claim.
-- If the episode succeeded, extract the workflow and decision order that made it work.
-- If the episode failed, extract the root mistake as an avoidance rule with a clear trigger.
-- Write skills as policy-facing advice, not as retrospective explanation of this trajectory.
-- Keep the episode-level skill to one or two sentences when it is requested.
-- Return only these top-level fields: {return_fields}.
-
-Style examples for episode_skill:
-- "Decompose Then Search: Break a complex question into minimal sub-questions, search each entity-attribute relation separately, then synthesize the answer. Apply this when the question links multiple entities, attributes, or comparisons."
-- "Precision Query Crafting: Search with the exact entity name plus the requested attribute, removing filler words before issuing the query. Apply this at the first lookup step for direct fact retrieval or entity-attribute questions."
-- "Resolve Ambiguity Before Answering: Add clarifiers such as profession, year, medium, or location before trusting results for a shared name. Apply this when snippets refer to multiple possible entities or contexts."
-- "Collect Then Compare: Retrieve and normalize each value independently before deciding which is earlier, larger, older, or otherwise preferred. Apply this whenever the question asks for a comparison."
-- "Evidence-Bound Answering: Do not give the final answer until the retrieved text explicitly supports it; refine the query instead of guessing when evidence is weak. Apply this before ending any search episode."
-
-Return format:
-{return_format}
-
-Episode context:
-- Task description: {task_description or "(not available)"}
-- episode_success: {outcome_label}
-- analysis_mode: {analysis_mode}
-- Candidate step indices: {list(candidate_step_indices)}
-- Interaction trajectory: {self._format_episode_steps(steps)}
-"""
-        return build_prompt_dict(user_prompt=prompt_text)
-
-    def _build_search_skill_only_episode_analysis_prompt(
-        self,
-        steps: List[Dict[str, object]],
-        candidate_step_indices: Sequence[int],
-        analysis_mode: str = "teacher_bootstrap",
-        episode_success: Optional[float] = None,
-        task_description: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        task_description = _clean_task_description(task_description) or self._infer_task_description(steps)
-
-        outcome_label = "unknown"
-        if episode_success is not None:
-            try:
-                outcome_label = "success" if float(episode_success) >= 1.0 else "failure"
-            except (TypeError, ValueError):
-                outcome_label = "unknown"
-
-        if outcome_label == "success":
-            episode_skill_instruction = (
-                "Write one episode_skill that extracts the successful search trajectory into workflow: "
-                "the core decision rule and action ordering that made this trajectory work."
-            )
-        elif outcome_label == "failure":
-            episode_skill_instruction = (
-                "Write one episode_skill that extracts the failed search trajectory into avoidance rules: "
-                "the core mistake and warning signs that the agent should avoid."
-            )
-        else:
-            episode_skill_instruction = (
-                "Write one episode_skill distilled from the search trajectory. If it succeeded, extract "
-                "the successful workflow; if it failed, extract the avoidance rules."
-            )
-
-        prompt_text = f"""Analyze the following search QA agent episode and return ONLY valid JSON.
-
-You need to complete one field:
-1. {episode_skill_instruction}
-
-Important constraints:
-- Write episode_skill as one short policy-facing search skill, not as retrospective explanation of the trajectory.
-- The skill should be reusable across similar search QA tasks, but it may mention generic behaviors such as query refinement, evidence checking, ambiguity resolution, multi-hop decomposition, or comparison.
-- Do not include any other top-level fields.
-- Return only this top-level field: episode_skill.
-
-Return format:
-{{
-  "episode_skill": "string"
-}}
-
-Episode context:
-- Task description: {task_description or "(not available)"}
-- episode_success: {outcome_label}
-- analysis_mode: {analysis_mode}
-- Interaction trajectory: {self._format_episode_steps(steps)}
-"""
-        return build_prompt_dict(user_prompt=prompt_text)
-
-    def _format_sokoban_visual_episode_steps(self, steps: List[Dict[str, object]]) -> str:
-        step_lines = []
         for step in steps:
-            action_valid_str = ""
-            if "action_valid" in step:
-                action_valid_str = f"\nAction valid: {str(bool(step['action_valid'])).lower()}"
-            reward_str = ""
-            if "step_reward" in step:
-                reward_str = f"\nStep reward: {step['step_reward']}"
             if not step.get("has_observation_image"):
-                raise ValueError("sokoban_visual analysis requires an observation image for every episode step.")
-            observation_line = "<image>"
-            step_lines.append(
-                f"Step {step['step_index']}\n"
-                f"Board observation: {observation_line}\n"
-                f"Response: {step['response']}{action_valid_str}{reward_str}\n"
-            )
-        return "".join(step_lines)
-
-    def _build_sokoban_visual_episode_analysis_prompt(
-        self,
-        steps: List[Dict[str, object]],
-        candidate_step_indices: Sequence[int],
-        analysis_mode: str = "teacher_bootstrap",
-        episode_success: Optional[float] = None,
-        task_description: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        max_skill_count = min(self.max_step_skills_per_traj, len(candidate_step_indices))
-
-        outcome_label = "unknown"
-        if episode_success is not None:
-            try:
-                outcome_label = "success" if float(episode_success) >= 1.0 else "failure"
-            except (TypeError, ValueError):
-                outcome_label = "unknown"
-
-        if outcome_label == "success":
-            episode_skill_instruction = (
-                "Write one episode_skill that extracts the successful Sokoban trajectory into a reusable board-control rule: "
-                "how to choose pushes, preserve box mobility, and route the player around walls and targets."
-            )
-        elif outcome_label == "failure":
-            episode_skill_instruction = (
-                "Write one episode_skill that extracts the failed Sokoban trajectory into an avoidance rule: "
-                "which visual trap, blocked box, bad push, or wasted movement pattern the policy should avoid."
-            )
-        else:
-            episode_skill_instruction = (
-                "Write one episode_skill distilled from the Sokoban trajectory. If it succeeded, extract the reusable "
-                "board-control workflow; if it failed, extract the visual trap or bad-push pattern to avoid."
-            )
-
-        summary_instruction = "Write a concise episode_summary based on the board images, actions, rewards, and outcome."
-        selection_instruction = (
-            f"Provide concise, action-oriented step_skills for at most {max_skill_count} critical step(s) "
-            "from the candidate set. Each step skill must be usable by the policy while looking at the current board image."
+                raise ValueError("seed_visual analysis requires an observation image for every episode step.")
+        image_steps = []
+        for step in steps:
+            image_step = dict(step)
+            image_step["observation"] = "<image>"
+            image_step["response"] = str(step["response"]).replace("<image>", "[image]")
+            image_steps.append(image_step)
+        return self._build_default_episode_analysis_prompt(
+            steps=image_steps,
+            candidate_step_indices=candidate_step_indices,
+            analysis_mode=analysis_mode,
+            episode_success=episode_success,
+            task_description=task_description,
         )
-
-        if self.skill_mode == "episode_only":
-            required_fields = "episode_summary, episode_skill" if self.include_episode_summary else "episode_skill"
-            json_fields = (
-                '{\n  "episode_summary": "string",\n  "episode_skill": "string"\n}'
-                if self.include_episode_summary
-                else '{\n  "episode_skill": "string"\n}'
-            )
-            work_items = (
-                f"1. {summary_instruction}\n2. {episode_skill_instruction}"
-                if self.include_episode_summary
-                else f"1. {episode_skill_instruction}"
-            )
-        elif self.skill_mode == "step_only":
-            required_fields = "episode_summary, step_skills" if self.include_episode_summary else "step_skills"
-            json_fields = (
-                '{\n  "episode_summary": "string",\n  "step_skills": {\n    "0": "skill for step 0"\n  }\n}'
-                if self.include_episode_summary
-                else '{\n  "step_skills": {\n    "0": "skill for step 0"\n  }\n}'
-            )
-            work_items = (
-                f"1. {summary_instruction}\n2. {selection_instruction}"
-                if self.include_episode_summary
-                else f"1. {selection_instruction}"
-            )
-        else:
-            required_fields = "episode_summary, episode_skill, step_skills" if self.include_episode_summary else "episode_skill, step_skills"
-            json_fields = (
-                '{\n  "episode_summary": "string",\n  "episode_skill": "string",\n  "step_skills": {\n    "0": "skill for step 0"\n  }\n}'
-                if self.include_episode_summary
-                else '{\n  "episode_skill": "string",\n  "step_skills": {\n    "0": "skill for step 0"\n  }\n}'
-            )
-            work_items = (
-                f"1. {summary_instruction}\n2. {episode_skill_instruction}\n3. {selection_instruction}"
-                if self.include_episode_summary
-                else f"1. {episode_skill_instruction}\n2. {selection_instruction}"
-            )
-
-        prompt_text = f"""Analyze the following visual Sokoban agent episode and return ONLY valid JSON.
-
-You need to complete these field(s): {required_fields}
-{work_items}
-
-Important constraints:
-- Step indexing is 0-based: step 0 is the first step of the trajectory.
-- Use the board images as the source of state: locate the player, boxes, targets, walls, and visually obvious traps.
-- Write skills as short policy-facing advice for future Sokoban decisions, not as retrospective narration.
-- Do not invent coordinates unless they are clear from the image.
-- Return only valid JSON with the requested top-level fields.
-- The chosen steps are exactly the keys present in step_skills.
-
-Return format:
-{json_fields}
-
-Episode context:
-- Task: Push all boxes onto targets without trapping boxes.
-- episode_success: {outcome_label}
-- analysis_mode: {analysis_mode}
-- Candidate step indices: {list(candidate_step_indices)}
-- Interaction trajectory: {self._format_sokoban_visual_episode_steps(steps)}
-"""
-        return build_prompt_dict(user_prompt=prompt_text)
 
     def _build_episode_analysis_prompt(
         self,
@@ -1087,32 +859,8 @@ Episode context:
         episode_success: Optional[float] = None,
         task_description: Optional[str] = None,
     ) -> Dict[str, Any]:
-        if self.analysis_prompt_version == "sokoban_visual":
-            return self._build_sokoban_visual_episode_analysis_prompt(
-                steps=steps,
-                candidate_step_indices=candidate_step_indices,
-                analysis_mode=analysis_mode,
-                episode_success=episode_success,
-                task_description=task_description,
-            )
-        if self.analysis_prompt_version == "strategy_bank":
-            return self._build_strategy_bank_episode_analysis_prompt(
-                steps=steps,
-                candidate_step_indices=candidate_step_indices,
-                analysis_mode=analysis_mode,
-                episode_success=episode_success,
-                task_description=task_description,
-            )
-        if self.analysis_prompt_version == "search_strategy_bank":
-            return self._build_search_strategy_bank_episode_analysis_prompt(
-                steps=steps,
-                candidate_step_indices=candidate_step_indices,
-                analysis_mode=analysis_mode,
-                episode_success=episode_success,
-                task_description=task_description,
-            )
-        if self.analysis_prompt_version == "search_skill_only":
-            return self._build_search_skill_only_episode_analysis_prompt(
+        if self.analysis_prompt_version == "seed_visual":
+            return self._build_seed_visual_episode_analysis_prompt(
                 steps=steps,
                 candidate_step_indices=candidate_step_indices,
                 analysis_mode=analysis_mode,

@@ -1347,6 +1347,58 @@ class RayPPOTrainer:
                 for i in range(n)
             ]
 
+        def _sokoban_image_path(index: int) -> Optional[str]:
+            env_name = str(OmegaConf.select(self.config, "env.env_name") or "")
+            if "sokoban" not in env_name.lower():
+                return None
+            save_images = OmegaConf.select(self.config, "env.sokoban.save_images")
+            if isinstance(save_images, str):
+                save_images = save_images.strip().lower() in {"1", "true", "yes", "on"}
+            if not save_images:
+                return None
+            if not all(key in base_data for key in ("sample_id", "rollout_id", "step_num", "traj_uid")):
+                return None
+
+            image_root = OmegaConf.select(self.config, "env.sokoban.image_save_dir")
+            if isinstance(image_root, str) and image_root.strip().lower() in {"", "none", "null"}:
+                image_root = None
+            if not image_root:
+                default_local_dir = OmegaConf.select(self.config, "trainer.default_local_dir")
+                if not default_local_dir:
+                    return None
+                image_root = os.path.join(os.path.expanduser(str(default_local_dir)), "sokoban_images")
+            image_root = os.path.expanduser(str(image_root))
+
+            def _sanitize_path_component(value: Any) -> str:
+                text = str(value)
+                allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+                cleaned = "".join(ch if ch in allowed else "_" for ch in text).strip("._")
+                return cleaned or "unknown"
+
+            try:
+                global_step = int(self.global_steps)
+                sample_id = int(base_data["sample_id"][index])
+                rollout_id = int(base_data["rollout_id"][index])
+                step_num = int(base_data["step_num"][index])
+            except (TypeError, ValueError):
+                return None
+
+            traj_uid = _sanitize_path_component(base_data["traj_uid"][index])
+            sequence_name = f"train_sample_{sample_id:06d}_rollout_{rollout_id:03d}_{traj_uid}"
+            return os.path.join(
+                image_root,
+                f"global_step_{global_step}",
+                sequence_name,
+                f"step_{step_num:03d}.png",
+            )
+
+        image_paths = [_sokoban_image_path(i) for i in range(n)]
+        if any(image_paths):
+            base_data["images"] = [
+                [{"image": image_path}] if image_path else []
+                for image_path in image_paths
+            ]
+
         entries = []
         for i in range(n):
             entries.append({k: _json_safe(v[i]) for k, v in base_data.items()})
@@ -2373,10 +2425,10 @@ class RayPPOTrainer:
         base_obs_texts = batch.non_tensor_batch.get("obs_text_base", batch.non_tensor_batch["obs_text"])
         analysis_obs_texts = base_obs_texts
         analysis_obs_images = self._extract_step_observation_images(batch)
-        if analyzer.analysis_prompt_version == "sokoban_visual":
+        if analyzer.analysis_prompt_version == "seed_visual":
             if analysis_obs_images is None or any(image is None for image in analysis_obs_images):
                 raise RuntimeError(
-                    "sokoban_visual SEED analysis requires an observation image for every rollout step."
+                    "seed_visual SEED analysis requires an observation image for every rollout step."
                 )
 
         episodes = core_seed.build_episode_records(
@@ -2687,7 +2739,7 @@ class RayPPOTrainer:
         if critical_preview and module_logger.isEnabledFor(logging.DEBUG):
             module_logger.debug("SEED episode-level OPD preview: %s", critical_preview)
         self._dump_seed_augmented_observations(augmented_observation_dump_entries)
-        visual_teacher_required = analyzer.analysis_prompt_version == "sokoban_visual"
+        visual_teacher_required = analyzer.analysis_prompt_version == "seed_visual"
 
         def _compute_skill_log_probs(
             *,
@@ -2706,7 +2758,7 @@ class RayPPOTrainer:
             if visual_teacher_required and (
                 prompt_images is None or not all(image is not None for image in prompt_images)
             ):
-                raise RuntimeError("sokoban_visual SEED teacher scoring requires an image for every prompt.")
+                raise RuntimeError("seed_visual SEED teacher scoring requires an image for every prompt.")
             if use_prompt_images and not all(image is not None for image in prompt_images):
                 raise RuntimeError(
                     "SEED %s teacher scoring received a mixed visual/text prompt batch."
@@ -3205,7 +3257,7 @@ class RayPPOTrainer:
                                 except Exception as exc:
                                     if (
                                         str(OmegaConf.select(self.config, "algorithm.seed.analysis_prompt_version") or "")
-                                        == "sokoban_visual"
+                                        == "seed_visual"
                                     ):
                                         raise
                                     module_logger.warning(

@@ -310,7 +310,7 @@ algorithm:
     failed_only_after_steps: null # null -> use failed_only; otherwise analyze all episodes through this step, then failed episodes only
     failure_success_threshold: 1.0 # when episode_success is unavailable, episode_rewards >= this value counts as success
     analysis_backend: "openai"
-    analysis_prompt_version: "seed" # "seed", "strategy_bank" for WebShop, "search_strategy_bank" for Search QA, or "search_skill_only" without episode_summary
+    analysis_prompt_version: "seed" # "seed" or "seed_visual"
     analysis_num_workers: 8
     analysis_context_length: 16384
     analysis_max_completion_tokens: 1024
