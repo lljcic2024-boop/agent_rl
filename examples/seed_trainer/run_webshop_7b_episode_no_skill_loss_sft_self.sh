@@ -18,7 +18,9 @@ if [[ -z "${MODELS_ROOT:-}" && -z "${HF_MODEL_PATH:-}" ]]; then
     exit 1
 fi
 
+export SEED_MODE="${SEED_MODE:-mean_norm}"
+
 export HF_MODEL_PATH="${HF_MODEL_PATH:-$MODELS_ROOT/Qwen2.5-7B-Instruct-webshop-episode-skill-sft-glm-self}"
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-seed_qwen2.5_7b_webshop_sft_glm_self}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-seed_qwen2.5_7b_webshop_sft_glm_self_mean-norm}"
 
 exec bash "$SCRIPT_DIR/run_webshop_7b_episode_no_skill_loss_sft.sh" "$@"

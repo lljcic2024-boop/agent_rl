@@ -42,7 +42,7 @@ export SEED_ANALYSIS_BACKEND="${SEED_ANALYSIS_BACKEND:-policy_vllm}"
 export SEED_ANALYSIS_PROMPT_VERSION="${SEED_ANALYSIS_PROMPT_VERSION:-seed}"
 export SEED_MODE="${SEED_MODE:-mean_norm}"
 
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-seed_qwen2.5_3b_webshop_sft_glm_self_mean-norm}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-seed_qwen2.5_3b_webshop_sft_glm_self_mean-norm_exp2}"
 export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}"
 
 exec bash "$SCRIPT_DIR/run_webshop_both_no_skill_loss_base.sh" \
