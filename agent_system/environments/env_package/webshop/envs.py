@@ -35,7 +35,7 @@ class WebshopWorker:
         from web_agent_site.envs import WebAgentTextEnv  # noqa: WPS433 (runtime import)
         
         env_kwargs['seed'] = seed
-        self.env = gym.make('WebAgentTextEnv-v0', **env_kwargs)
+        self.env = gym.make('WebAgentTextEnv-v0', disable_env_checker=True, **env_kwargs)
     
     def step(self, action):
         """Execute a step in the environment"""

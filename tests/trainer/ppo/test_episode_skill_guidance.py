@@ -35,6 +35,27 @@ def test_augmented_observation_injects_step_skill_after_episode_skill():
     assert augmented.index("Critical-Step Skill") < augmented.index("Now it's your turn")
 
 
+def test_augmented_observation_injects_episode_skill_after_goal_line():
+    prompt = """You are an expert agent operating in the Sokoban environment. Your goal is to push all the boxes onto the target spots. Once all boxes are on the targets, you win!
+
+# Rules
+You can only push boxes.
+
+# Current Step
+Your current observation is shown in the image: <image>
+Your admissible actions are ["up", "down", "left", "right"].
+
+Now it's your turn to make a move."""
+    augmented = build_augmented_observation_text(
+        observation=prompt,
+        episode_skill="Move behind each box before pushing it toward a target.",
+    )
+
+    assert "Episode-Level Skill" in augmented
+    assert augmented.index("Your goal is to push") < augmented.index("Episode-Level Skill")
+    assert augmented.index("Episode-Level Skill") < augmented.index("# Rules")
+
+
 def test_augmented_observation_without_episode_skill_is_unchanged():
     augmented = build_augmented_observation_text(
         observation=PROMPT,

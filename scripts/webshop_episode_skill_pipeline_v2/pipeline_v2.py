@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import sys
 import time
 from collections import Counter
@@ -96,6 +97,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-workers", type=int, default=128)
     parser.add_argument("--max-tasks", type=int, default=None)
     parser.add_argument("--max-candidates", type=int, default=None)
+    parser.add_argument(
+        "--baseline-rollouts",
+        default=None,
+        help="Reuse an existing baseline_rollouts.jsonl instead of collecting policy rollouts.",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
@@ -287,6 +293,37 @@ def sample_tasks(args: argparse.Namespace, output_dir: Path) -> List[Dict[str, A
     existing = read_jsonl(sampled_path)
     if existing and args.resume:
         return existing
+
+    if args.baseline_rollouts:
+        baseline_records = read_jsonl(Path(args.baseline_rollouts))
+        if not baseline_records:
+            raise ValueError(f"No baseline rollouts found in {args.baseline_rollouts}")
+        tasks_by_id: Dict[str, Dict[str, Any]] = {}
+        for record in baseline_records:
+            task_id = str(record.get("task_id", "")).strip()
+            if not task_id:
+                raise ValueError("External baseline rollout is missing task_id")
+            tasks_by_id.setdefault(
+                task_id,
+                {
+                    "task_id": task_id,
+                    "task_type": record.get("task_type", "webshop"),
+                    "goal_idx": int(record.get("goal_idx", -1)),
+                    "sample_index": len(tasks_by_id),
+                    "split": "train",
+                    "task_description": str(record.get("task_description", "")),
+                },
+            )
+        sampled = list(tasks_by_id.values())
+        if sampled_path.exists():
+            sampled_path.unlink()
+        for record in sampled:
+            append_jsonl(sampled_path, record)
+        logging.info(
+            "Derived %d WebShop tasks from external baseline rollouts.",
+            len(sampled),
+        )
+        return sampled
 
     goals = get_webshop_goals(args)
     start = max(0, int(args.webshop_train_start))
@@ -595,6 +632,36 @@ def collect_baseline_rollouts(
     policy_endpoint: ChatEndpoint,
 ) -> List[Dict[str, Any]]:
     path = output_dir / "baseline_rollouts.jsonl"
+    if args.baseline_rollouts:
+        source_path = Path(args.baseline_rollouts).expanduser().resolve()
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Baseline rollouts not found: {source_path}")
+        if source_path != path.resolve():
+            if path.exists():
+                path.unlink()
+            shutil.copy2(source_path, path)
+        records = read_jsonl(path)
+        task_ids = {str(record.get("task_id", "")) for record in records}
+        if len(task_ids) != len(tasks):
+            raise ValueError(
+                "External baseline/task mismatch: "
+                f"{len(task_ids)} baseline tasks versus {len(tasks)} sampled tasks"
+            )
+        logging.info(
+            "Reused %d baseline rollouts from %s.",
+            len(records),
+            source_path,
+        )
+        log_stage(
+            output_dir,
+            "baseline_rollout",
+            "complete",
+            completed_rollouts=len(records),
+            expected_rollouts=len(records),
+            reused_from=str(source_path),
+        )
+        return records
+
     existing = read_jsonl(path) if args.resume else []
     existing_keys = {(record["task_id"], int(record["rollout_id"])) for record in existing}
     records = list(existing)
@@ -1102,11 +1169,18 @@ def write_run_config(
     for key in ("policy_api_key", "skill_api_key"):
         if redacted_args.get(key):
             redacted_args[key] = "<redacted>"
+    redacted_argv = list(sys.argv)
+    for index, value in enumerate(redacted_argv):
+        for flag in ("--policy-api-key", "--skill-api-key"):
+            if value == flag and index + 1 < len(redacted_argv):
+                redacted_argv[index + 1] = "<redacted>"
+            elif value.startswith(f"{flag}="):
+                redacted_argv[index] = f"{flag}=<redacted>"
     payload = {
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "version": "webshop_v2_no_skill_validation",
         "project_root": str(PROJECT_ROOT),
-        "argv": sys.argv,
+        "argv": redacted_argv,
         "args": redacted_args,
         "policy_endpoint": {
             "base_url": policy_endpoint.base_url,

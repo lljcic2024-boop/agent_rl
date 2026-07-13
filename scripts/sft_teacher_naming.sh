@@ -11,6 +11,9 @@ infer_sft_teacher_short() {
     local lowered
     lowered="$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')"
     case "$lowered" in
+        *gpt-5.6*|*gpt5.6*|*gpt_5.6*|*gpt56*)
+            printf 'gpt56'
+            ;;
         *deepseek*|*deep-seek*|*ds*)
             printf 'ds'
             ;;

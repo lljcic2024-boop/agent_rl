@@ -373,11 +373,18 @@ def write_run_config(
         redacted_args["skill_api_key"] = "<redacted>"
     if redacted_args.get("policy_api_key"):
         redacted_args["policy_api_key"] = "<redacted>"
+    redacted_argv = list(sys.argv)
+    for index, value in enumerate(redacted_argv):
+        for flag in ("--policy-api-key", "--skill-api-key"):
+            if value == flag and index + 1 < len(redacted_argv):
+                redacted_argv[index + 1] = "<redacted>"
+            elif value.startswith(f"{flag}="):
+                redacted_argv[index] = f"{flag}=<redacted>"
     payload = {
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "version": "v2_no_skill_validation",
         "project_root": str(PROJECT_ROOT),
-        "argv": sys.argv,
+        "argv": redacted_argv,
         "args": redacted_args,
         "policy_endpoint": None,
         "skill_endpoint": {

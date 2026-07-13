@@ -39,8 +39,9 @@ export SEED_SKILL_GEN_LOSS_ENABLE="${SEED_SKILL_GEN_LOSS_ENABLE:-False}"
 export SEED_SKILL_GEN_LOSS_COEF="${SEED_SKILL_GEN_LOSS_COEF:-0.0}"
 export SEED_ANALYSIS_BACKEND="${SEED_ANALYSIS_BACKEND:-policy_vllm}"
 export SEED_ANALYSIS_PROMPT_VERSION="${SEED_ANALYSIS_PROMPT_VERSION:-seed_visual}"
+export SEED_MODE="${SEED_MODE:-mean_norm}"
 
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-seed_qwen2.5_vl_3b_sokoban_visual_sft}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-seed_qwen2.5_vl_3b_sokoban_visual_sft_mean-norm}"
 export DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-$MODELS_ROOT/ckpt/$EXPERIMENT_NAME}"
 
 exec "$SCRIPT_DIR/run_sokoban_visual.sh" \

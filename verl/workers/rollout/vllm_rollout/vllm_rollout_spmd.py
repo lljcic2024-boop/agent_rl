@@ -68,6 +68,17 @@ except ModuleNotFoundError:
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+
+def _configure_vllm_sleep_pin_memory() -> None:
+    """Allow pageable CPU backups when aggregate pinned memory is limited."""
+    if os.getenv("VERL_VLLM_SLEEP_PIN_MEMORY", "1").lower() not in {"0", "false", "no"}:
+        return
+
+    import vllm.device_allocator.cumem as vllm_cumem
+
+    vllm_cumem.is_pin_memory_available = lambda: False
+    logger.warning("vLLM sleep mode will use pageable CPU memory for weight backups")
+
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
@@ -182,6 +193,7 @@ class vLLMRollout(BaseRollout):
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
+        _configure_vllm_sleep_pin_memory()
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=True,

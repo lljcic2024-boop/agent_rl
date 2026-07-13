@@ -82,6 +82,7 @@ def build_augmented_observation_text(
             r"^.*\bYour current task is:\s*.*(?:\n|$)",
             r"^.*\bYour task is:\s*.*(?:\n|$)",
             r"^.*\bYour question:\s*.*(?:\n|$)",
+            r"^.*\bYour goal is(?: to)?\b[:\s].*(?:\n|$)",
         )
         for pattern in task_line_patterns:
             match = re.search(pattern, prompt_text, flags=re.MULTILINE)

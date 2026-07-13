@@ -20,7 +20,7 @@ fi
 
 export SEED_MODE="${SEED_MODE:-mean_norm}"
 
-export HF_MODEL_PATH="${HF_MODEL_PATH:-$MODELS_ROOT/Qwen2.5-7B-Instruct-webshop-episode-skill-sft-glm-self}"
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-seed_qwen2.5_7b_webshop_sft_glm_self_mean-norm}"
+export HF_MODEL_PATH="${HF_MODEL_PATH:-$MODELS_ROOT/Qwen2.5-7B-Instruct-webshop-episode-skill-sft-glm-3b}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-seed_qwen2.5_7b_webshop_sft_glm_3b_mean-norm_exp2}"
 
 exec bash "$SCRIPT_DIR/run_webshop_7b_episode_no_skill_loss_sft.sh" "$@"

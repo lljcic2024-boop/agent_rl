@@ -66,6 +66,7 @@ TASK_BATCH_SIZE="${TASK_BATCH_SIZE:-16}"
 MAX_STEPS="${MAX_STEPS:-15}"
 HISTORY_LENGTH="${HISTORY_LENGTH:-2}"
 BASELINE_HISTORY_LENGTH="${BASELINE_HISTORY_LENGTH:-$HISTORY_LENGTH}"
+BASELINE_ROLLOUTS="${BASELINE_ROLLOUTS:-}"
 REQUEST_WORKERS="${REQUEST_WORKERS:-128}"
 WEBSHOP_HUMAN_GOALS="${WEBSHOP_HUMAN_GOALS:-0}"
 WEBSHOP_USE_SMALL="${WEBSHOP_USE_SMALL:-1}"
@@ -81,6 +82,7 @@ SEED="${SEED:-2026}"
 RESUME="${RESUME:-false}"
 OVERWRITE="${OVERWRITE:-false}"
 REGENERATE_CANDIDATES="${REGENERATE_CANDIDATES:-false}"
+STOP_AFTER_BASELINE_ROLLOUTS="${STOP_AFTER_BASELINE_ROLLOUTS:-false}"
 PROGRESS_MONITOR="${PROGRESS_MONITOR:-1}"
 PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-30}"
 
@@ -148,6 +150,10 @@ fi
 
 if [[ -n "${MAX_CANDIDATES:-}" ]]; then
     args+=(--max-candidates "$MAX_CANDIDATES")
+fi
+
+if [[ -n "$BASELINE_ROLLOUTS" ]]; then
+    args+=(--baseline-rollouts "$BASELINE_ROLLOUTS")
 fi
 
 if [[ -n "$SFT_MAX_ZERO_SCORE_FAILURES" ]]; then
@@ -333,6 +339,7 @@ echo "  sampled tasks:      $NUM_TASKS"
 echo "  rollouts per task:  $ROLLOUTS_PER_TASK"
 echo "  task batch size:    $TASK_BATCH_SIZE"
 echo "  baseline history:   $BASELINE_HISTORY_LENGTH"
+echo "  baseline source:    ${BASELINE_ROLLOUTS:-<generate with policy>}"
 echo "  stop vLLM after API:$STOP_VLLM_AFTER_API"
 echo "  skill gen workers:  $SKILL_GEN_WORKERS"
 echo "  skill parse tries:  $SKILL_PARSE_ATTEMPTS"
@@ -365,7 +372,17 @@ run_remaining_pipeline() {
     python "${remaining_args[@]}"
 }
 
-if [[ "$STOP_VLLM_AFTER_API" == "1" && -n "$server_pid" && "$KEEP_VLLM_ALIVE" != "1" ]]; then
+if [[ "$STOP_AFTER_BASELINE_ROLLOUTS" == "true" || "$STOP_AFTER_BASELINE_ROLLOUTS" == "1" ]]; then
+    echo "Running baseline rollouts only; skill API generation is disabled for this run."
+    set +e
+    run_pipeline --stop-after-baseline-rollouts
+    run_status=$?
+    set -e
+    print_progress
+    if [[ -n "$server_pid" && "$KEEP_VLLM_ALIVE" != "1" ]]; then
+        stop_vllm_server
+    fi
+elif [[ "$STOP_VLLM_AFTER_API" == "1" && -n "$server_pid" && "$KEEP_VLLM_ALIVE" != "1" ]]; then
     echo "Running baseline rollouts and skill API generation before stopping policy vLLM."
     set +e
     run_pipeline --stop-after-skill-generation
