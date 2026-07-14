@@ -16,7 +16,7 @@ fi
 SFT_CONDA_ENV="${SFT_CONDA_ENV:-${CONDA_ENV:-}}"
 SFT_CUDA_VISIBLE_DEVICES="${SFT_CUDA_VISIBLE_DEVICES:-}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-2}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-3}"
 LR="${LR:-2e-6}"
 MAX_LENGTH="${MAX_LENGTH:-4096}"
 TRUNCATION="${TRUNCATION:-error}"
@@ -31,19 +31,19 @@ MODEL_PATH="${MODEL_PATH:-$MODELS_ROOT/Qwen2.5-VL-3B-Instruct}"
 source "$PROJECT_ROOT/scripts/sft_teacher_naming.sh"
 SOKOBAN_SELF_DIR_SUFFIX="${SOKOBAN_SELF_DIR_SUFFIX:-$SFT_SELF_DIR_SUFFIX}"
 if [[ "$SOKOBAN_SELF_DIR_SUFFIX" == "teacher_self" ]]; then
-    SOKOBAN_SELF_DIR_SUFFIX="self"
+    SOKOBAN_SELF_DIR_SUFFIX="qwen_self"
 fi
-DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/sokoban_visual_seed_pipeline_qwen25_vl_3b_${SOKOBAN_SELF_DIR_SUFFIX}}"
-TRAIN_DATA="${TRAIN_DATA:-$DATA_DIR/sft_sokoban_visual_train.parquet}"
-VAL_DATA="${VAL_DATA:-$DATA_DIR/sft_sokoban_visual_val.parquet}"
+DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/outputs/sokoban_episode_skill_pipeline_qwen25_vl_3b_${SOKOBAN_SELF_DIR_SUFFIX}}"
+TRAIN_DATA="${TRAIN_DATA:-$DATA_DIR/sft_episode_skill_train.parquet}"
+VAL_DATA="${VAL_DATA:-$DATA_DIR/sft_episode_skill_val.parquet}"
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-PROJECT_NAME="${PROJECT_NAME:-sokoban-visual-sft}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen25-vl-3b-sokoban-visual-sft-ep${TOTAL_EPOCHS}}"
-OUTPUT_DIR="${OUTPUT_DIR:-$MODELS_ROOT/outputs/sft/sokoban_visual_seed_ep${TOTAL_EPOCHS}_${RUN_ID}}"
+PROJECT_NAME="${PROJECT_NAME:-sokoban-episode-skill-sft}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen25-vl-3b-sokoban-episode-skill-sft-${SFT_SELF_SUFFIX}-ep${TOTAL_EPOCHS}}"
+OUTPUT_DIR="${OUTPUT_DIR:-$MODELS_ROOT/outputs/sft/sokoban_episode_skill_sft_${SOKOBAN_SELF_DIR_SUFFIX}_ep${TOTAL_EPOCHS}_${RUN_ID}}"
 LOG_DIR="${LOG_DIR:-$MODELS_ROOT/logs/sft}"
-LOG_FILE="${LOG_FILE:-$LOG_DIR/sokoban_visual_sft_ep${TOTAL_EPOCHS}_${RUN_ID}.log}"
-EXPORT_MODEL_DIR="${EXPORT_MODEL_DIR:-$MODELS_ROOT/Qwen2.5-VL-3B-Instruct-sokoban-visual-sft}"
+LOG_FILE="${LOG_FILE:-$LOG_DIR/sokoban_episode_skill_sft_${SOKOBAN_SELF_DIR_SUFFIX}_ep${TOTAL_EPOCHS}_${RUN_ID}.log}"
+EXPORT_MODEL_DIR="${EXPORT_MODEL_DIR:-$MODELS_ROOT/Qwen2.5-VL-3B-Instruct-sokoban-episode-skill-sft-${SFT_SELF_SUFFIX}}"
 
 if [[ ! -f "$TRAIN_DATA" ]]; then
     echo "Train parquet not found: $TRAIN_DATA" >&2
@@ -135,5 +135,5 @@ if [[ "$EXPORT_MODEL_AFTER_TRAIN" == "true" ]]; then
         mv "$EXPORT_MODEL_DIR" "$export_backup"
     fi
     mv "$export_tmp" "$EXPORT_MODEL_DIR"
-    echo "Exported visual Sokoban SFT model to $EXPORT_MODEL_DIR"
+    echo "Exported Sokoban episode-skill SFT model to $EXPORT_MODEL_DIR"
 fi

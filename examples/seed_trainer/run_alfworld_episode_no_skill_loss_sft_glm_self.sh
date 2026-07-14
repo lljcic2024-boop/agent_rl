@@ -48,7 +48,7 @@ TEST_FREQ="${TEST_FREQ:-5}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.7}"
 
 export history_length="$HISTORY_LENGTH"
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-seed_qwen2.5_3b_alfworld_sft_glm_self_mean-std-norm_exp1}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-seed_qwen2.5_3b_alfworld_sft_glm_self_mean-std-norm_exp2}"
 if [[ -n "${MODELS_ROOT:-}" ]]; then
     default_local_dir="$MODELS_ROOT/ckpt/$EXPERIMENT_NAME"
 else

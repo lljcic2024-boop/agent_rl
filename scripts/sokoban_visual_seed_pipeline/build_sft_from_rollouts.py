@@ -188,6 +188,7 @@ def build_records_from_candidate_skills(args: argparse.Namespace, candidate_path
             {
                 "prompt": prompt_text,
                 "response": json.dumps(response_payload, ensure_ascii=False),
+                "teacher_model": candidate.get("teacher_model"),
                 "skill_id": candidate.get("skill_id"),
                 "task_id": candidate.get("task_id"),
                 "task_type": candidate.get("task_type", "sokoban"),
@@ -307,9 +308,9 @@ def write_splits(records: List[Dict[str, Any]], args: argparse.Namespace) -> Non
         train_records = val_records
         val_records = []
 
-    train_path = output_dir / "sft_sokoban_visual_train.parquet"
-    val_path = output_dir / "sft_sokoban_visual_val.parquet"
-    all_jsonl = output_dir / "sft_sokoban_visual_all.jsonl"
+    train_path = output_dir / "sft_episode_skill_train.parquet"
+    val_path = output_dir / "sft_episode_skill_val.parquet"
+    all_jsonl = output_dir / "sft_episode_skill_all.jsonl"
     with all_jsonl.open("w", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -324,7 +325,7 @@ def write_splits(records: List[Dict[str, Any]], args: argparse.Namespace) -> Non
         "train_path": str(train_path),
         "val_path": str(val_path),
     }
-    (output_dir / "sft_sokoban_visual_summary.json").write_text(
+    (output_dir / "sft_episode_skill_summary.json").write_text(
         json.dumps(summary, indent=2),
         encoding="utf-8",
     )

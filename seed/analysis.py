@@ -27,6 +27,8 @@ _TASK_DESCRIPTION_PATTERNS = (
     re.compile(r"Your task is:\s*(.+?)(?:\n|$)", re.IGNORECASE | re.DOTALL),
     re.compile(r"Your current task is:\s*(.+?)(?:\n|$)", re.IGNORECASE | re.DOTALL),
     re.compile(r"Your question:\s*(.+?)(?:\n|$)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"Your goal is to\s*(.+?)(?:\n|$)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"You are [^\n]*?\bhelping to\s*(.+?)(?:\n|$)", re.IGNORECASE),
 )
 
 _ANALYSIS_PROMPT_VERSIONS = {

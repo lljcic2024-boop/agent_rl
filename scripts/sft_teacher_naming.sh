@@ -17,6 +17,9 @@ infer_sft_teacher_short() {
         *deepseek*|*deep-seek*|*ds*)
             printf 'ds'
             ;;
+        *gemini*)
+            printf 'gemini'
+            ;;
         *qwen*)
             printf 'qwen'
             ;;

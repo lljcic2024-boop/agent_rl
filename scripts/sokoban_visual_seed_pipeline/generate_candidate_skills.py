@@ -161,6 +161,7 @@ def build_candidate_skill_record(
         parse_ok = False
 
     return {
+        "teacher_model": str(args.skill_model or analyzer.model),
         "skill_id": skill_id,
         "task_id": trajectory.get("task_id", ""),
         "task_type": trajectory.get("task_type", "sokoban"),
@@ -203,7 +204,7 @@ def generate_candidate_skills(
     existing = read_jsonl(path) if args.resume else []
     existing_ids = {str(record.get("skill_id", "")) for record in existing}
     records = list(existing)
-    rollouts = list(baseline_rollouts)
+    rollouts = list(baseline_rollouts)[max(0, int(args.candidate_start)) :]
     if args.max_candidates is not None:
         rollouts = rollouts[: max(0, int(args.max_candidates))]
 
@@ -234,8 +235,13 @@ def generate_candidate_skills(
     return records
 
 
-def write_metrics(records: Sequence[Dict[str, Any]], output_dir: Path) -> None:
+def write_metrics(
+    records: Sequence[Dict[str, Any]],
+    output_dir: Path,
+    teacher_model: Optional[str] = None,
+) -> None:
     payload = {
+        "teacher_model": str(teacher_model or ""),
         "candidate_skills": len(records),
         "parse_ok_skills": sum(1 for record in records if record.get("parse_ok")),
         "parse_error_skills": sum(1 for record in records if not record.get("parse_ok")),
@@ -250,6 +256,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-rollouts", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--candidate-start", type=int, default=0)
     parser.add_argument("--max-candidates", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--regenerate-candidates", action="store_true")
@@ -296,10 +303,11 @@ def main() -> None:
         output_dir=output_dir,
         args=args,
     )
-    write_metrics(records, output_dir)
+    write_metrics(records, output_dir, teacher_model=args.skill_model)
     print(
         json.dumps(
             {
+                "teacher_model": str(args.skill_model or ""),
                 "candidate_skills": len(records),
                 "parse_ok_skills": sum(1 for record in records if record.get("parse_ok")),
                 "output_path": str(output_dir / "candidate_skills.jsonl"),
