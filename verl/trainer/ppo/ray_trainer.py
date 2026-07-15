@@ -644,9 +644,9 @@ class RayPPOTrainer:
         backend = OmegaConf.select(self.config, "algorithm.seed.analysis_backend")
         return str(backend or "") == "policy_vllm"
 
-    def _is_seed_sdar_loss_enabled(self) -> bool:
-        sdar_loss_coef = OmegaConf.select(self.config, "actor_rollout_ref.actor.sdar_loss_coef")
-        return float(sdar_loss_coef or 0.0) > 0.0
+    def _is_seed_opd_loss_enabled(self) -> bool:
+        opd_loss_coef = OmegaConf.select(self.config, "actor_rollout_ref.actor.opd_loss_coef")
+        return float(opd_loss_coef or 0.0) > 0.0
 
     @staticmethod
     def _config_bool(config, key: str, default: bool = False) -> bool:
@@ -2626,17 +2626,17 @@ class RayPPOTrainer:
         step_skill_guided_steps = 0
         teacher_obs_images = self._extract_step_observation_images(batch)
         metrics["seed/teacher_multimodal"] = 1.0 if teacher_obs_images is not None else 0.0
-        sdar_loss_enabled = self._is_seed_sdar_loss_enabled()
+        opd_loss_enabled = self._is_seed_opd_loss_enabled()
         skill_mode = self._get_seed_skill_mode()
         episode_skill_teacher_weight = float(
             OmegaConf.select(self.config, "algorithm.seed.episode_skill_teacher_advantage_w") or 0.0
         )
-        episode_skill_teacher_enabled = episode_skill_teacher_weight > 0.0 or sdar_loss_enabled
+        episode_skill_teacher_enabled = episode_skill_teacher_weight > 0.0 or opd_loss_enabled
         if skill_mode == "step_only":
             episode_skill_teacher_enabled = False
         step_skill_teacher_enabled = (
             float(OmegaConf.select(self.config, "algorithm.seed.step_skill_teacher_advantage_w") or 0.0) > 0.0
-            or sdar_loss_enabled
+            or opd_loss_enabled
         )
         if skill_mode == "episode_only":
             step_skill_teacher_enabled = False
@@ -2644,7 +2644,7 @@ class RayPPOTrainer:
             OmegaConf.select(self.config, "algorithm.seed.skill_teacher_mode") or "step_priority"
         )
         metrics["seed/episode_skill_teacher/enabled"] = 1.0 if episode_skill_teacher_enabled else 0.0
-        metrics["seed/sdar_loss_enabled"] = 1.0 if sdar_loss_enabled else 0.0
+        metrics["seed/opd_loss_enabled"] = 1.0 if opd_loss_enabled else 0.0
         metrics["seed/episode_skill_teacher_skipped_zero_weight"] = (
             0.0 if episode_skill_teacher_enabled else 1.0
         )
@@ -3076,10 +3076,10 @@ class RayPPOTrainer:
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.SEED:
                         seed_teacher_schedule_enabled = self._is_seed_teacher_signal_enabled()
                         seed_analysis_enabled = self._is_seed_analysis_enabled()
-                        seed_sdar_loss_enabled = self._is_seed_sdar_loss_enabled()
+                        seed_opd_loss_enabled = self._is_seed_opd_loss_enabled()
                         seed_skill_gen_enabled = self._is_seed_skill_gen_enabled()
                         seed_teacher_signal_enabled = seed_teacher_schedule_enabled and seed_analysis_enabled
-                        seed_teacher_adv_enabled = seed_teacher_signal_enabled and not seed_sdar_loss_enabled
+                        seed_teacher_adv_enabled = seed_teacher_signal_enabled and not seed_opd_loss_enabled
                         seed_policy_vllm_backend = self._is_seed_policy_vllm_backend()
                     # generate a batch
                     with _timer("gen", timing_raw):
@@ -3131,7 +3131,7 @@ class RayPPOTrainer:
                         metrics["seed/teacher_enabled"] = 1.0 if seed_teacher_signal_enabled else 0.0
                         metrics["seed/teacher_signal_enabled"] = 1.0 if seed_teacher_signal_enabled else 0.0
                         metrics["seed/teacher_advantage_enabled"] = 1.0 if seed_teacher_adv_enabled else 0.0
-                        metrics["seed/sdar_loss_enabled"] = 1.0 if seed_sdar_loss_enabled else 0.0
+                        metrics["seed/opd_loss_enabled"] = 1.0 if seed_opd_loss_enabled else 0.0
                         metrics["seed/skill_gen_enabled"] = 1.0 if seed_skill_gen_enabled else 0.0
                         metrics["seed/teacher_disabled_by_schedule"] = 0.0 if seed_teacher_schedule_enabled else 1.0
                         metrics["seed/teacher_disabled_by_analysis"] = (

@@ -2,574 +2,437 @@
 
 ## 摘要
 
-本文档说明当前仓库中 SEED 算法的实现形态、数学目标和训练流程。当前
-SEED 是一种面向多步智能体任务的 critic-free on-policy 优化方法。它以
-GRPO 风格的组内 episode-relative advantage 为基础，并引入由大模型轨迹
-分析产生的 hindsight skill。需要强调的是，分析大模型不直接给 reward
-或 value；它只把一条完整轨迹总结为 `episode_skill` 和若干 `step_skills`。
-训练器随后将这些 skill 注入当前 observation，并用当前策略重新计算“原始
-动作”在增强 prompt 下的 log-prob。增强 prompt 与原始 prompt 的
-log-prob 差值构成 token-level teacher advantage。
+本文档根据论文 `ICLR_27_SEED (3).pdf` 更新当前仓库中 SEED 的算法说明。
+论文版 SEED 全称为 **SElf-Evolving On-Policy Distillation**，核心目标是在
+长程 agentic RL 中，把完整轨迹结束后才能看到的 hindsight 信息转化为
+token-level 训练信号，同时避免在推理阶段依赖额外 skill prompt、检索库或外部
+分析器。
 
-在当前打开的 AlfWorld 启动脚本
-[`examples/seed_trainer/run_alfworld_seed_guide.sh`](../../examples/seed_trainer/run_alfworld_seed_guide.sh)
-中，实际运行的是 episode-level SEED：
+SEED 有两个阶段：
 
-- `algorithm.adv_estimator=seed`
-- `algorithm.seed.mode=mean_norm`
-- `algorithm.seed.step_advantage_w=0.0`
-- `algorithm.seed.episode_skill_teacher_advantage_w=0.001`
-- `algorithm.seed.step_skill_teacher_advantage_w=0.001`
+1. **Hindsight Skill SFT**：先收集普通 agent 轨迹，用外部 analyzer 为完整轨迹
+   生成 episode-level hindsight skill，再 SFT 当前 backbone，使其具备“读完整
+   轨迹并总结 skill”的能力。
+2. **Self-Evolving OPD**：RL 时，冻结的当前策略快照既负责采样 on-policy 轨迹，
+   也作为同步 analyzer 总结这些轨迹。随后训练中的策略在普通上下文和
+   skill-augmented 上下文下对同一批 sampled action tokens 重新打分，用
+   skill-induced log-prob shift 构造 gated OPD loss，并与 GRPO loss 联合优化。
 
-因此，当前训练主要由 episode outcome relative advantage 驱动，LLM
-hindsight teacher signal 作为小权重的 shaping 项进入 PPO advantage。
+最重要的推理侧结论是：**SEED 的 skill 只在训练时作为 privileged supervision
+使用，推理时只部署普通 policy**。
 
-## 1. 问题定义
+## 1. 论文核心 Idea
 
-考虑一个多步文本环境。训练器从数据集中采样一批原始任务 prompt，并对每个
-prompt 采样 \(K\) 条 on-policy 轨迹。在实现中，同一个原始任务的多个
-rollout 共享 `uid`，每条具体轨迹有独立的 `traj_uid`。第 \(g\) 个任务组中
-第 \(k\) 条轨迹记为：
+SEED 针对长程 agentic RL 的三个问题设计：
 
-$$
-\tau_{g,k}
-=
-\{(o_{g,k,t}, y_{g,k,t}, r_{g,k,t})\}_{t=0}^{T_{g,k}-1}.
-$$
+| 需求 | SEED 的对应机制 |
+| --- | --- |
+| on-policy | 轨迹由当前策略快照采样，skill 也由同一快照分析得到 |
+| dense | 同一 action token 在普通上下文和 skill 上下文下重新打分，形成 token-level OPD 信号 |
+| self-evolving | 每轮更新后，actor 和 analyzer 都随最新 checkpoint 同步刷新 |
 
-其中 \(o_{g,k,t}\) 是第 \(t\) 步 observation，\(y_{g,k,t}\) 是策略生成的
-文本动作或响应，\(r_{g,k,t}\) 是环境在该步返回的标量 reward。响应
-\(y_{g,k,t}\) 是 token 序列：
+直观地说，episode reward 只能告诉我们一条轨迹最后成功或失败；完整轨迹中的
+hindsight skill 则能指出“成功 workflow”“关键观察”“失败规避规则”。SEED 不把
+这些 skill 当作推理 prompt，而是把 skill 对当前策略行为概率的影响蒸馏进模型
+参数。
 
-$$
-y_{g,k,t}
-=
-(y_{g,k,t,1}, \ldots, y_{g,k,t,L_{g,k,t}}).
-$$
+## 2. 当前代码路径说明
 
-SEED 的目标是在稀疏、延迟且高方差的 agent reward 场景下，保留
-GRPO-like critic-free 训练的稳定性，同时利用完整轨迹的 hindsight 信息
-为关键决策提供更细粒度的 token-level 更新信号。
+当前仓库保留论文使用的 SFT + self-evolving OPD 主路径：
 
-## 2. 整体算法草图
-
-```mermaid
-flowchart TD
-    A[Prompt batch] --> B[Grouped multi-turn rollout]
-    B --> C[Trajectory records]
-    B --> D[Episode rewards and discounted step returns]
-    C --> E[LLM episode analyzer]
-    E --> F[episode_skill and step_skills]
-    F --> G[Augmented observations]
-    G --> H[Re-score original responses]
-    H --> I[Teacher log-prob delta]
-    D --> J[Episode relative advantage]
-    D --> K[Optional state-relative step advantage]
-    J --> L[Fused SEED advantage]
-    K --> L
-    I --> L
-    L --> M[PPO actor update]
-```
-
-这张图对应当前代码的主路径：先做 grouped rollout，再重建轨迹并请求 LLM
-生成 hindsight skill；之后用增强 observation 重新打分原始 response，
-将 log-prob delta 与 episode advantage 融合，最后使用 PPO actor loss
-更新策略。
-
-## 3. 符号表
-
-| 符号 | 含义 | 实现字段 |
+| 路径 | 典型脚本 | 说明 |
 | --- | --- | --- |
-| \(g\) | 原始任务组或 prompt group | `uid` |
-| \(k\) | 同组内第 \(k\) 条 rollout | 由重复采样隐式表示 |
-| \(t\) | 环境步编号 | `step_idx`, `step_num` |
-| \(\tau_{g,k}\) | 一条完整采样轨迹 | `traj_uid` |
-| \(o_{g,k,t}\) | 第 \(t\) 步 observation | `obs_text`, `obs_text_base` |
-| \(y_{g,k,t}\) | 第 \(t\) 步 response/action tokens | `responses` |
-| \(R_{g,k}\) | episode outcome score | `episode_rewards` |
-| \(G_{g,k,t}\) | discounted step return | `step_rewards` |
-| \(m_{i,\ell}\) | 第 \(i\) 个样本第 \(\ell\) 个 response token 的有效 mask | `response_mask` |
-| \(\ell^{old}\) | 原始 prompt 下的 token log-prob | `old_log_probs` |
-| \(\ell^{ep}\) | episode skill 增强 prompt 下的 token log-prob | `episode_teacher_log_prob` |
-| \(\ell^{step}\) | step skill 增强 prompt 下的 token log-prob | `step_teacher_log_prob` |
+| 论文主路径 | `examples/seed_trainer/run_*_sft*.sh` | 从 hindsight-skill SFT checkpoint 初始化 policy 和 `policy_vllm` analyzer，用 `opd_loss_coef` 启用 gated OPD loss |
 
-下文使用 \(i\) 表示 flatten 后的 rollout-step 样本索引。一个完整轨迹会被
-展开为多个训练样本，每个样本对应环境中的一个决策步。
+启动脚本名已省略历史字段 `episode_no_skill_loss`。它表示默认不启用额外的
+skill-generation LM auxiliary loss，并不表示关闭论文式 OPD loss；OPD 仍通过
+`actor_rollout_ref.actor.opd_loss_coef=0.01` 启用。
 
-## 4. Rollout 与 reward 构造
+## 3. Stage 1: Hindsight Skill SFT
 
-多步 rollout 由
-[`agent_system/multi_turn_rollout/rollout_loop.py`](../../agent_system/multi_turn_rollout/rollout_loop.py)
-实现。对每个原始 prompt，环境被重复采样 `env.rollout.n` 次。当前 AlfWorld
-脚本中该值为 8，因此每个任务组最多包含 8 条轨迹。rollout loop 在每一步：
-
-1. 根据当前 observation 构造模型输入；
-2. 由 actor 生成文本动作；
-3. 将动作提交给环境；
-4. 记录 reward、done、action validity、`uid`、`traj_uid` 和 step metadata；
-5. 若所有环境均结束，则停止该批次 rollout。
-
-rollout 结束后，`gather_rollout_data` 将所有 active step 展平成一个训练
-batch。episode reward 由
-[`agent_system/reward_manager/episode.py`](../../agent_system/reward_manager/episode.py)
-写入每个 response 的最后一个有效 token，因此对 token-level reward 求和可
-恢复该样本的 episode outcome score。
-
-对于 SEED 和 GiGPO，训练器还会计算 discounted step return：
+论文中每个 benchmark 选择 180 个 SFT 任务，每个任务采样 8 条 rollout，总计
+1,440 条完整轨迹：
 
 $$
-G_{g,k,t}
-=
-\sum_{u=t}^{T_{g,k}-1}
-\gamma^{u-t} r_{g,k,u}.
+B_j = \{\tau_{j,k}\}_{k=1}^{K_0}, \quad K_0=8.
 $$
 
-当前 AlfWorld 脚本设置 `algorithm.gamma=0.95`。对应实现为
-[`gigpo/core_gigpo.py`](../../gigpo/core_gigpo.py) 中的
-`compute_step_discounted_returns`。
-
-## 5. Episode-level relative advantage
-
-令 \(S_i\) 为 flatten 后第 \(i\) 个样本的 outcome score。样本 \(i\) 属于
-任务组 \(g(i)\)。SEED 首先计算组内相对 episode advantage。
-
-在当前 `mean_norm` 模式下：
+每条轨迹包含 task description、observations、actions、rewards 和 final outcome。
+外部 analyzer 对完整轨迹生成 episode-level skill：
 
 $$
-A^{ep}_i
-=
-S_i - \mu_{g(i)},
+s_\tau = A_{\text{ext}}(\tau).
 $$
 
-其中
-
-$$
-\mu_g
-=
-\frac{1}{|\mathcal{I}_g|}
-\sum_{j \in \mathcal{I}_g} S_j.
-$$
-
-\(\mathcal{I}_g\) 表示属于同一 `uid` 的 flatten 样本集合。注意当前实现
-默认跨 trajectory step 计算均值，即同一轨迹中的多个 step 也会参与该组
-baseline 的估计。这与 `episode_norm_reward` 中
-`compute_mean_std_cross_steps=True` 的默认行为一致。
-
-若使用 `mean_std_norm`，则 advantage 会进一步除以组内标准差：
-
-$$
-A^{ep}_i
-=
-\frac{S_i - \mu_{g(i)}}{\sigma_{g(i)} + \epsilon}.
-$$
-
-最后，标量 advantage 被广播到每个有效 response token：
-
-$$
-A^{ep}_{i,\ell}
-=
-A^{ep}_i \cdot m_{i,\ell}.
-$$
-
-这一部分由
-[`gigpo/core_gigpo.py`](../../gigpo/core_gigpo.py) 中的
-`episode_norm_reward` 和 `compute_seed_advantage_components` 实现。
-
-## 6. 可选的 state-relative step advantage
-
-SEED 可以复用 GiGPO 的 state grouping 机制。当
-`algorithm.seed.step_advantage_w` 非零时，训练器会在同一个 `uid` 内按照
-`anchor_obs` 对 observation 进行分组。每个 state group 内使用 discounted
-step return 计算 step-level relative advantage：
-
-$$
-A^{step}_i
-=
-G_i - \bar{G}_{c(i)},
-$$
-
-其中 \(c(i)\) 是样本 \(i\) 所属的 state group。若启用 `mean_std_norm`：
-
-$$
-A^{step}_i
-=
-\frac{G_i - \bar{G}_{c(i)}}{\sigma_{c(i)}+\epsilon}.
-$$
-
-不过在当前 AlfWorld SEED 脚本中：
-
-$$
-w_{step}=0.
-$$
-
-因此该项不会进入最终 advantage。episode-level SEED 的配置校验也要求
-`step_advantage_w=0.0`。
-
-## 7. Hindsight Skill 生成
-
-SEED 会把每条 `traj_uid` 对应的 step 重新组装为有序轨迹记录，每个 step
-包含：
-
-```text
-step_index
-observation
-observation_prompt
-response
-step_reward
-task_description
-```
-
-轨迹分析由
-[`seed/analysis.py`](../../seed/analysis.py) 中的 `SEEDEpisodeAnalyzer`
-完成。它调用 OpenAI-compatible backend，并要求 LLM 返回合法 JSON：
+成功轨迹的 skill 应总结可复用 workflow；失败轨迹的 skill 应总结 avoidance
+rule。论文 prompt 要求输出合法 JSON：
 
 ```json
 {
   "episode_summary": "string",
-  "episode_skill": "string",
-  "step_skills": {
-    "0": "skill for step 0",
-    "2": "skill for step 2"
-  }
+  "episode_skill": "string"
 }
 ```
 
-当前 prompt 设计区分成功和失败轨迹：
+通过格式校验后的样本组成：
 
-- 若 episode 成功，`episode_skill` 应抽象为可复用 workflow；
-- 若 episode 失败，`episode_skill` 应抽象为 avoidance rule；
-- `step_skills` 是面向策略的短 imperative skills，用于少量关键步。
+$$
+D_{\text{sft}} = \{(x_\tau, s_\tau): v_\tau=1\},
+$$
 
-当前 AlfWorld 脚本设置
-`algorithm.seed.analysis_max_step_skills_per_traj=5`，所以每条轨迹最多保留
-5 个 step-level skills。若 LLM 输出 JSON 解析失败，分析器会重试；若最终仍
-失败或缺少必需字段，该轨迹不会产生 teacher signal。
+其中 \(x_\tau\) 是序列化后的 trajectory-analysis input。SFT 目标是标准
+negative log-likelihood：
 
-## 8. Observation 增强与 teacher scoring
+$$
+L_{\text{sft}}(\theta)
+= -\mathbb{E}_{(x_\tau,s_\tau)\sim D_{\text{sft}}}
+\sum_\ell \log \pi_\theta(s_{\tau,\ell}\mid x_\tau,s_{\tau,<\ell}).
+$$
 
-对每条成功分析的轨迹，普通 SEED 会将该轨迹中的所有 step 视为可进行
-hindsight teacher scoring 的样本。具体使用哪一种 skill 由如下规则决定：
+SFT 后的 checkpoint 既作为后续 RL actor，也作为后续同步 trajectory analyzer
+的初始化。
 
-1. 如果当前 step 有非空 `step_skill`，且
-   `step_skill_teacher_advantage_w > 0`，则使用 step-level skill；
-2. 否则，如果 episode-level teacher 权重大于 0，则使用 `episode_skill`；
-3. 若两类权重均为 0，则该 step 不产生 teacher log-prob。
+对应脚本：
 
-skill 注入逻辑位于
-[`seed/prompting.py`](../../seed/prompting.py)。
-增强 observation 的文本形态为：
+```bash
+# ALFWorld
+bash scripts/sft/alfworld/prepare_data.sh
+bash scripts/sft/alfworld/train_sft.sh
 
-```text
-Episode-Level Skill
-Refer to this episode-level skill when deciding what action to take in the current episode:
-[...]
+# WebShop
+bash scripts/sft/webshop/prepare_data.sh
+bash scripts/sft/webshop/train_sft.sh
 
-Critical-Step Skill
-Use this current-step skill for this decision only:
-[...]
+# Search-based QA
+bash scripts/sft/search/prepare_data.sh
+bash scripts/sft/search/train_sft.sh
+
+# EZPoints
+bash scripts/sft/ezpoints/prepare_data.sh
+bash scripts/sft/ezpoints/train_sft.sh
+
+# Sokoban
+bash scripts/sft/sokoban/prepare_data.sh
+bash scripts/sft/sokoban/train_sft.sh
 ```
 
-令 \(h^{ep}(o_i)\) 表示插入 episode skill 后的 observation，
-\(h^{step}(o_i)\) 表示插入 step skill 后的 observation。训练器不会重新采样
-动作，而是计算原始 response 在增强 prompt 下的 log-prob：
+## 4. Stage 2: Self-Evolving OPD
+
+在第 \(k\) 轮 policy update 开始时，SEED 冻结当前策略为
+\(\pi_{\theta_{\text{old}}}\)。这个快照承担两个角色：
+
+1. actor：在环境中采样 on-policy trajectories；
+2. analyzer：读取完整轨迹并生成 hindsight skill。
+
+对于任务 \(q\)，采样 \(N\) 条轨迹：
 
 $$
-\ell^{ep}_{i,\ell}
+G_q = \{\tau_q^{(1)},\ldots,\tau_q^{(N)}\},\quad
+\tau_q^{(n)} \sim \pi_{\theta_{\text{old}}}(\cdot\mid q).
+$$
+
+论文和主要脚本均使用 rollout group size \(N=8\)。同步 analyzer 生成：
+
+$$
+s_q^{(n)} = A_{\theta_{\text{old}}}(x_{\tau_q^{(n)}}).
+$$
+
+这形成 self-evolving loop：策略越强，采样到的轨迹分布会变化；同一个 checkpoint
+的分析能力也会随训练一起变化，因此 hindsight supervision 不会长期停留在旧
+策略或静态 skill 库上。
+
+## 5. Skill-Augmented Re-Scoring
+
+令 \(h_{q,n,t}\) 表示第 \(n\) 条轨迹第 \(t\) 步的普通 interaction history，
+\(a_{q,n,t}\) 是已采样出的 action token 序列。SEED 不重新采样动作，而是把
+episode skill 插入上下文：
+
+$$
+\tilde{h}_{q,n,t}=H(h_{q,n,t},s_q^{(n)}).
+$$
+
+训练中的当前策略 \(\pi_\theta\) 对同一批 sampled action tokens 计算两种
+log-prob：
+
+$$
+\ell^{\text{skill}}_{q,n,t,\ell}
+=\log\pi_\theta(a_{q,n,t,\ell}\mid \tilde{h}_{q,n,t},a_{q,n,t,<\ell}),
+$$
+
+$$
+\ell^\theta_{q,n,t,\ell}
+=\log\pi_\theta(a_{q,n,t,\ell}\mid h_{q,n,t},a_{q,n,t,<\ell}).
+$$
+
+两条分支共享同一个模型参数，但 teacher branch 看到 hindsight skill，student
+branch 只看到普通上下文。梯度只通过普通 student branch。
+
+skill-induced log-prob shift 定义为：
+
+$$
+\Delta_{q,n,t,\ell}
+=\operatorname{sg}\left[
+\ell^{\text{skill}}_{q,n,t,\ell}
+-\ell^\theta_{q,n,t,\ell}
+\right],
+$$
+
+其中 \(\operatorname{sg}\) 表示 stop-gradient。再用 sigmoid gate 控制 OPD
+强度：
+
+$$
+g_{q,n,t,\ell}=\sigma(\beta_{\text{opd}}\Delta_{q,n,t,\ell}).
+$$
+
+论文默认 \(\beta_{\text{opd}}=5.0\)。
+
+OPD loss 为：
+
+$$
+L_{\text{opd}}(\theta)
 =
-\log \pi_{\theta_{old}}
-\left(
-y_{i,\ell}
-\mid
-h^{ep}(o_i), y_{i,<\ell}
-\right),
-$$
-
-$$
-\ell^{step}_{i,\ell}
-=
-\log \pi_{\theta_{old}}
-\left(
-y_{i,\ell}
-\mid
-h^{step}(o_i), y_{i,<\ell}
-\right).
-$$
-
-原始 prompt 下的 log-prob 为：
-
-$$
-\ell^{old}_{i,\ell}
-=
-\log \pi_{\theta_{old}}
-\left(
-y_{i,\ell}
-\mid
-o_i, y_{i,<\ell}
-\right).
-$$
-
-因此，这里的 teacher 不是独立专家模型，而是“同一个当前策略在更强上下文
-prompt 下的条件概率”。这使 SEED 更接近一种 prompt-conditioned
-self-distillation。
-
-## 9. Teacher advantage
-
-teacher advantage 定义为增强 prompt log-prob 与原始 prompt log-prob 的差：
-
-$$
-\Delta^{ep}_{i,\ell}
-=
-\left(
-\ell^{ep}_{i,\ell}
--
-\ell^{old}_{i,\ell}
-\right)
-\cdot m_{i,\ell}
-\cdot q^{ep}_i,
-$$
-
-$$
-\Delta^{step}_{i,\ell}
-=
-\left(
-\ell^{step}_{i,\ell}
--
-\ell^{old}_{i,\ell}
-\right)
-\cdot m_{i,\ell}
-\cdot q^{step}_i.
-$$
-
-其中 \(q^{ep}_i\) 和 \(q^{step}_i\) 是样本级 mask，分别表示该样本是否使用
-episode skill 或 step skill 进行 teacher scoring。若 \(\Delta>0\)，表示
-hindsight skill 使原始动作更可能，PPO 更新会更倾向于强化该动作；若
-\(\Delta<0\)，则表示 skill 认为该动作在增强上下文下更不合理，对应产生
-抑制作用。
-
-实现函数为
-[`gigpo/core_gigpo.py`](../../gigpo/core_gigpo.py) 中的
-`compute_teacher_token_advantage`。该函数还支持可选归一化和截断：
-
-- `algorithm.seed.normalize_teacher_adv`
-- `algorithm.seed.clip_teacher_adv`
-
-当前 AlfWorld 脚本设置 `normalize_teacher_adv=False`，且未启用
-`clip_teacher_adv`。
-
-## 10. 最终 SEED advantage
-
-SEED 的最终 token-level advantage 为：
-
-$$
-A^{SEED}_{i,\ell}
-=
-A^{ep}_{i,\ell}
-+
-w_{step} A^{step}_{i,\ell}
-+
-w_{ep} \Delta^{ep}_{i,\ell}
-+
-w_{stepSkill} \Delta^{step}_{i,\ell}.
-$$
-
-当前 AlfWorld 脚本对应：
-
-$$
-w_{step}=0,\quad
-w_{ep}=10^{-3},\quad
-w_{stepSkill}=10^{-3}.
-$$
-
-因此实际生效的形式为：
-
-$$
-A^{SEED}_{i,\ell}
-=
-A^{ep}_{i,\ell}
-+
-10^{-3}\Delta^{ep}_{i,\ell}
-+
-10^{-3}\Delta^{step}_{i,\ell}.
-$$
-
-该融合逻辑位于
-[`gigpo/core_gigpo.py`](../../gigpo/core_gigpo.py) 中的
-`compute_seed_outcome_advantage` 和 `compute_seed_advantage_components`。
-
-## 11. PPO 目标
-
-得到 \(A^{SEED}\) 后，训练器使用标准 PPO actor update。令：
-
-$$
-\rho_{i,\ell}(\theta)
-=
-\exp
-\left(
-\log \pi_{\theta}(y_{i,\ell}\mid o_i,y_{i,<\ell})
--
-\log \pi_{\theta_{old}}(y_{i,\ell}\mid o_i,y_{i,<\ell})
-\right).
-$$
-
-PPO clipped objective 可写为：
-
-$$
-\mathcal{L}_{policy}(\theta)
-=
--
-\mathbb{E}_{i,\ell}
+\mathbb{E}_{q,n,t,\ell}
 \left[
-\min
+m_{q,n,t,\ell}\,
+g_{q,n,t,\ell}\,
 \left(
-\rho_{i,\ell}(\theta) A^{SEED}_{i,\ell},
-\operatorname{clip}
-(\rho_{i,\ell}(\theta),1-\epsilon,1+\epsilon)
-A^{SEED}_{i,\ell}
+\operatorname{sg}[\ell^{\text{skill}}_{q,n,t,\ell}]
+-\ell^\theta_{q,n,t,\ell}
 \right)
 \right].
 $$
 
-当前 AlfWorld 脚本还启用了 actor KL loss：
+由于 gate 和 teacher log-prob 都 detached，该目标等价于 gate-weighted NLL：
+skill 支持的 token 会得到更强蒸馏，skill 不支持的 token 影响会被 attenuate。
 
-- `actor_rollout_ref.actor.use_kl_loss=True`
-- `actor_rollout_ref.actor.kl_loss_coef=0.01`
-- `actor_rollout_ref.actor.kl_loss_type=low_var_kl`
+对应实现入口：
 
-此外，旧的 signed auxiliary OPD loss 路径已移除。若需要额外的
-distillation loss，当前实现使用 SDAR-style gated auxiliary loss：
-[`verl/trainer/ppo/core_algos.py`](../../verl/trainer/ppo/core_algos.py) 的
-`compute_sdar_loss`，以及
-[`verl/workers/actor/dp_actor.py`](../../verl/workers/actor/dp_actor.py) 的
-actor update。
+- [`verl/trainer/ppo/core_algos.py`](../../verl/trainer/ppo/core_algos.py) 的
+  `compute_opd_loss`
+- [`verl/workers/actor/dp_actor.py`](../../verl/workers/actor/dp_actor.py) 的
+  actor update
+- [`verl/trainer/ppo/ray_trainer.py`](../../verl/trainer/ppo/ray_trainer.py) 的
+  SEED analysis、teacher/OPD signal 构造
 
-## 12. 算法伪代码
+## 6. 与 GRPO 的联合目标
 
-```text
-Algorithm: One SEED training step
+SEED 保留 group-relative RL objective。对同一任务组 \(G_q\)，计算 trajectory
+outcome 的均值和标准差：
 
-Input:
-  policy pi_theta
-  grouped prompt batch B
-  rollout group size K
-  environment E
-  discount gamma
-  weights w_step, w_ep, w_stepSkill
+$$
+\mu_q=\frac{1}{N}\sum_{n=1}^N R(\tau_q^{(n)}),\quad
+\sigma_q=
+\sqrt{
+\frac{1}{N}\sum_{n=1}^N
+\left(R(\tau_q^{(n)})-\mu_q\right)^2
+}.
+$$
 
-1. Run grouped multi-turn rollout.
-   For each prompt group g and rollout k:
-     collect tau_{g,k}
-     store uid, traj_uid, observations, responses, rewards
+trajectory-level advantage 为：
 
-2. Construct rewards.
-   Put episode score on the last valid response token.
-   Compute discounted step return G_{g,k,t}.
+$$
+A^{\text{rl}}_{q,n}
+=
+\frac{R(\tau_q^{(n)})-\mu_q}{\sigma_q+\epsilon}.
+$$
 
-3. Run SEED analysis if enabled.
-   Reconstruct each traj_uid into ordered step records.
-   Send the trajectory to SEEDEpisodeAnalyzer.
-   Parse episode_summary, episode_skill, step_skills.
-   Drop trajectories with invalid JSON or missing required skills.
+该 advantage broadcast 到该 trajectory 的有效 action tokens。PPO/GRPO ratio 为：
 
-4. Build augmented observations.
-   For each analyzed step:
-     if step_skill exists and w_stepSkill > 0:
-       insert Critical-Step Skill
-       mark q_step = 1
-     else if episode_skill is enabled:
-       insert Episode-Level Skill
-       mark q_ep = 1
+$$
+\rho_{q,n,t,\ell}(\theta)
+=
+\exp\left(
+\ell^\theta_{q,n,t,\ell}
+-\ell^{\text{old}}_{q,n,t,\ell}
+\right).
+$$
 
-5. Re-score original responses.
-   Compute old_log_probs under original observations.
-   Compute teacher log-probs under augmented observations.
-   Delta = teacher_log_prob - old_log_prob.
+最终目标：
 
-6. Compute fused SEED advantage.
-   A_ep = group-relative episode advantage.
-   A_step = optional state-relative step advantage.
-   A_SEED = A_ep
-            + w_step * A_step
-            + w_ep * Delta_ep
-            + w_stepSkill * Delta_step.
+$$
+L_{\text{SEED}}(\theta)
+=
+L_{\text{rl}}(\theta)
++
+\lambda_{\text{opd}} L_{\text{opd}}(\theta).
+$$
 
-7. Update actor with PPO.
-   Use A_SEED in the clipped PPO objective.
-   Add KL loss if configured.
-   Add SDAR-style auxiliary distillation loss only if sdar_loss_coef > 0.
-```
+论文默认 \(\lambda_{\text{opd}}=0.01\)，KL coefficient 为 \(0.01\)。
 
-## 13. 当前 AlfWorld 配置解读
+## 7. 推理阶段
 
-| 配置项 | 当前值 | 作用 |
-| --- | --- | --- |
-| `env.env_name` | `alfworld/AlfredTWEnv` | 使用文本版 AlfWorld 环境 |
-| `env.rollout.n` | `8` | 每个 prompt group 采样 8 条轨迹 |
-| `algorithm.gamma` | `0.95` | discounted step return 的折扣因子 |
-| `algorithm.adv_estimator` | `seed` | 使用 SEED advantage estimator |
-| `algorithm.seed.mode` | `mean_norm` | 组内只减均值，不除标准差 |
-| `algorithm.seed.step_advantage_w` | `0.0` | 关闭 GiGPO step advantage |
-| `algorithm.seed.episode_skill_teacher_advantage_w` | `0.001` | episode-skill teacher signal 独立权重 |
-| `algorithm.seed.step_skill_teacher_advantage_w` | `0.001` | step-skill teacher signal 独立权重 |
-| `algorithm.seed.enable_analysis` | `True` | 开启 LLM 轨迹分析 |
-| `algorithm.seed.selector` | `llm` | 使用 LLM JSON analyzer |
-| `algorithm.seed.analysis_backend` | `openai` | 使用 OpenAI-compatible 后端 |
-| `algorithm.seed.analysis_num_workers` | `128` | 并发分析轨迹 |
-| `algorithm.seed.analysis_max_step_skills_per_traj` | `5` | 每条轨迹最多保留 5 个 step skills |
-| `algorithm.seed.failed_only` | `False` | 成功和失败轨迹都分析 |
-| `algorithm.seed.opd_start_after_steps` | `null` | 从训练开始即允许 teacher signal |
-| `algorithm.seed.opd_stop_after_steps` | `null` | 不设置 teacher signal 停止步数 |
-| `actor_rollout_ref.actor.sdar_loss_coef` | `0.0` | 默认不使用 SDAR-style auxiliary distillation loss |
+SEED 推理时只使用普通交互历史：
 
-## 14. 实现映射
+$$
+a_t \sim \pi_\theta(\cdot\mid h_t).
+$$
+
+不需要：
+
+- trajectory analyzer；
+- skill bank；
+- skill retrieval；
+- 额外 skill prompt；
+- privileged context。
+
+这也是 SEED 与 Skill-Prompt、Skill-GRPO* 等方法的关键区别：后者在评测时仍
+依赖 skill context，而 SEED 将 skill 的行为作用内化到参数中。
+
+## 8. 主要实验数据
+
+下表汇总论文 Table 1 中 GRPO 与 SEED 的 aggregate 对比。每个单元格为
+`GRPO -> SEED (+gain)`。
+
+| Backbone | ALFWorld Avg. | Search-QA Avg. | WebShop Score | WebShop Succ. |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen2.5-3B-Instruct | 75.0 -> 91.8 (+16.8) | 36.4 -> 45.7 (+9.3) | 79.8 -> 88.5 (+8.7) | 63.3 -> 78.9 (+15.6) |
+| Qwen2.5-7B-Instruct | 81.2 -> 96.1 (+14.9) | 42.0 -> 48.6 (+6.6) | 80.9 -> 89.7 (+8.8) | 72.6 -> 78.1 (+5.5) |
+| Qwen3-1.7B-Instruct | 46.1 -> 92.0 (+45.9) | 40.8 -> 42.2 (+1.4) | 67.3 -> 87.1 (+19.8) | 38.3 -> 77.3 (+39.0) |
+
+论文还报告：
+
+- 相比 GRPO，SEED 在三种 backbone 上分别带来 ALFWorld +14.9 到 +45.9、
+  Search-QA +1.4 到 +9.3、WebShop Score +8.7 到 +19.8、WebShop Success
+  +5.5 到 +39.0 的提升。
+- Skill-Prompt 和 Skill-GRPO* 在评测时插入 skill，但 SEED 在不使用推理
+  skill prompt 的情况下，仍在绝大多数 aggregate 指标上更强。
+- 在 ALFWorld，Qwen2.5-3B 的 SEED 为 91.8，高于 SDAR 的 84.4 和
+  GRPO+OPSD 的 81.2。
+
+## 9. 样本效率、泛化与消融
+
+### 样本效率
+
+论文 Table 6 显示，SEED 在不同训练数据比例下均超过 GRPO：
+
+| Benchmark | Data | GRPO | SEED | Gain |
+| --- | ---: | ---: | ---: | ---: |
+| ALFWorld | 20% | 27.3 | 40.7 | +13.4 |
+| ALFWorld | 40% | 42.2 | 58.9 | +16.7 |
+| ALFWorld | 60% | 56.3 | 80.7 | +24.4 |
+| ALFWorld | 80% | 58.6 | 88.8 | +30.2 |
+| ALFWorld | 100% | 75.0 | 91.8 | +16.8 |
+| WebShop | 20% | 31.3 | 37.5 | +6.2 |
+| WebShop | 40% | 45.3 | 53.1 | +7.8 |
+| WebShop | 60% | 57.0 | 62.5 | +5.5 |
+| WebShop | 80% | 63.6 | 75.0 | +11.4 |
+| WebShop | 100% | 63.3 | 78.9 | +15.6 |
+
+关键结论：ALFWorld 上 SEED 用 60% 数据达到 80.7，已经超过 full-data GRPO
+的 75.0。
+
+### ALFWorld Unseen 泛化
+
+论文 Table 7 中，Qwen2.5-3B 在 ALFWorld unseen split 上：
+
+| Method | Pick | Look | Clean | Heat | Cool | Pick2 | Avg. |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| GRPO | 73.9 | 60.0 | 82.4 | 59.3 | 72.7 | 76.9 | 70.9 |
+| SEED | 90.4 | 78.3 | 79.5 | 94.3 | 86.2 | 88.2 | 86.2 |
+| Gain | +16.5 | +18.3 | -2.9 | +35.0 | +13.5 | +11.3 | +15.3 |
+
+SEED 在 6 个 unseen task family 中 5 个超过 GRPO，平均提升 15.3。
+
+### 消融
+
+论文 Table 2 的 ALFWorld 消融：
+
+| Variant | Avg. | Drop |
+| --- | ---: | ---: |
+| SEED | 91.8 | 0.0 |
+| w/o Hindsight Skill SFT | 86.0 | -5.8 |
+| w/o Self-Evolving OPD | 87.0 | -4.8 |
+| w/o On-Policy Skill | 84.4 | -7.4 |
+
+这说明三点都重要：SFT 初始化、持续 OPD 蒸馏、以及从当前策略轨迹中生成
+on-policy skill。
+
+### 视觉 agent 扩展
+
+论文 Table 8 在 Qwen2.5-VL-3B-Instruct 上报告：
+
+| Method | Sokoban 6x6 | EZPoints |
+| --- | ---: | ---: |
+| GRPO | 67.1 | 86.9 |
+| SEED | 82.0 | 100.0 |
+| Gain | +14.9 | +13.1 |
+
+## 10. 关键配置
+
+论文和当前 paper-style 脚本的关键配置如下：
+
+| 配置项 | 值 |
+| --- | --- |
+| SFT tasks | 180 per benchmark |
+| SFT rollouts per task | 8 |
+| SFT trajectories | 1,440 |
+| SFT epochs | 3 |
+| RL updates | 150 in paper; current scripts commonly set `trainer.total_epochs=160` |
+| Rollout group size | `env.rollout.n=8` |
+| OPD coefficient | `actor_rollout_ref.actor.opd_loss_coef=0.01` |
+| OPD gate sharpness | `actor_rollout_ref.actor.opd_gate_beta=5.0` |
+| KL coefficient | `actor_rollout_ref.actor.kl_loss_coef=0.01` |
+| Learning rate | `actor_rollout_ref.actor.optim.lr=1e-6` |
+| Analyzer backend | `algorithm.seed.analysis_backend=policy_vllm` for paper-style SEED |
+| Skill mode | `algorithm.seed.skill_mode=episode_only` for paper-style episode-skill OPD |
+
+## 11. 实现映射
 
 | 功能 | 主要实现位置 |
 | --- | --- |
-| 多步 rollout 与 `uid`/`traj_uid` 分配 | [`agent_system/multi_turn_rollout/rollout_loop.py`](../../agent_system/multi_turn_rollout/rollout_loop.py) |
-| episode reward tensor 构造 | [`agent_system/reward_manager/episode.py`](../../agent_system/reward_manager/episode.py) |
+| SFT 数据构建：ALFWorld | [`scripts/sft/alfworld`](../../scripts/sft/alfworld) |
+| SFT 数据构建：WebShop | [`scripts/sft/webshop`](../../scripts/sft/webshop) |
+| SFT 数据构建：Search-QA | [`scripts/sft/search`](../../scripts/sft/search) |
+| SFT 数据构建：EZPoints | [`scripts/sft/ezpoints`](../../scripts/sft/ezpoints) |
+| SFT 数据构建：Sokoban | [`scripts/sft/sokoban`](../../scripts/sft/sokoban) |
+| SFT 训练 | [`verl/trainer/fsdp_sft_trainer.py`](../../verl/trainer/fsdp_sft_trainer.py) |
+| 多步 rollout | [`agent_system/multi_turn_rollout/rollout_loop.py`](../../agent_system/multi_turn_rollout/rollout_loop.py) |
 | SEED 训练器集成 | [`verl/trainer/ppo/ray_trainer.py`](../../verl/trainer/ppo/ray_trainer.py) |
-| LLM 轨迹分析器 | [`seed/analysis.py`](../../seed/analysis.py) |
+| 轨迹分析 prompt 与 JSON 解析 | [`seed/analysis.py`](../../seed/analysis.py) |
 | skill 注入 observation | [`seed/prompting.py`](../../seed/prompting.py) |
-| episode/teacher advantage 计算 | [`gigpo/core_gigpo.py`](../../gigpo/core_gigpo.py) |
-| PPO actor update | [`verl/workers/actor/dp_actor.py`](../../verl/workers/actor/dp_actor.py) |
-| SEED 默认配置 | [`verl/trainer/config/ppo_trainer.yaml`](../../verl/trainer/config/ppo_trainer.yaml) |
-| AlfWorld SEED 启动脚本 | [`examples/seed_trainer/run_alfworld_seed_guide.sh`](../../examples/seed_trainer/run_alfworld_seed_guide.sh) |
+| gated OPD loss | [`verl/trainer/ppo/core_algos.py`](../../verl/trainer/ppo/core_algos.py) |
+| actor update | [`verl/workers/actor/dp_actor.py`](../../verl/workers/actor/dp_actor.py) |
+| SEED 配置 | [`verl/trainer/config/ppo_trainer.yaml`](../../verl/trainer/config/ppo_trainer.yaml) |
 
-## 15. 讨论与局限
+## 12. 与 Legacy Teacher-Advantage 路径的关系
 
-1. SEED 的 teacher signal 是 prompt-conditioned self-distillation，不是
-   外部 reward model。它度量的是 hindsight skill 对当前策略原始动作
-   log-prob 的影响。
+当前代码仍支持一种早期路径：计算 enhanced prompt log-prob 与 ordinary prompt
+log-prob 的差值，并把这个 delta 按权重融入 PPO advantage：
 
-2. 当前 SEED 路径要求 `selector=llm`，且要求
-   `algorithm.seed.step_advantage_w=0.0`。
+$$
+A^{\text{SEED}}
+=
+A^{\text{ep}}
++w_{\text{ep}}\Delta^{\text{ep}}
++w_{\text{step}}\Delta^{\text{step}}.
+$$
 
-3. 当前 teacher scoring 只支持 text prompt。若 batch 中存在
-   `multi_modal_inputs`，SEED teacher signal 会被跳过。
+这个路径由 `episode_skill_teacher_advantage_w` 和
+`step_skill_teacher_advantage_w` 控制；当
+`actor_rollout_ref.actor.opd_loss_coef > 0` 时，代码会优先使用论文式的
+auxiliary OPD loss，这些 teacher-advantage 权重会被忽略或置为 0。
 
-4. LLM analysis 的质量会直接影响 teacher delta。解析器能处理 JSON 失败并
-   重试，但无法保证 skill 在语义上总是高质量。
+因此：
 
-5. 当前 AlfWorld 配置中 episode-skill 和 step-skill teacher 权重均为
-   \(10^{-3}\)，因此主导项仍然是 episode outcome advantage。训练时应关注
-   日志中的 `seed/adv/*` 指标，尤其是 episode、step、teacher 三类分量的
-   绝对均值和 share。
+- 复现实验和论文主线时，使用 SFT checkpoint + `policy_vllm` analyzer +
+  `opd_loss_coef=0.01`；
+- 做直接 ablation 或快速实验时，在对应的 `run_*_sft*.sh` 上通过环境变量或
+  Hydra 参数覆盖 analyzer、loss 和 teacher-advantage 配置，不再维护独立的
+  legacy 启动脚本。
 
-6. LLM 分析按 trajectory 发起请求，成本由 rollout batch 中的轨迹数量、
-   `analysis_num_workers` 和 `analysis_max_completion_tokens` 共同决定。
+## 13. 结论
 
-## 16. 结论
-
-当前 SEED 可以概括为：
+论文版 SEED 可以概括为：
 
 $$
 \text{SEED}
 =
-\text{GRPO-style episode relative advantage}
+\text{GRPO outcome optimization}
 +
-\text{LLM-hindsight prompt advantage}.
+\text{self-evolving hindsight-skill OPD}.
 $$
 
-它不改变 PPO actor update 的基本形式，而是替换 advantage 的构造方式。
-LLM 负责把完整轨迹转化为可执行的 hindsight skill；当前策略负责将该
-skill 转换为 token-level log-prob delta。最终，episode outcome signal
-与 teacher prompt signal 共同形成用于 PPO 更新的 \(A^{SEED}\)。
+它不是在推理阶段“多给一个 skill prompt”，也不是用静态 skill 库做检索，而是
+在训练时让当前策略从自己的完整轨迹中产生 hindsight skill，再把这些 skill 对
+行为概率的影响蒸馏回普通策略。这样，决策能力和轨迹分析能力随训练共同演化，
+最终得到一个推理时不依赖额外上下文的 agent policy。

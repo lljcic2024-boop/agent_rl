@@ -492,16 +492,16 @@ def compute_policy_loss(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
-def compute_sdar_loss(
+def compute_opd_loss(
     log_prob: torch.Tensor,
     teacher_log_prob: torch.Tensor,
     response_mask: torch.Tensor,
-    sdar_step_mask: torch.Tensor = None,
+    opd_step_mask: torch.Tensor = None,
     gate_beta: float = 5.0,
     loss_agg_mode: str = "token-mean",
 ):
     """
-    Compute SDAR-style confidence-gated teacher distillation loss.
+    Compute OPD-style confidence-gated teacher distillation loss.
 
     This keeps the teacher log-probs and the gate detached, so gradients flow
     only through the current policy log-probs:
@@ -512,68 +512,68 @@ def compute_sdar_loss(
         log_prob: Current policy log-probabilities, shape (batch_size, response_length).
         teacher_log_prob: Teacher/enhanced-prompt log-probabilities, shape (batch_size, response_length).
         response_mask: Mask for valid response tokens, shape (batch_size, response_length).
-        sdar_step_mask: Optional sample-level or token-level mask selecting SDAR-supervised steps.
+        opd_step_mask: Optional sample-level or token-level mask selecting OPD-supervised steps.
         gate_beta: Sigmoid sharpness for the teacher-student gap gate.
         loss_agg_mode: Aggregation mode for `agg_loss`.
 
     Returns:
-        sdar_loss, sdar_active_token_ratio, sdar_gate_mean,
-        sdar_gate_active_ratio, sdar_teacher_gap_mean
+        opd_loss, opd_active_token_ratio, opd_gate_mean,
+        opd_gate_active_ratio, opd_teacher_gap_mean
     """
     if log_prob.shape != teacher_log_prob.shape:
         raise ValueError(f"log_prob shape {tuple(log_prob.shape)} does not match teacher_log_prob shape {tuple(teacher_log_prob.shape)}")
     if log_prob.shape != response_mask.shape:
         raise ValueError(f"log_prob shape {tuple(log_prob.shape)} does not match response_mask shape {tuple(response_mask.shape)}")
 
-    if sdar_step_mask is None:
-        sdar_mask = response_mask
+    if opd_step_mask is None:
+        opd_mask = response_mask
     else:
-        sdar_step_mask = sdar_step_mask.to(device=log_prob.device, dtype=response_mask.dtype)
-        if sdar_step_mask.dim() == 1:
-            if sdar_step_mask.shape[0] != response_mask.shape[0]:
-                raise ValueError(f"sdar_step_mask batch size {sdar_step_mask.shape[0]} does not match response_mask batch size {response_mask.shape[0]}")
-            sdar_mask = response_mask * sdar_step_mask.unsqueeze(-1)
-        elif sdar_step_mask.dim() == 2:
-            if sdar_step_mask.shape != response_mask.shape:
-                raise ValueError(f"sdar_step_mask shape {tuple(sdar_step_mask.shape)} does not match response_mask shape {tuple(response_mask.shape)}")
-            sdar_mask = response_mask * sdar_step_mask
+        opd_step_mask = opd_step_mask.to(device=log_prob.device, dtype=response_mask.dtype)
+        if opd_step_mask.dim() == 1:
+            if opd_step_mask.shape[0] != response_mask.shape[0]:
+                raise ValueError(f"opd_step_mask batch size {opd_step_mask.shape[0]} does not match response_mask batch size {response_mask.shape[0]}")
+            opd_mask = response_mask * opd_step_mask.unsqueeze(-1)
+        elif opd_step_mask.dim() == 2:
+            if opd_step_mask.shape != response_mask.shape:
+                raise ValueError(f"opd_step_mask shape {tuple(opd_step_mask.shape)} does not match response_mask shape {tuple(response_mask.shape)}")
+            opd_mask = response_mask * opd_step_mask
         else:
-            raise ValueError(f"sdar_step_mask must be 1D or 2D, got shape {tuple(sdar_step_mask.shape)}")
+            raise ValueError(f"opd_step_mask must be 1D or 2D, got shape {tuple(opd_step_mask.shape)}")
 
-    sdar_loss = log_prob.new_tensor(0.0)
-    sdar_active_token_ratio = log_prob.new_tensor(0.0)
-    sdar_gate_mean = log_prob.new_tensor(0.0)
-    sdar_gate_active_ratio = log_prob.new_tensor(0.0)
-    sdar_teacher_gap_mean = log_prob.new_tensor(0.0)
-    if not torch.any(sdar_mask > 0):
+    opd_loss = log_prob.new_tensor(0.0)
+    opd_active_token_ratio = log_prob.new_tensor(0.0)
+    opd_gate_mean = log_prob.new_tensor(0.0)
+    opd_gate_active_ratio = log_prob.new_tensor(0.0)
+    opd_teacher_gap_mean = log_prob.new_tensor(0.0)
+    if not torch.any(opd_mask > 0):
         return (
-            sdar_loss,
-            sdar_active_token_ratio,
-            sdar_gate_mean,
-            sdar_gate_active_ratio,
-            sdar_teacher_gap_mean,
+            opd_loss,
+            opd_active_token_ratio,
+            opd_gate_mean,
+            opd_gate_active_ratio,
+            opd_teacher_gap_mean,
         )
 
     teacher_log_prob = teacher_log_prob.detach()
     teacher_gap = (teacher_log_prob - log_prob.detach()).detach()
-    sdar_gate = torch.sigmoid(float(gate_beta) * teacher_gap).detach()
-    sdar_loss_mat = sdar_gate * (teacher_log_prob - log_prob)
+    opd_gate = torch.sigmoid(float(gate_beta) * teacher_gap).detach()
+    opd_loss_mat = opd_gate * (teacher_log_prob - log_prob)
 
-    sdar_loss = agg_loss(
-        loss_mat=sdar_loss_mat,
-        loss_mask=sdar_mask,
+    opd_loss = agg_loss(
+        loss_mat=opd_loss_mat,
+        loss_mask=opd_mask,
         loss_agg_mode=loss_agg_mode,
     )
-    sdar_active_token_ratio = (sdar_mask > 0).float().mean()
-    sdar_gate_mean = verl_F.masked_mean(sdar_gate, sdar_mask)
-    sdar_gate_active_ratio = verl_F.masked_mean((sdar_gate > 0.5).float(), sdar_mask)
-    sdar_teacher_gap_mean = verl_F.masked_mean(teacher_gap, sdar_mask)
+    opd_active_token_ratio = (opd_mask > 0).float().mean()
+    opd_gate_mean = verl_F.masked_mean(opd_gate, opd_mask)
+    opd_gate_active_ratio = verl_F.masked_mean((opd_gate > 0.5).float(), opd_mask)
+    opd_teacher_gap_mean = verl_F.masked_mean(teacher_gap, opd_mask)
     return (
-        sdar_loss,
-        sdar_active_token_ratio,
-        sdar_gate_mean,
-        sdar_gate_active_ratio,
-        sdar_teacher_gap_mean,
+        opd_loss,
+        opd_active_token_ratio,
+        opd_gate_mean,
+        opd_gate_active_ratio,
+        opd_teacher_gap_mean,
     )
 
 

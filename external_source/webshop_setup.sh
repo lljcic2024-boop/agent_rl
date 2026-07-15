@@ -3,8 +3,8 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-conda create -n sgop-webshop python==3.10.12 -y
-conda activate sgop-webshop
+conda create -n seed-webshop python==3.10.12 -y
+conda activate seed-webshop
 
 pip3 install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 

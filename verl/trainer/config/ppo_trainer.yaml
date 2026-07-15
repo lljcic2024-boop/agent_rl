@@ -54,8 +54,8 @@ actor_rollout_ref:
     clip_ratio_high: 0.2
     clip_ratio_c: 3.0 # lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729
     loss_agg_mode: "token-mean" # / "seq-mean-token-sum" / "seq-mean-token-mean"
-    sdar_loss_coef: 0.0 # SDAR-style gated auxiliary distillation loss; 0 disables it. For SEED, enabling this uses teacher/OPD signals as loss instead of teacher advantage.
-    sdar_gate_beta: 5.0 # sigmoid sharpness for SDAR teacher-student gap gating
+    opd_loss_coef: 0.0 # OPD-style gated auxiliary distillation loss; 0 disables it. For SEED, enabling this uses teacher/OPD signals as loss instead of teacher advantage.
+    opd_gate_beta: 5.0 # sigmoid sharpness for OPD teacher-student gap gating
     skill_gen_loss_coef: 0.0 # SEED skill-generation reward-weighted LM loss; 0 disables it.
     skill_gen_micro_batch_size_per_gpu: null # per-GPU micro batch size for long policy-vllm skill generation samples
     skill_gen_micro_batch_size: 1 # deprecated alias for skill_gen_micro_batch_size_per_gpu
@@ -269,8 +269,8 @@ algorithm:
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
   seed:
     step_advantage_w: 0.0 # SEED uses episode-level advantage only.
-    episode_skill_teacher_advantage_w: 1.0 # separate weight for episode-skill teacher advantage; ignored when actor.sdar_loss_coef > 0
-    step_skill_teacher_advantage_w: 0.0 # separate weight for step-skill-only teacher advantage; ignored when actor.sdar_loss_coef > 0
+    episode_skill_teacher_advantage_w: 1.0 # separate weight for episode-skill teacher advantage; ignored when actor.opd_loss_coef > 0
+    step_skill_teacher_advantage_w: 0.0 # separate weight for step-skill-only teacher advantage; ignored when actor.opd_loss_coef > 0
     skill_mode: "episode_step" # "episode_step" generates episode_skill + step_skills; "step_only" uses step_skills only; "episode_only" applies episode_skill to all selected steps
     skill_teacher_mode: "step_priority" # "step_priority" uses episode skills only where no step skill is active; "additive" scores both prompts and adds both advantages
     opd_start_after_steps: null # null -> enable SEED teacher/OPD signal from the first training step; otherwise enable after this many completed steps

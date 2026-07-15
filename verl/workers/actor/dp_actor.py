@@ -32,7 +32,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, compute_policy_loss_gspo, compute_sdar_loss, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, compute_policy_loss_gspo, compute_opd_loss, kl_penalty
 from verl.trainer.ppo.env_aux_loss_utils import (
     create_inverse_dynamics_messages,
     create_search_inverse_dynamics_messages,
@@ -771,7 +771,7 @@ class DataParallelPPOActor(BasePPOActor):
             raise RuntimeError("SP/ID environment auxiliary loss is not supported with actor.use_dynamic_bsz=True.")
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
-        sdar_loss_coef = float(self.config.get("sdar_loss_coef", 0.0) or 0.0)
+        opd_loss_coef = float(self.config.get("opd_loss_coef", 0.0) or 0.0)
         skill_gen_loss_coef = float(self.config.get("skill_gen_loss_coef", 0.0) or 0.0)
         seed_skill_gen_payload = data.meta_info.get("seed_skill_gen")
         use_skill_gen_loss = (
@@ -781,11 +781,11 @@ class DataParallelPPOActor(BasePPOActor):
         )
         teacher_mask_key = "teacher_signal_mask" if "teacher_signal_mask" in data.batch.keys() else "critical_step_mask"
         has_teacher_signal = "teacher_log_prob" in data.batch.keys() and teacher_mask_key in data.batch.keys()
-        use_sdar_loss = (
-            sdar_loss_coef > 0
+        use_opd_loss = (
+            opd_loss_coef > 0
             and has_teacher_signal
         )
-        if use_sdar_loss:
+        if use_opd_loss:
             select_keys.extend(["teacher_log_prob", teacher_mask_key])
         if multi_turn:
             select_keys.append("loss_mask")
@@ -897,27 +897,27 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         policy_loss = pg_loss
 
-                    sdar_loss = log_prob.new_tensor(0.0)
-                    sdar_active_token_ratio = log_prob.new_tensor(0.0)
-                    sdar_gate_mean = log_prob.new_tensor(0.0)
-                    sdar_gate_active_ratio = log_prob.new_tensor(0.0)
-                    sdar_teacher_gap_mean = log_prob.new_tensor(0.0)
-                    if use_sdar_loss and "teacher_log_prob" in data and teacher_mask_key in data:
+                    opd_loss = log_prob.new_tensor(0.0)
+                    opd_active_token_ratio = log_prob.new_tensor(0.0)
+                    opd_gate_mean = log_prob.new_tensor(0.0)
+                    opd_gate_active_ratio = log_prob.new_tensor(0.0)
+                    opd_teacher_gap_mean = log_prob.new_tensor(0.0)
+                    if use_opd_loss and "teacher_log_prob" in data and teacher_mask_key in data:
                         (
-                            sdar_loss,
-                            sdar_active_token_ratio,
-                            sdar_gate_mean,
-                            sdar_gate_active_ratio,
-                            sdar_teacher_gap_mean,
-                        ) = compute_sdar_loss(
+                            opd_loss,
+                            opd_active_token_ratio,
+                            opd_gate_mean,
+                            opd_gate_active_ratio,
+                            opd_teacher_gap_mean,
+                        ) = compute_opd_loss(
                             log_prob=log_prob,
                             teacher_log_prob=data["teacher_log_prob"],
                             response_mask=response_mask,
-                            sdar_step_mask=data[teacher_mask_key],
-                            gate_beta=self.config.get("sdar_gate_beta", 5.0),
+                            opd_step_mask=data[teacher_mask_key],
+                            gate_beta=self.config.get("opd_gate_beta", 5.0),
                             loss_agg_mode=loss_agg_mode,
                         )
-                        policy_loss = policy_loss + sdar_loss_coef * sdar_loss
+                        policy_loss = policy_loss + opd_loss_coef * opd_loss
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data["ref_log_prob"]
@@ -951,12 +951,12 @@ class DataParallelPPOActor(BasePPOActor):
                         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                         "actor/ppo_kl": ppo_kl.detach().item(),
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-                        "actor/sdar_loss": sdar_loss.detach().item(),
-                        "actor/sdar_loss_coef": sdar_loss_coef,
-                        "actor/sdar_active_token_ratio": sdar_active_token_ratio.detach().item(),
-                        "actor/sdar_gate_mean": sdar_gate_mean.detach().item(),
-                        "actor/sdar_gate_active_ratio": sdar_gate_active_ratio.detach().item(),
-                        "actor/sdar_teacher_gap_mean": sdar_teacher_gap_mean.detach().item(),
+                        "actor/opd_loss": opd_loss.detach().item(),
+                        "actor/opd_loss_coef": opd_loss_coef,
+                        "actor/opd_active_token_ratio": opd_active_token_ratio.detach().item(),
+                        "actor/opd_gate_mean": opd_gate_mean.detach().item(),
+                        "actor/opd_gate_active_ratio": opd_gate_active_ratio.detach().item(),
+                        "actor/opd_teacher_gap_mean": opd_teacher_gap_mean.detach().item(),
                         "actor/env_aux_loss": env_aux_loss.detach().item(),
                         "actor/sp_coef": self.sp_coef,
                         "actor/id_coef": self.id_coef,
