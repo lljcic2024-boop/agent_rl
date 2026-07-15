@@ -20,5 +20,20 @@ outputs/ezpoints_episode_skill_pipeline_qwen25_vl_3b_gemini_self_1440/
 
 Important defaults are `BASELINE_REQUEST_WORKERS=64`,
 `EZPOINTS_SKILL_GEN_WORKERS=64`, and resume enabled for both stages. Override
-them through environment variables when needed. The script only creates SFT
-data; it does not start SFT or RL training.
+them through environment variables when needed.
+
+After the parquet files are built, run visual SFT:
+
+```bash
+bash scripts/ezpoints_visual_seed_pipeline/run_sft.sh
+```
+
+Useful overrides include `MODEL_PATH`, `DATA_DIR`, `NPROC_PER_NODE`,
+`TOTAL_EPOCHS`, `TRAIN_BATCH_SIZE`, `MICRO_BATCH_SIZE_PER_GPU`,
+`MAX_LENGTH`, and `EXPORT_MODEL_DIR`.
+
+Then run SEED RL from the exported SFT model:
+
+```bash
+bash examples/seed_trainer/run_ezpoints_episode_no_skill_loss_sft_gemini_self.sh
+```
