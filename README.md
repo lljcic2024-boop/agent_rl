@@ -3,6 +3,13 @@
 SEED: Self-Evolving On-Policy Distillation for Agentic Reinforcement Learning
 </h1>
 
+## News
+
+- **2026-07-16**: We have released our paper and code.
+
+If you have any questions ❓ or are interested in collaboration 🤝, please feel free to contact me at 
+wu-jy23@mails.tsinghua.edu.cn.
+
 ## Overview
 
 **SEED** is a **Self-Evolving On-Policy Distillation** framework for long-horizon
