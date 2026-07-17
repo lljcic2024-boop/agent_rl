@@ -77,10 +77,6 @@ findings:
   <em>Figure 2: Main results.</em>
 </div>
 
-## News
-
-- **2026-07-15**: Initial paper and code release.
-
 ## Installation
 
 ### Install veRL
