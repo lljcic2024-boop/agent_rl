@@ -3,6 +3,21 @@
 SEED: Self-Evolving On-Policy Distillation for Agentic Reinforcement Learning
 </h1>
 
+<p align="center">
+  <a href="https://jinyangwu.github.io/seed/">
+    <img src="https://img.shields.io/badge/Project-Page-1F6FEB?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Project Page">
+  </a>
+  <a href="https://huggingface.co/papers/2607.14777">
+    <img src="https://img.shields.io/badge/HF-Paper-FFD21E?style=for-the-badge&logo=huggingface&logoColor=111827" alt="Hugging Face Paper">
+  </a>
+  <a href="https://arxiv.org/abs/2607.14777">
+    <img src="https://img.shields.io/badge/arXiv-Paper-B31B1B?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv Paper">
+  </a>
+  <a href="https://huggingface.co/Jinyang23/Seed-AlfWorld-3B">
+    <img src="https://img.shields.io/badge/Model-Checkpoint-F59E0B?style=for-the-badge&logo=huggingface&logoColor=white" alt="Model Checkpoint">
+  </a>
+</p>
+
 ## News
 
 - **2026-07-16**: We have released our paper and code.
@@ -245,11 +260,19 @@ bash examples/seed_trainer/run_sokoban_sft_gemini_self.sh
 See `scripts/model_merger.py` for FSDP/Megatron merge examples using paths under
 `./checkpoints/...`.
 
-## Citation
+## ⭐ Citation
 
-The manuscript is currently under review.
+If you find this project useful, welcome to cite us.
+
 ```bibtex
-
+@article{wu2026seed,
+  title={SEED: Self-Evolving On-Policy Distillation for Agentic Reinforcement Learning},
+  author={Wu, Jinyang and Yang, Shuo and Lu, Zhengxi and Zhang, Fan and
+          Shen, Yuhao and Feng, Lang and Luo, Haoran and Lian, Zheng and
+          Zhang, Shuai and Wen, Zhengqi and Tao, Jianhua},
+  journal={arXiv preprint arXiv:2607.14777},
+  year={2026}
+}
 ```
 
 ## Acknowledgement
