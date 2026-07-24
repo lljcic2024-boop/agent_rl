@@ -32,7 +32,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, compute_policy_loss_gspo, compute_opd_loss, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, compute_policy_loss_gspo, compute_opd_loss, compute_opd_fkl_loss, kl_penalty
 from verl.trainer.ppo.env_aux_loss_utils import (
     create_inverse_dynamics_messages,
     create_search_inverse_dynamics_messages,
@@ -787,6 +787,10 @@ class DataParallelPPOActor(BasePPOActor):
         )
         if use_opd_loss:
             select_keys.extend(["teacher_log_prob", teacher_mask_key])
+        opd_fkl_loss_coef = float(self.config.get("opd_fkl_loss_coef", 0.0) or 0.0)
+        use_opd_fkl_loss = opd_fkl_loss_coef > 0 and "teacher_token_mask" in data.batch.keys()
+        if use_opd_fkl_loss:
+            select_keys.append("teacher_token_mask")
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -868,7 +872,7 @@ class DataParallelPPOActor(BasePPOActor):
                     if entropy_coeff != 0:
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
-                    
+
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     if loss_mode == "vanilla":
                         policy_loss_fn = compute_policy_loss
@@ -915,9 +919,32 @@ class DataParallelPPOActor(BasePPOActor):
                             response_mask=response_mask,
                             opd_step_mask=data[teacher_mask_key],
                             gate_beta=self.config.get("opd_gate_beta", 5.0),
+                            loss_mode=self.config.get("opd_loss_mode", "gate"),
+                            rkl_adv_clip=self.config.get("opd_rkl_adv_clip", None),
                             loss_agg_mode=loss_agg_mode,
                         )
                         policy_loss = policy_loss + opd_loss_coef * opd_loss
+
+                    # Forward-KL / CE on teacher-generated tokens (off-policy
+                    # segments, e.g. teacher-written thinking prefixes). These
+                    # tokens are excluded from the PG loss mask by the rollout
+                    # builder, so validity comes from the attention mask.
+                    opd_fkl_loss = log_prob.new_tensor(0.0)
+                    opd_fkl_token_ratio = log_prob.new_tensor(0.0)
+                    opd_fkl_student_lp_mean = log_prob.new_tensor(0.0)
+                    if use_opd_fkl_loss and "teacher_token_mask" in data:
+                        response_validity_mask = attention_mask[:, -response_length:].to(dtype=log_prob.dtype)
+                        (
+                            opd_fkl_loss,
+                            opd_fkl_token_ratio,
+                            opd_fkl_student_lp_mean,
+                        ) = compute_opd_fkl_loss(
+                            log_prob=log_prob,
+                            teacher_token_mask=data["teacher_token_mask"],
+                            response_validity_mask=response_validity_mask,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        policy_loss = policy_loss + opd_fkl_loss_coef * opd_fkl_loss
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data["ref_log_prob"]
@@ -957,6 +984,10 @@ class DataParallelPPOActor(BasePPOActor):
                         "actor/opd_gate_mean": opd_gate_mean.detach().item(),
                         "actor/opd_gate_active_ratio": opd_gate_active_ratio.detach().item(),
                         "actor/opd_teacher_gap_mean": opd_teacher_gap_mean.detach().item(),
+                        "actor/opd_fkl_loss": opd_fkl_loss.detach().item(),
+                        "actor/opd_fkl_loss_coef": opd_fkl_loss_coef,
+                        "actor/opd_fkl_token_ratio": opd_fkl_token_ratio.detach().item(),
+                        "actor/opd_fkl_student_lp_mean": opd_fkl_student_lp_mean.detach().item(),
                         "actor/env_aux_loss": env_aux_loss.detach().item(),
                         "actor/sp_coef": self.sp_coef,
                         "actor/id_coef": self.id_coef,

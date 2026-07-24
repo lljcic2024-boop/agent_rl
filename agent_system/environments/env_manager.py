@@ -204,7 +204,7 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             "image": None,
             "anchor": obs.copy()
         }
-        
+
         return observations, infos
 
     def step(self, text_actions: List[str]):
@@ -220,7 +220,7 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
             "image": None,
             "anchor": next_obs.copy()
         }
-        
+
         for i, info in enumerate(infos):
             info["is_action_valid"] = to_numpy(valids[i])
 
@@ -243,13 +243,19 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 action_key="search"
             )
 
+        # Function-typed thinking (tag capability menu); the same prompt must be
+        # used across SFT, RL, and evaluation.
+        use_function_tags = bool(_mapping_select(self.config, "env.use_function_tags", False))
+        template_no_his = SEARCH_TAG_TEMPLATE_NO_HIS if use_function_tags else SEARCH_TEMPLATE_NO_HIS
+        template_with_his = SEARCH_TAG_TEMPLATE if use_function_tags else SEARCH_TEMPLATE
+
         for i in range(len(text_obs)):
             # Use retrieval memory template if enabled
             use_retrieval = (self.retrieval_memory is not None and
                            self.retrieved_memories is not None and
                            not init)
             if init or self.config.env.history_length <= 0:
-                obs_i = SEARCH_TEMPLATE_NO_HIS.format(
+                obs_i = template_no_his.format(
                     task_description=self.tasks[i]
                 )
             elif use_retrieval:
@@ -264,7 +270,7 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                     memory_context=memory_ctx[i],
                 )
             else:
-                obs_i = SEARCH_TEMPLATE.format(
+                obs_i = template_with_his.format(
                     task_description=self.tasks[i],
                     memory_context=memory_ctx[i],
                     step_count=len(self.memory[i]),
@@ -282,11 +288,11 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 info = total_infos[batch_idx][i]
                 won_value = float(info['won'])
                 success['success_rate'].append(won_value)
-                
+
                 data_source = info.get("data_source")
                 success[f"{data_source}_success_rate"].append(won_value)
                 return  # Exit after finding the first active mask
-            
+
 
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
@@ -319,7 +325,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             self.retrieval_memory = None
 
         super().__init__(envs, projection_f, config)
-    
+
     def reset(self, kwargs):
         text_obs, image_obs, infos = self.envs.reset()
         self.gamefile = parse_gamefile(infos)
@@ -354,7 +360,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
         observations = {'text': full_text_obs, 'text_base': full_text_obs, 'image': image_obs, 'anchor': text_obs}
         return observations, infos
-    
+
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
@@ -374,16 +380,16 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         dones = to_numpy(dones)
 
         return next_observations, rewards, dones, infos
-    
+
     def extract_task(self, text_obs: List[str]):
         for obs in text_obs:
             task_start = obs.find('Your task is to: ')
-            
+
             if task_start != -1:
                 self.tasks.append(obs[task_start + len('Your task is to: '):].strip())
             else:
                 raise ValueError("Task description not found in text observation.")
-        
+
 
     def build_text_obs(
         self,
@@ -404,6 +410,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     effective_history_length,
                     obs_key="text_obs",
                     action_key="action")
+
+        use_function_tags = bool(_mapping_select(self.config, "env.use_function_tags", False))
+        template_no_his = ALFWORLD_TAG_TEMPLATE_NO_HIS if use_function_tags else ALFWORLD_TEMPLATE_NO_HIS
+        template_with_his = ALFWORLD_TAG_TEMPLATE if use_function_tags else ALFWORLD_TEMPLATE
 
         for i in range(len(text_obs)):
             # exclude 'help' in admissible_actions[i]
@@ -433,12 +443,12 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     admissible_actions=reformatted_admissible_actions
                 )
             elif init or effective_history_length <= 0:
-                obs = ALFWORLD_TEMPLATE_NO_HIS.format(
+                obs = template_no_his.format(
                     current_observation=text_obs[i],
                     admissible_actions=reformatted_admissible_actions
                 )
             else:
-                obs = ALFWORLD_TEMPLATE.format(
+                obs = template_with_his.format(
                     task_description=self.tasks[i],
                     step_count=step_count,
                     history_length=valid_lens[i],
@@ -459,7 +469,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 info = total_infos[batch_idx][i]
                 won_value = float(info['won'])
                 success['success_rate'].append(won_value)
-                
+
                 # Process game file if it exists
                 gamefile = info.get("extra.gamefile")
                 if gamefile:
@@ -527,8 +537,8 @@ class SokobanEnvironmentManager(EnvironmentManagerBase):
             obs = np.array(obs, obs[0].dtype)
             self.pre_text_obs = self.envs.render(mode='tiny_rgb_array')
             observations = {
-                'text': self.build_text_obs(infos, init=True), 
-                'image': obs,   
+                'text': self.build_text_obs(infos, init=True),
+                'image': obs,
                 'anchor': obs
             }
         else:
@@ -554,16 +564,16 @@ class SokobanEnvironmentManager(EnvironmentManagerBase):
             next_obs = np.array(next_obs, next_obs[0].dtype)
             self.pre_text_obs = self.envs.render(mode='tiny_rgb_array')
             next_observations = {
-                'text': self.build_text_obs(infos),  
+                'text': self.build_text_obs(infos),
                 'image': next_obs,
-                'anchor': next_obs 
+                'anchor': next_obs
             }
         else:
             self.pre_text_obs = next_obs
             next_observations = {
-                'text': self.build_text_obs(infos, next_obs),  
-                'image': None, 
-                'anchor': next_obs 
+                'text': self.build_text_obs(infos, next_obs),
+                'image': None,
+                'anchor': next_obs
             }
 
         rewards = to_numpy(rewards)
@@ -582,7 +592,7 @@ class SokobanEnvironmentManager(EnvironmentManagerBase):
                     self.config.env.history_length,
                     obs_key="text_obs",
                     action_key="action")
-            
+
         for i in range(len(infos)):
             if init or self.config.env.history_length <= 0:
                 obs = SOKOBAN_VISUAL_TEMPLATE if self.is_multi_modal \
@@ -608,17 +618,17 @@ class SokobanEnvironmentManager(EnvironmentManagerBase):
 class GymCardEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         super().__init__(envs, projection_f, config)
-    
+
     def reset(self, kwargs) -> Dict[str, Any]:
         obs, infos = self.envs.reset()
         # infos = [None] * self.envs.num_envs
         observations = {'text': self.build_text_obs(infos), 'image': obs, 'anchor': obs.copy()}
-        
+
         return observations, infos
 
     def step(self, text_actions: List[str]):
         next_observations, rewards, dones, infos = super().step(text_actions)
-        
+
         # add text observation to next_observations
         next_observations['text'] = self.build_text_obs(infos)
         next_observations['anchor'] = next_observations['image'].copy()
@@ -730,7 +740,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             assert parts[1]=='Instruction:'
             tasks.append(parts[2])
         return tasks
-    
+
     def format_obs(self, text_obs):
         postprocess_text_obs = []
         for i in range(len(text_obs)):
@@ -745,7 +755,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             postprocess_text_obs.append(reformatted_obs)
 
         return postprocess_text_obs
-    
+
     def format_avail_actions(self, avail):
         actions = []
 
@@ -760,7 +770,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             actions.append(f"click[{txt}]")
 
         return actions
-            
+
     def build_text_obs(self, text_obs: List[str], infos: List[List[str]], init: bool = False) -> List[str]:
         """
         This function builds the text observation for the agent.
@@ -844,10 +854,10 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
         super().__init__(envs, projection_f, config)
-    
+
     def reset(self, kwargs):
         text_obs, infos = self.envs.reset()
-        
+
         self.supervisors = [info['supervisor'] for info in infos]
         self.memory.reset(batch_size = len(text_obs))
         self.tasks = text_obs.copy()
@@ -855,7 +865,7 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
 
         full_text_obs = self.build_text_obs(text_obs, init=True)
         return {'text': full_text_obs, 'image': None, 'anchor': text_obs}, infos
-    
+
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions)
 
@@ -875,7 +885,7 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
         dones = to_numpy(dones)
 
         return next_observations, rewards, dones, infos
-    
+
 
     def build_text_obs(self, text_obs: List[str], init: bool = False) -> List[str]:
         """
@@ -904,7 +914,7 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
                     action = record["action"]
                     env_obs = record["text_obs"]
                     action_history += f"\nCode {step_number}: \n{action}\n\nResult {step_number}: \n{env_obs}\n"
-                
+
                 if len(action_history) > 10000:
                     action_history = "... " + action_history[-10000:]
 
@@ -922,7 +932,7 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
                     )
                 postprocess_text_obs.append(obs)
         return postprocess_text_obs
-    
+
 class SciWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
@@ -1108,8 +1118,8 @@ class SciWorldEnvironmentManager(EnvironmentManagerBase):
 
 def make_envs(config):
     """
-    Create enviroments 
-    """ 
+    Create enviroments
+    """
     # check if config.env.rollout.n is an integer
     if not isinstance(config.env.rollout.n, int):
         raise ValueError("config.env.rollout.n should be an integer")
@@ -1130,7 +1140,7 @@ def make_envs(config):
         from agent_system.environments.env_package.gym_cards import build_gymcards_envs, gym_projection
         _envs = build_gymcards_envs(env_name=config.env.env_name, seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, resources_per_worker=resources_per_worker)
         _val_envs = build_gymcards_envs(env_name=config.env.env_name, seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, resources_per_worker=resources_per_worker)
-        
+
         projection_f = partial(gym_projection, env_name=config.env.env_name)
         envs = GymCardEnvironmentManager(_envs, projection_f, config)
         val_envs = GymCardEnvironmentManager(_val_envs, projection_f, config)
@@ -1149,7 +1159,7 @@ def make_envs(config):
         }
         _envs = build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
         _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
-        
+
         projection_f = partial(alfworld_projection, require_think=projection_require_think)
         envs = AlfWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AlfWorldEnvironmentManager(_val_envs, projection_f, config)
@@ -1164,7 +1174,7 @@ def make_envs(config):
         }
         _envs = build_sokoban_envs(config.env.seed, config.data.train_batch_size, group_n, mode=config.env.sokoban.mode, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
         _val_envs = build_sokoban_envs(config.env.seed + 1000, config.data.val_batch_size, 1, mode=config.env.sokoban.mode, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
-        
+
         projection_f = partial(sokoban_projection, require_think=projection_require_think)
         envs = SokobanEnvironmentManager(_envs, projection_f, config)
         val_envs = SokobanEnvironmentManager(_val_envs, projection_f, config)
@@ -1178,8 +1188,8 @@ def make_envs(config):
             file_path = os.path.join(os.path.dirname(__file__), 'env_package/webshop/webshop/data/items_shuffle.json')
             attr_path = os.path.join(os.path.dirname(__file__), 'env_package/webshop/webshop/data/items_ins_v2.json')
         env_kwargs = {
-                    'observation_mode': 'text', 
-                    'num_products': None, 
+                    'observation_mode': 'text',
+                    'num_products': None,
                     'human_goals': config.env.webshop.human_goals,
                     'file_path': file_path,
                     'attr_path': attr_path
@@ -1197,7 +1207,7 @@ def make_envs(config):
         from agent_system.environments.env_package.appworld import build_appworld_envs, appworld_projection
         _envs = build_appworld_envs(dataset_name='train', seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, start_server_id=0, resources_per_worker=resources_per_worker)
         _val_envs = build_appworld_envs(dataset_name='test_normal', seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, start_server_id=config.data.train_batch_size*group_n, resources_per_worker=resources_per_worker)
-        
+
         projection_f = partial(appworld_projection, require_think=projection_require_think)
         envs = AppWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AppWorldEnvironmentManager(_val_envs, projection_f, config)
@@ -1222,9 +1232,9 @@ def make_envs(config):
         jar_path = config.env.sciworld.get('jar_path', None)
 
         _envs = build_sciworld_envs(
-            seed=config.env.seed, 
-            env_num=config.data.train_batch_size, 
-            group_n=group_n, 
+            seed=config.env.seed,
+            env_num=config.data.train_batch_size,
+            group_n=group_n,
             simplifications_preset=simplifications_preset,
             env_step_limit=env_step_limit,
             jar_path=jar_path,
@@ -1232,9 +1242,9 @@ def make_envs(config):
         )
 
         _val_envs = build_sciworld_envs(
-            seed=config.env.seed + 1000, 
-            env_num=config.data.val_batch_size, 
-            group_n=1, 
+            seed=config.env.seed + 1000,
+            env_num=config.data.val_batch_size,
+            group_n=1,
             simplifications_preset=simplifications_preset,
             env_step_limit=env_step_limit,
             jar_path=jar_path,

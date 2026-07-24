@@ -199,6 +199,33 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         #     batch.non_tensor_batch["tool_callings"][unique_idx].min().item(),
         **({f"episode/{k}": v[0].item() for k, v in batch.non_tensor_batch.items() if "success_rate" in k}),
     }
+
+    # Function-typed thinking tag behavior (plan/verify/reflect/backtrack),
+    # collected per active step by TrajectoryCollector.
+    if "tag_plan_count" in batch.non_tensor_batch:
+        step_total = len(batch.non_tensor_batch["tag_plan_count"])
+        any_tag = np.zeros(step_total, dtype=bool)
+        for tag_name in ("plan", "verify", "reflect", "backtrack"):
+            counts = np.asarray(batch.non_tensor_batch[f"tag_{tag_name}_count"], dtype=np.int64)
+            present = counts > 0
+            any_tag |= present
+            metrics[f"tags/{tag_name}/step_freq"] = present.mean().item()
+            metrics[f"tags/{tag_name}/count_per_step"] = counts.mean().item()
+        metrics["tags/any_tag/step_freq"] = any_tag.mean().item()
+
+        final_answer = np.asarray(batch.non_tensor_batch["tag_final_answer"], dtype=bool)
+        error_signal = np.asarray(batch.non_tensor_batch["tag_error_signal"], dtype=bool)
+        verify_present = np.asarray(batch.non_tensor_batch["tag_verify_count"], dtype=np.int64) > 0
+        reflect_present = np.asarray(batch.non_tensor_batch["tag_reflect_count"], dtype=np.int64) > 0
+        backtrack_present = np.asarray(batch.non_tensor_batch["tag_backtrack_count"], dtype=np.int64) > 0
+        metrics["tags/final_answer_step_rate"] = final_answer.mean().item()
+        metrics["tags/error_signal_step_rate"] = error_signal.mean().item()
+        if final_answer.any():
+            metrics["tags/p_verify_given_final_answer"] = verify_present[final_answer].mean().item()
+        if error_signal.any():
+            metrics["tags/p_reflect_given_error"] = reflect_present[error_signal].mean().item()
+            metrics["tags/p_backtrack_given_error"] = backtrack_present[error_signal].mean().item()
+
     return metrics
 
 

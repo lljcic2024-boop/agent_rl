@@ -35,6 +35,14 @@ SEED_OPD_START_AFTER_STEPS=${SEED_OPD_START_AFTER_STEPS:-null}
 SEED_OPD_STOP_AFTER_STEPS=${SEED_OPD_STOP_AFTER_STEPS:-null}
 SEED_OPD_LOSS_COEF=${SEED_OPD_LOSS_COEF:-0.01}
 SEED_OPD_GATE_BETA=${SEED_OPD_GATE_BETA:-5.0}
+SEED_OPD_LOSS_MODE=${SEED_OPD_LOSS_MODE:-gate}
+SEED_OPD_RKL_ADV_CLIP=${SEED_OPD_RKL_ADV_CLIP:-null}
+SEED_OPD_FKL_LOSS_COEF=${SEED_OPD_FKL_LOSS_COEF:-0.0}
+SEED_EXTERNAL_TEACHER_ENABLE=${SEED_EXTERNAL_TEACHER_ENABLE:-False}
+SEED_EXTERNAL_TEACHER_BASE_URL=${SEED_EXTERNAL_TEACHER_BASE_URL:-http://127.0.0.1:8100/v1}
+SEED_EXTERNAL_TEACHER_MODEL=${SEED_EXTERNAL_TEACHER_MODEL:-Qwen3-30B-A3B}
+SEED_STEP_SELECTOR=${SEED_STEP_SELECTOR:-trajectory}
+SEARCH_USE_FUNCTION_TAGS=${SEARCH_USE_FUNCTION_TAGS:-False}
 
 # SEED episode filtering and teacher prompt construction.
 SEED_FAILED_ONLY=${SEED_FAILED_ONLY:-False}
@@ -83,6 +91,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.opd_loss_coef=$SEED_OPD_LOSS_COEF \
     actor_rollout_ref.actor.opd_gate_beta=$SEED_OPD_GATE_BETA \
+    actor_rollout_ref.actor.opd_loss_mode=$SEED_OPD_LOSS_MODE \
+    actor_rollout_ref.actor.opd_rkl_adv_clip=$SEED_OPD_RKL_ADV_CLIP \
+    actor_rollout_ref.actor.opd_fkl_loss_coef=$SEED_OPD_FKL_LOSS_COEF \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
@@ -117,6 +128,10 @@ python3 -m verl.trainer.main_ppo \
     algorithm.seed.enable_analysis=$SEED_ENABLE_ANALYSIS \
     algorithm.seed.selector=$SEED_SELECTOR \
     algorithm.seed.analysis_backend=$SEED_ANALYSIS_BACKEND \
+    algorithm.seed.external_teacher.enable=$SEED_EXTERNAL_TEACHER_ENABLE \
+    algorithm.seed.external_teacher.base_url=$SEED_EXTERNAL_TEACHER_BASE_URL \
+    algorithm.seed.external_teacher.model=$SEED_EXTERNAL_TEACHER_MODEL \
+    algorithm.seed.step_selector=$SEED_STEP_SELECTOR \
     algorithm.seed.analysis_num_workers=$SEED_ANALYSIS_NUM_WORKERS \
     algorithm.seed.analysis_context_length=$SEED_ANALYSIS_CONTEXT_LENGTH \
     algorithm.seed.analysis_max_completion_tokens=$SEED_ANALYSIS_MAX_COMPLETION_TOKENS \
@@ -124,6 +139,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.seed.analysis_prompt_version=$SEED_ANALYSIS_PROMPT_VERSION \
     algorithm.seed.normalize_teacher_adv=False \
     env.history_length=$history_length \
+    env.use_function_tags=$SEARCH_USE_FUNCTION_TAGS \
     env.env_name=search \
     env.seed=0 \
     env.max_steps=4 \

@@ -132,7 +132,7 @@ def compute_grpo_outcome_advantage(
             If True, the advantage is scaled by the std, as in the original GRPO.
             If False, the advantage is not scaled, as in Dr.GRPO (https://arxiv.org/abs/2503.20783).
         compute_mean_std_cross_steps: bool
-            If True (more stable), the mean and std are computed across steps within one group. 
+            If True (more stable), the mean and std are computed across steps within one group.
             If False (i.e., standard episode-level adv), the mean and std are computed across trajectories within one group.
 
     Returns:
@@ -196,7 +196,7 @@ def compute_grpo_passk_outcome_advantage(
         epsilon: float for numerical stability
         norm_adv_by_std_in_grpo: if True, normalize advantage by std within group
         compute_mean_std_cross_steps: bool
-            If True (more stable), the mean and std are computed across steps within one group. 
+            If True (more stable), the mean and std are computed across steps within one group.
             If False (i.e., standard episode-level adv), the mean and std are computed across trajectories within one group.
 
     Returns:
@@ -498,28 +498,47 @@ def compute_opd_loss(
     response_mask: torch.Tensor,
     opd_step_mask: torch.Tensor = None,
     gate_beta: float = 5.0,
+    loss_mode: str = "gate",
+    rkl_adv_clip: float = None,
     loss_agg_mode: str = "token-mean",
 ):
     """
-    Compute OPD-style confidence-gated teacher distillation loss.
+    Compute OPD teacher distillation loss on student-sampled tokens.
 
-    This keeps the teacher log-probs and the gate detached, so gradients flow
-    only through the current policy log-probs:
-        gate = sigmoid(beta * (teacher_log_prob - log_prob.detach()))
-        loss = gate * (teacher_log_prob - log_prob)
+    Two modes; both keep the teacher log-probs and the per-token weight detached,
+    so gradients flow only through the current policy log-probs:
+
+    - loss_mode="gate" (SEED original, one-sided):
+        weight = sigmoid(beta * (teacher_log_prob - log_prob.detach()))
+        loss = weight * (teacher_log_prob - log_prob)
+      Only reinforces tokens the (skill-conditioned) teacher endorses; never suppresses.
+
+    - loss_mode="rkl" (standard on-policy distillation, signed; cf. GKD/MiniLLM,
+      Thinking Machines on-policy distillation):
+        advantage = teacher_log_prob - log_prob.detach()   (= negative per-token reverse KL)
+        loss = advantage * (teacher_log_prob - log_prob)
+      Gradient = -advantage * grad(log_prob): tokens the teacher prefers are
+      reinforced, tokens the teacher dislikes are suppressed. `rkl_adv_clip`
+      optionally clamps the advantage to [-clip, clip] for robustness.
 
     Args:
         log_prob: Current policy log-probabilities, shape (batch_size, response_length).
         teacher_log_prob: Teacher/enhanced-prompt log-probabilities, shape (batch_size, response_length).
         response_mask: Mask for valid response tokens, shape (batch_size, response_length).
         opd_step_mask: Optional sample-level or token-level mask selecting OPD-supervised steps.
-        gate_beta: Sigmoid sharpness for the teacher-student gap gate.
+        gate_beta: Sigmoid sharpness for the teacher-student gap gate (loss_mode="gate").
+        loss_mode: "gate" (SEED sigmoid gating) or "rkl" (standard signed advantage).
+        rkl_adv_clip: Optional symmetric clip value for the rkl advantage (loss_mode="rkl").
         loss_agg_mode: Aggregation mode for `agg_loss`.
 
     Returns:
         opd_loss, opd_active_token_ratio, opd_gate_mean,
         opd_gate_active_ratio, opd_teacher_gap_mean
+        (in "rkl" mode the two gate metrics report the signed advantage weight:
+        mean weight and fraction of positive-advantage tokens)
     """
+    if loss_mode not in ("gate", "rkl"):
+        raise ValueError(f"loss_mode must be 'gate' or 'rkl', got {loss_mode!r}")
     if log_prob.shape != teacher_log_prob.shape:
         raise ValueError(f"log_prob shape {tuple(log_prob.shape)} does not match teacher_log_prob shape {tuple(teacher_log_prob.shape)}")
     if log_prob.shape != response_mask.shape:
@@ -556,8 +575,19 @@ def compute_opd_loss(
 
     teacher_log_prob = teacher_log_prob.detach()
     teacher_gap = (teacher_log_prob - log_prob.detach()).detach()
-    opd_gate = torch.sigmoid(float(gate_beta) * teacher_gap).detach()
-    opd_loss_mat = opd_gate * (teacher_log_prob - log_prob)
+    if loss_mode == "rkl":
+        # Standard OPD: signed per-token advantage = negative reverse KL.
+        opd_weight = teacher_gap
+        if rkl_adv_clip is not None:
+            clip_value = float(rkl_adv_clip)
+            opd_weight = opd_weight.clamp(min=-clip_value, max=clip_value)
+        opd_weight = opd_weight.detach()
+        active_threshold = 0.0
+    else:
+        # SEED original: one-sided sigmoid gate.
+        opd_weight = torch.sigmoid(float(gate_beta) * teacher_gap).detach()
+        active_threshold = 0.5
+    opd_loss_mat = opd_weight * (teacher_log_prob - log_prob)
 
     opd_loss = agg_loss(
         loss_mat=opd_loss_mat,
@@ -565,8 +595,8 @@ def compute_opd_loss(
         loss_agg_mode=loss_agg_mode,
     )
     opd_active_token_ratio = (opd_mask > 0).float().mean()
-    opd_gate_mean = verl_F.masked_mean(opd_gate, opd_mask)
-    opd_gate_active_ratio = verl_F.masked_mean((opd_gate > 0.5).float(), opd_mask)
+    opd_gate_mean = verl_F.masked_mean(opd_weight, opd_mask)
+    opd_gate_active_ratio = verl_F.masked_mean((opd_weight > active_threshold).float(), opd_mask)
     opd_teacher_gap_mean = verl_F.masked_mean(teacher_gap, opd_mask)
     return (
         opd_loss,
@@ -575,6 +605,79 @@ def compute_opd_loss(
         opd_gate_active_ratio,
         opd_teacher_gap_mean,
     )
+
+
+def compute_opd_fkl_loss(
+    log_prob: torch.Tensor,
+    teacher_token_mask: torch.Tensor,
+    response_validity_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+):
+    """
+    Forward-KL / cross-entropy distillation on teacher-generated tokens.
+
+    For tokens sampled by the teacher (off-policy segments injected into the
+    trajectory, e.g. teacher-written thinking prefixes a_T), the standard
+    treatment is the single-sample Monte-Carlo estimate of the forward KL
+    KL(pi_teacher || pi_student), i.e. plain cross-entropy on the teacher's
+    tokens:
+        loss = -log pi_student(y_t),   y_t ~ pi_teacher
+
+    These tokens must be EXCLUDED from the policy-gradient loss mask by the
+    rollout builder (they were not sampled from the student, so importance
+    ratios are meaningless there) and marked in `teacher_token_mask` instead.
+
+    Args:
+        log_prob: Current policy log-probabilities, shape (batch_size, response_length).
+        teacher_token_mask: Token-level (2D) or sample-level (1D) mask marking
+            teacher-generated tokens.
+        response_validity_mask: Validity mask for response tokens (derived from
+            attention_mask, NOT the PG loss mask, which excludes these tokens),
+            shape (batch_size, response_length).
+        loss_agg_mode: Aggregation mode for `agg_loss`.
+
+    Returns:
+        fkl_loss, fkl_active_token_ratio, fkl_student_log_prob_mean
+    """
+    if log_prob.shape != response_validity_mask.shape:
+        raise ValueError(
+            f"log_prob shape {tuple(log_prob.shape)} does not match "
+            f"response_validity_mask shape {tuple(response_validity_mask.shape)}"
+        )
+    teacher_token_mask = teacher_token_mask.to(
+        device=log_prob.device, dtype=response_validity_mask.dtype
+    )
+    if teacher_token_mask.dim() == 1:
+        if teacher_token_mask.shape[0] != log_prob.shape[0]:
+            raise ValueError(
+                f"teacher_token_mask batch size {teacher_token_mask.shape[0]} does not match "
+                f"log_prob batch size {log_prob.shape[0]}"
+            )
+        fkl_mask = response_validity_mask * teacher_token_mask.unsqueeze(-1)
+    elif teacher_token_mask.dim() == 2:
+        if teacher_token_mask.shape != log_prob.shape:
+            raise ValueError(
+                f"teacher_token_mask shape {tuple(teacher_token_mask.shape)} does not match "
+                f"log_prob shape {tuple(log_prob.shape)}"
+            )
+        fkl_mask = response_validity_mask * teacher_token_mask
+    else:
+        raise ValueError(f"teacher_token_mask must be 1D or 2D, got shape {tuple(teacher_token_mask.shape)}")
+
+    fkl_loss = log_prob.new_tensor(0.0)
+    fkl_active_token_ratio = log_prob.new_tensor(0.0)
+    fkl_student_log_prob_mean = log_prob.new_tensor(0.0)
+    if not torch.any(fkl_mask > 0):
+        return fkl_loss, fkl_active_token_ratio, fkl_student_log_prob_mean
+
+    fkl_loss = agg_loss(
+        loss_mat=-log_prob,
+        loss_mask=fkl_mask,
+        loss_agg_mode=loss_agg_mode,
+    )
+    fkl_active_token_ratio = (fkl_mask > 0).float().mean()
+    fkl_student_log_prob_mean = verl_F.masked_mean(log_prob.detach(), fkl_mask)
+    return fkl_loss, fkl_active_token_ratio, fkl_student_log_prob_mean
 
 
 def compute_policy_loss_gspo(

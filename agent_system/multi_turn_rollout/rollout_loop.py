@@ -196,6 +196,19 @@ class TrajectoryCollector:
         text = str(response_text or "")
         return self._extract_tag(text, "search") or self._extract_tag(text, "action") or text.strip()
 
+    # Function-typed thinking tags (see agent_system/environments/prompts/*TAG*).
+    TAG_FUNCTION_NAMES = ("plan", "verify", "reflect", "backtrack")
+    # Anomalous signals in the observation the model saw this step:
+    # empty/failed search results (Search-QA) or a no-op action (ALFWorld).
+    _TAG_ERROR_SIGNAL_RE = re.compile(
+        r"<information>\s*</information>|no (?:relevant )?results?|nothing happens|invalid action",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _count_tag_segments(text: str, tag: str) -> int:
+        return len(re.findall(rf"<{re.escape(tag)}>", str(text or ""), re.IGNORECASE))
+
     def _env_aux_metadata_enabled(self) -> bool:
         try:
             actor_config = self.config.actor_rollout_ref.actor
@@ -752,6 +765,7 @@ class TrajectoryCollector:
         episode_lengths = np.zeros(batch_size, dtype=np.float32)
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
+        prev_action_invalid = np.zeros(batch_size, dtype=bool)
         collect_env_aux_data = self._env_aux_metadata_enabled()
         env_aux_histories = [[] for _ in range(batch_size)] if collect_env_aux_data else None
         # Trajectory collection loop
@@ -833,6 +847,26 @@ class TrajectoryCollector:
                 batch.non_tensor_batch['is_action_valid'] = np.array([info['is_action_valid'] for info in infos], dtype=bool)
             else:
                 batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
+
+            # Function-tag behavior stats (plan/verify/reflect/backtrack usage per step)
+            for tag_name in self.TAG_FUNCTION_NAMES:
+                batch.non_tensor_batch[f'tag_{tag_name}_count'] = np.array(
+                    [self._count_tag_segments(text_actions[i], tag_name) for i in range(batch_size)],
+                    dtype=np.int64,
+                )
+            batch.non_tensor_batch['tag_final_answer'] = np.array(
+                [('<answer>' in str(text_actions[i]).lower()) or bool(dones[i]) for i in range(batch_size)],
+                dtype=bool,
+            )
+            batch.non_tensor_batch['tag_error_signal'] = np.array(
+                [
+                    bool(prev_action_invalid[i])
+                    or self._TAG_ERROR_SIGNAL_RE.search(self._extract_observation_text(obs, i)) is not None
+                    for i in range(batch_size)
+                ],
+                dtype=bool,
+            )
+            prev_action_invalid = np.logical_not(batch.non_tensor_batch['is_action_valid'].astype(bool))
 
             if 'tool_calling' in infos[0]:
                 tool_callings[active_masks] += np.array([info['tool_calling'] for info in infos], dtype=np.float32)[active_masks]

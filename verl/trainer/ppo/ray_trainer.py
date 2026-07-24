@@ -539,6 +539,8 @@ class RayPPOTrainer:
         self._seed_failed_only_last_enabled_state = None
         self._seed_analysis_last_enabled_state = None
         self._seed_teacher_signal_executor = None
+        self._seed_external_teacher_client = None
+        self._seed_external_teacher_init_done = False
         self.traj_collector = traj_collector
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
@@ -909,6 +911,32 @@ class RayPPOTrainer:
         metrics["seed/step_skill_teacher/step_skill_step_ratio"] = 0.0
         metrics["seed/step_skill_teacher/step_skills_applied"] = 0.0
         return batch
+
+    def _get_seed_external_teacher_client(self):
+        """Lazily build the external teacher scoring client (algorithm.seed.external_teacher)."""
+        if self._seed_external_teacher_init_done:
+            return self._seed_external_teacher_client
+        self._seed_external_teacher_init_done = True
+        cfg = OmegaConf.select(self.config, "algorithm.seed.external_teacher")
+        if cfg is None or not bool(cfg.get("enable", False)):
+            return None
+        from verl.trainer.ppo.seed_external_teacher import ExternalTeacherClient
+
+        api_key = cfg.get("api_key", None)
+        self._seed_external_teacher_client = ExternalTeacherClient(
+            base_url=str(cfg.get("base_url")),
+            model=str(cfg.get("model")),
+            api_key=str(api_key) if api_key else None,
+            timeout=float(cfg.get("timeout", 600.0) or 600.0),
+            max_retries=int(cfg.get("max_retries", 3) or 3),
+            concurrency=int(cfg.get("concurrency", 8) or 8),
+        )
+        module_logger.info(
+            "SEED external teacher scoring enabled: %s (model=%s). teacher_log_prob now comes from the external server.",
+            cfg.get("base_url"),
+            cfg.get("model"),
+        )
+        return self._seed_external_teacher_client
 
     def _lazy_init_seed_teacher_signal_executor(self):
         if self._seed_teacher_signal_executor is None:
@@ -2538,6 +2566,34 @@ class RayPPOTrainer:
         for sample_idx, sample_traj_uid in enumerate(batch.non_tensor_batch["traj_uid"]):
             if sample_traj_uid in analyzed_traj_uids:
                 critical_mask_np[sample_idx] = True
+
+        # 改造点 3 / Phase 2a step selection: restrict OPD-supervised steps to those
+        # where the model saw an anomalous signal (tool error / empty result /
+        # previous action invalid), using tag_error_signal recorded by the
+        # TrajectoryCollector. "trajectory" keeps SEED's original behavior
+        # (all steps of successfully analyzed trajectories).
+        step_selector = str(OmegaConf.select(self.config, "algorithm.seed.step_selector") or "trajectory")
+        if step_selector not in ("trajectory", "error_signal"):
+            raise ValueError(f"algorithm.seed.step_selector must be 'trajectory' or 'error_signal', got {step_selector!r}")
+        metrics["seed/step_selector_error_signal"] = 1.0 if step_selector == "error_signal" else 0.0
+        if step_selector == "error_signal":
+            error_signal_values = batch.non_tensor_batch.get("tag_error_signal")
+            if error_signal_values is None:
+                module_logger.warning(
+                    "algorithm.seed.step_selector=error_signal but the batch has no tag_error_signal key; "
+                    "falling back to trajectory-level selection."
+                )
+            else:
+                error_signal_np = np.asarray([bool(value) for value in error_signal_values], dtype=bool)
+                pre_filter_steps = int(critical_mask_np.sum())
+                critical_mask_np &= error_signal_np
+                metrics["seed/error_signal_step_ratio"] = float(error_signal_np.mean()) if batch_size > 0 else 0.0
+                module_logger.info(
+                    "SEED error-signal step selector kept %s/%s trajectory-selected steps (batch error-signal ratio %.4f).",
+                    int(critical_mask_np.sum()),
+                    pre_filter_steps,
+                    float(error_signal_np.mean()) if batch_size > 0 else 0.0,
+                )
         module_logger.info(
             "SEED episode-level OPD selected %s steps from %s successful analyzed trajectories (%s failed/skipped).",
             int(critical_mask_np.sum()),
@@ -2794,6 +2850,30 @@ class RayPPOTrainer:
                 ],
                 dim=-1,
             )
+            external_teacher_client = self._get_seed_external_teacher_client()
+            if external_teacher_client is not None:
+                if use_prompt_images:
+                    raise RuntimeError("SEED external teacher scoring does not support image prompts yet.")
+                scoring_temperature = float(teacher_meta_info.get("temperature", 1.0) or 1.0)
+                if abs(scoring_temperature - 1.0) > 1e-6:
+                    module_logger.warning(
+                        "SEED external teacher returns raw (temperature=1.0) log-probs, but student log-probs "
+                        "use temperature=%s; the OPD teacher-student gap will be biased.",
+                        scoring_temperature,
+                    )
+                teacher_log_prob_cpu = external_teacher_client.score_response_log_probs(
+                    input_ids=teacher_input_ids,
+                    attention_mask=teacher_attention_mask,
+                    response_masks=response_masks,
+                )
+                module_logger.info(
+                    "SEED %s external-teacher scored %s sequences (token_mean=%.6f).",
+                    label,
+                    teacher_log_prob_cpu.size(0),
+                    float(teacher_log_prob_cpu.sum() / response_masks.detach().cpu().sum().clamp(min=1)),
+                )
+                return teacher_log_prob_cpu.to(device=responses.device)
+
             teacher_position_ids = self._append_response_position_ids(
                 teacher_prompt_batch.batch["position_ids"],
                 responses.size(-1),

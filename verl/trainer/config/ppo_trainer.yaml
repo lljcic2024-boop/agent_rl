@@ -55,7 +55,10 @@ actor_rollout_ref:
     clip_ratio_c: 3.0 # lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729
     loss_agg_mode: "token-mean" # / "seq-mean-token-sum" / "seq-mean-token-mean"
     opd_loss_coef: 0.0 # OPD-style gated auxiliary distillation loss; 0 disables it. For SEED, enabling this uses teacher/OPD signals as loss instead of teacher advantage.
-    opd_gate_beta: 5.0 # sigmoid sharpness for OPD teacher-student gap gating
+    opd_gate_beta: 5.0 # sigmoid sharpness for OPD teacher-student gap gating (opd_loss_mode=gate)
+    opd_loss_mode: gate # 'gate' = SEED original one-sided sigmoid gating; 'rkl' = standard on-policy distillation (signed per-token advantage = teacher_lp - student_lp)
+    opd_rkl_adv_clip: null # optional symmetric clip for the rkl advantage; null disables clipping
+    opd_fkl_loss_coef: 0.0 # forward-KL/CE loss on teacher-generated tokens (marked by batch key teacher_token_mask); 0 disables it. Anneal with ATOD alpha for teacher-prefix injection.
     skill_gen_loss_coef: 0.0 # SEED skill-generation reward-weighted LM loss; 0 disables it.
     skill_gen_micro_batch_size_per_gpu: null # per-GPU micro batch size for long policy-vllm skill generation samples
     skill_gen_micro_batch_size: 1 # deprecated alias for skill_gen_micro_batch_size_per_gpu
@@ -280,6 +283,7 @@ algorithm:
     enable_similarity: False
     similarity_thresh: 0.95
     selector: "llm"
+    step_selector: "trajectory" # 改造点 3 Phase 2a: "trajectory" = SEED original (all steps of analyzed trajectories); "error_signal" = only steps whose observation carried an anomalous signal (needs tag_error_signal from rollout)
     failed_only: False # if True, analyze and apply teacher OPD only on failed episodes
     failed_only_after_steps: null # null -> use failed_only; otherwise analyze all episodes through this step, then failed episodes only
     failure_success_threshold: 1.0 # when episode_success is unavailable, episode_rewards >= this value counts as success
@@ -308,6 +312,14 @@ algorithm:
     state_group_dump_dir: null # null -> ${trainer.default_local_dir}/seed_state_group
     normalize_teacher_adv: False
     clip_teacher_adv: null
+    external_teacher: # 改造点 2: score student tokens with an external teacher server instead of policy self-scoring
+      enable: False
+      base_url: "http://127.0.0.1:8100/v1" # OpenAI-compatible vLLM server of the teacher (e.g. Qwen3-30B-A3B); must support prompt_logprobs
+      model: "Qwen3-30B-A3B"
+      api_key: null
+      timeout: 600.0
+      max_retries: 3
+      concurrency: 8 # parallel HTTP scoring requests
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10
@@ -350,6 +362,7 @@ env:
   seed: 0
   max_steps: 50
   history_length: 2
+  use_function_tags: False # function-typed thinking: prompt declares the <plan>/<verify>/<reflect>/<backtrack> capability menu; must stay consistent across SFT/RL/eval
   resources_per_worker: # resources for each env worker
     num_cpus: 0.1
     num_gpus: 0
