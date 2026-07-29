@@ -4,6 +4,14 @@ dl.sh
 test_api.py
 test_webshop.py
 
+# Cluster-specific config and local ops helpers: these hold internal hostnames,
+# pod IPs and CFS paths. Track examples/seed_trainer/env.cfs.example instead.
+.env
+.env.*
+.conn_monitor.sh
+.diag_timing.sh
+.sync_patch.py
+
 case/
 external_source/
 past

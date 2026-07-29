@@ -248,7 +248,9 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
 
         valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
 
-        action_valids = data_item.non_tensor_batch['is_action_valid'].astype(np.float32)
+        # np.asarray, not .astype: once teacher-branch rows are concatenated the
+        # column is object dtype, so DataProtoItem hands back a plain Python bool.
+        action_valids = np.asarray(data_item.non_tensor_batch['is_action_valid'], dtype=np.float32)
         action_invalids = torch.tensor(1 - action_valids, dtype=torch.float32, device=prompt_ids.device).squeeze(0)
         # invalid action penalty
         # assert reward_tensor[i, valid_response_length - 1] != 0.0, f'i={i}'
@@ -257,7 +259,7 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
         if 'step_rewards' in data.batch.keys():
             step_rewards[i] -= invalid_action_penalty_coef * action_invalids
     
-    valid_action_ratio = np.mean(data.non_tensor_batch['is_action_valid'].astype(np.float32)).item()
+    valid_action_ratio = np.mean(np.asarray(data.non_tensor_batch['is_action_valid'], dtype=np.float32)).item()
     metrics = {'episode/valid_action_ratio': valid_action_ratio}
     return data, metrics
 
@@ -542,6 +544,8 @@ class RayPPOTrainer:
         self._seed_external_teacher_client = None
         self._seed_external_teacher_init_done = False
         self.traj_collector = traj_collector
+        # 改造点 4: built lazily on first use, once actor_rollout_wg exists
+        self._teacher_branch_runner = None
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -649,6 +653,45 @@ class RayPPOTrainer:
     def _is_seed_opd_loss_enabled(self) -> bool:
         opd_loss_coef = OmegaConf.select(self.config, "actor_rollout_ref.actor.opd_loss_coef")
         return float(opd_loss_coef or 0.0) > 0.0
+
+    def _is_teacher_branch_enabled(self) -> bool:
+        """改造点 4: teacher-prefix branches need the FKL term to be active."""
+        if not self._config_bool(self.config, "algorithm.seed.teacher_branch.enable", False):
+            return False
+        fkl_coef = OmegaConf.select(self.config, "actor_rollout_ref.actor.opd_fkl_loss_coef")
+        if float(fkl_coef or 0.0) <= 0.0:
+            print(
+                "[teacher_branch] algorithm.seed.teacher_branch.enable=True but "
+                "actor.opd_fkl_loss_coef=0; a_T tokens would be masked out of every loss. "
+                "Disabling branches."
+            )
+            return False
+        return True
+
+    def _use_loss_mask(self) -> bool:
+        """
+        Whether downstream stages must read `loss_mask` instead of `attention_mask`.
+
+        `rollout.multi_turn.enable` is verl's own flag for tool-calling rollouts
+        and asserts a tool config, so 改造点 4 cannot reuse it directly. Branch
+        rows carry a `loss_mask` that excludes the teacher's a_T tokens, and that
+        mask is only honored when this is true (see `dp_actor.update_policy`,
+        `apply_kl_penalty`, and the GRPO branch of `compute_advantage`).
+        """
+        return bool(self.config.actor_rollout_ref.rollout.multi_turn.enable) or self._is_teacher_branch_enabled()
+
+    def _get_teacher_branch_runner(self):
+        """Build the 改造点 4 runner on first use (needs actor_rollout_wg)."""
+        if self._teacher_branch_runner is None:
+            from agent_system.multi_turn_rollout.branch_runner import TeacherBranchRunner
+
+            self._teacher_branch_runner = TeacherBranchRunner(
+                config=self.config,
+                tokenizer=self.tokenizer,
+                collector=self.traj_collector,
+                actor_rollout_wg=self.actor_rollout_wg,
+            )
+        return self._teacher_branch_runner
 
     @staticmethod
     def _config_bool(config, key: str, default: bool = False) -> bool:
@@ -965,6 +1008,11 @@ class RayPPOTrainer:
             "episode_rewards",
             "multi_modal_inputs",
             "is_action_valid",
+            # 改造点 3: the error-signal step selector reads this off the batch it
+            # is given, which is this snapshot when scoring runs async. Without it
+            # the selector logs "no tag_error_signal key" and silently degrades to
+            # trajectory-level selection.
+            "tag_error_signal",
         ]
         non_tensors = {}
         for key in non_tensor_keys:
@@ -3147,6 +3195,10 @@ class RayPPOTrainer:
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
+                # 改造点 4 needs the env reset payloads to replay branch points,
+                # but the rollout loop pops them off gen_batch. Keep a reference
+                # here; rows are matched back by sample_id (index into this array).
+                branch_env_kwargs = gen_batch.non_tensor_batch.get("env_kwargs")
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -3200,6 +3252,28 @@ class RayPPOTrainer:
                     # batch = batch.union(gen_batch_output)
                     del batch
                     batch = gen_batch_output
+
+                    # 改造点 4: teacher-prefix branch rollouts. Branch rows are
+                    # appended to the batch before step rewards / advantages, so
+                    # they take part in the same GRPO group as their parent (they
+                    # inherit its uid) while their a_T tokens are excluded from
+                    # the PG loss_mask and marked in teacher_token_mask for FKL.
+                    if self._is_teacher_branch_enabled():
+                        with _timer("teacher_branch", timing_raw):
+                            from agent_system.multi_turn_rollout.branch_runner import (
+                                attach_default_masks,
+                            )
+
+                            branch_runner = self._get_teacher_branch_runner()
+                            branch_batch, branch_metrics = branch_runner.run(
+                                batch=batch,
+                                global_step=self.global_steps,
+                                env_kwargs=branch_env_kwargs,
+                            )
+                            metrics.update(branch_metrics)
+                            batch = attach_default_masks(batch)
+                            if branch_batch is not None:
+                                batch = DataProto.concat([batch, branch_batch])
 
                     if self.config.algorithm.adv_estimator in [AdvantageEstimator.GiGPO, AdvantageEstimator.SEED]:
                         step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
@@ -3373,7 +3447,12 @@ class RayPPOTrainer:
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
+                            batch, kl_metrics = apply_kl_penalty(
+                                batch,
+                                kl_ctrl=self.kl_ctrl_in_reward,
+                                kl_penalty=self.config.algorithm.kl_penalty,
+                                multi_turn=self._use_loss_mask(),
+                            )
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
@@ -3405,7 +3484,7 @@ class RayPPOTrainer:
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                            multi_turn=self._use_loss_mask(),
                             use_pf_ppo=self.config.algorithm.use_pf_ppo,
                             pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
                             pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
@@ -3441,7 +3520,7 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer("update_actor", timing_raw):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            batch.meta_info["multi_turn"] = self._use_loss_mask()
                             batch.meta_info["global_step"] = self.global_steps
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])

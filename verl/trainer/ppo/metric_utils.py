@@ -89,6 +89,19 @@ def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
     )
 
 
+def _episode_stat(batch: DataProto, key: str, unique_idx, reduction: str) -> float:
+    """
+    Reduce an object-dtype episode column to a float.
+
+    `collate_fn` stores every non-tensor column as `dtype=object`, so reducing it
+    directly returns whichever scalar type the rows held: np.float32 from the
+    main rollout (has `.item()`) but a plain Python float from a teacher-branch
+    row. Casting to float32 first makes the reduction type-independent.
+    """
+    values = np.asarray(batch.non_tensor_batch[key][unique_idx], dtype=np.float32)
+    return float(getattr(values, reduction)())
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -179,25 +192,18 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
         # episode
-        "episode/reward/mean": 
-            batch.non_tensor_batch["episode_rewards"][unique_idx].mean().item(),
-        "episode/reward/max": 
-            batch.non_tensor_batch["episode_rewards"][unique_idx].max().item(),
-        "episode/reward/min": 
-            batch.non_tensor_batch["episode_rewards"][unique_idx].min().item(),
-        "episode/length/mean": 
-            batch.non_tensor_batch["episode_lengths"][unique_idx].mean().item(),
-        "episode/length/max":
-            batch.non_tensor_batch["episode_lengths"][unique_idx].max().item(),
-        "episode/length/min": 
-            batch.non_tensor_batch["episode_lengths"][unique_idx].min().item(),
-        "episode/tool_call_count/mean": 
-            batch.non_tensor_batch["tool_callings"][unique_idx].mean().item(),
-        # "episode/tool_call_count/max":
-        #     batch.non_tensor_batch["tool_callings"][unique_idx].max().item(),
-        # "episode/tool_call_count/min":
-        #     batch.non_tensor_batch["tool_callings"][unique_idx].min().item(),
-        **({f"episode/{k}": v[0].item() for k, v in batch.non_tensor_batch.items() if "success_rate" in k}),
+        # np.asarray with an explicit dtype, not the raw object column: collate_fn
+        # stores these as dtype=object, so reductions hand back whatever scalar
+        # type the rows happened to hold (a teacher-branch row carries a plain
+        # Python float, which has no .item()).
+        "episode/reward/mean": _episode_stat(batch, "episode_rewards", unique_idx, "mean"),
+        "episode/reward/max": _episode_stat(batch, "episode_rewards", unique_idx, "max"),
+        "episode/reward/min": _episode_stat(batch, "episode_rewards", unique_idx, "min"),
+        "episode/length/mean": _episode_stat(batch, "episode_lengths", unique_idx, "mean"),
+        "episode/length/max": _episode_stat(batch, "episode_lengths", unique_idx, "max"),
+        "episode/length/min": _episode_stat(batch, "episode_lengths", unique_idx, "min"),
+        "episode/tool_call_count/mean": _episode_stat(batch, "tool_callings", unique_idx, "mean"),
+        **({f"episode/{k}": float(v[0]) for k, v in batch.non_tensor_batch.items() if "success_rate" in k}),
     }
 
     # Function-typed thinking tag behavior (plan/verify/reflect/backtrack),

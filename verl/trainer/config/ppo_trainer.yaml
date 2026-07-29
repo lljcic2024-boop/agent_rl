@@ -320,6 +320,17 @@ algorithm:
       timeout: 600.0
       max_retries: 3
       concurrency: 8 # parallel HTTP scoring requests
+    teacher_branch: # 改造点 4: replay a step with a teacher-written thinking prefix (a_T) and let the student continue
+      enable: False
+      max_branches_per_traj: 1 # branch points sampled per parent trajectory
+      max_total_branches: null # null -> no global cap; otherwise cap branches per training step
+      require_error_signal: True # only branch at steps whose observation carried an anomaly (改造点 3 error-signal)
+      max_prefix_tokens: null # null -> data.max_response_length // 2; a_T is truncated to this many tokens
+      prefix_concurrency: 8 # parallel a_T requests to the teacher server
+      prefix_max_retries: 2 # attempts per spec before the branch point is dropped
+      start_after_steps: null # null -> branch from the first training step
+      stop_after_steps: null # null -> keep branching; otherwise stop after this step
+      strict: False # raise instead of silently training with an empty FKL term (use for smoke runs)
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10

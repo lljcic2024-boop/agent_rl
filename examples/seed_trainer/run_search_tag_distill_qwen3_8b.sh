@@ -26,7 +26,9 @@ if [[ -f "$ENV_FILE" ]]; then
     set +a
 fi
 
-CONDA_ENV="${CONDA_ENV:-copd}"
+# `-` not `:-`: an explicitly empty CONDA_ENV means "use the current interpreter"
+# (the cluster pods have no conda at all), while unset still defaults to copd.
+CONDA_ENV="${CONDA_ENV-copd}"
 if [[ -n "$CONDA_ENV" && "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV" ]]; then
     if ! command -v conda >/dev/null 2>&1; then
         echo "conda is required to activate environment: $CONDA_ENV" >&2
@@ -85,9 +87,16 @@ export SEARCH_USE_FUNCTION_TAGS="${SEARCH_USE_FUNCTION_TAGS:-True}"
 export SEED_OPD_LOSS_MODE="${SEED_OPD_LOSS_MODE:-rkl}"
 export SEED_OPD_LOSS_COEF="${SEED_OPD_LOSS_COEF:-0.01}"
 export SEED_OPD_RKL_ADV_CLIP="${SEED_OPD_RKL_ADV_CLIP:-5.0}"
-# FKL on teacher-generated a_T tokens; stays 0 until the teacher-prefix
-# rollout branch (modification 4) feeds teacher_token_mask into the batch.
-export SEED_OPD_FKL_LOSS_COEF="${SEED_OPD_FKL_LOSS_COEF:-0.0}"
+# FKL on teacher-generated a_T tokens, produced by the teacher-prefix branch
+# rollout (modification 4). Both must be on together: with the branch off there
+# are no a_T tokens to learn from, and with the coefficient at 0 the branch rows
+# would carry tokens that are in no loss at all (the trainer self-disables in
+# that case).
+export SEED_OPD_FKL_LOSS_COEF="${SEED_OPD_FKL_LOSS_COEF:-0.05}"
+export SEED_TEACHER_BRANCH_ENABLE="${SEED_TEACHER_BRANCH_ENABLE:-True}"
+export SEED_TEACHER_BRANCH_MAX_PER_TRAJ="${SEED_TEACHER_BRANCH_MAX_PER_TRAJ:-1}"
+export SEED_TEACHER_BRANCH_REQUIRE_ERROR_SIGNAL="${SEED_TEACHER_BRANCH_REQUIRE_ERROR_SIGNAL:-True}"
+export SEED_TEACHER_BRANCH_PREFIX_CONCURRENCY="${SEED_TEACHER_BRANCH_PREFIX_CONCURRENCY:-8}"
 
 # Step selection: error-signal steps only (modification 3, Phase 2a).
 export SEED_STEP_SELECTOR="${SEED_STEP_SELECTOR:-error_signal}"
@@ -121,6 +130,7 @@ echo "  analysis backend: $SEED_ANALYSIS_BACKEND ($OPENAI_MODEL @ $OPENAI_BASE_U
 echo "  function tags:    $SEARCH_USE_FUNCTION_TAGS"
 echo "  opd loss:         mode=$SEED_OPD_LOSS_MODE coef=$SEED_OPD_LOSS_COEF clip=$SEED_OPD_RKL_ADV_CLIP fkl=$SEED_OPD_FKL_LOSS_COEF"
 echo "  step selector:    $SEED_STEP_SELECTOR"
+echo "  teacher branch:   $SEED_TEACHER_BRANCH_ENABLE (per-traj=$SEED_TEACHER_BRANCH_MAX_PER_TRAJ err-signal=$SEED_TEACHER_BRANCH_REQUIRE_ERROR_SIGNAL)"
 echo "  experiment:       $EXPERIMENT_NAME"
 echo "  output dir:       $DEFAULT_LOCAL_DIR"
 echo "  training steps:   $TOTAL_TRAINING_STEPS"

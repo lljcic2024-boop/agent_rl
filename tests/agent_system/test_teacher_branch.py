@@ -8,6 +8,7 @@ with fake env / policy hooks. Pure Python: no verl / ray / omegaconf needed.
 import importlib.util
 import pathlib
 import random
+import threading
 
 import pytest
 
@@ -347,3 +348,253 @@ def test_summarize_branch_metrics():
     assert metrics["seed/teacher_branch/mean_episode_reward"] == pytest.approx(1.25)
     empty = m.summarize_branch_metrics([])
     assert empty["seed/teacher_branch/num_branches"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# generate_teacher_prefixes: thread pool
+# ---------------------------------------------------------------------------
+
+def test_generate_teacher_prefixes_parallel_matches_serial():
+    specs = [
+        m.BranchSpec(f"t{i}", f"g{i}", i, 0, 1, [], f"obs-{i}")
+        for i in range(6)
+    ]
+    lock = threading.Lock()
+    seen = []
+
+    def chat_fn(messages):
+        obs = messages[1]["content"]
+        with lock:
+            seen.append(obs)
+        # odd specs get unparseable answers so they must be dropped
+        index = int(obs.split("obs-")[1][0])
+        if index % 2 == 0:
+            return f"<reflect>observation {index} shows the query missed the entity</reflect>"
+        return "untagged rubbish"
+
+    prefixes, failures = m.generate_teacher_prefixes(
+        specs, chat_fn, max_retries=1, max_workers=4
+    )
+    assert set(prefixes) == {0, 2, 4}
+    assert set(failures) == {1, 3, 5}
+    assert len(seen) == 6  # max_retries=1 -> exactly one call per spec
+    # each prefix belongs to its own spec (no cross-thread mixups)
+    for index, text in prefixes.items():
+        assert f"observation {index}" in text
+
+
+def test_generate_teacher_prefixes_single_worker_is_serial():
+    specs = [m.BranchSpec(f"t{i}", f"g{i}", i, 0, 1, [], f"obs-{i}") for i in range(3)]
+    order = []
+
+    def chat_fn(messages):
+        order.append(messages[1]["content"].split("obs-")[1][0])
+        return "<reflect>the previous query missed the actual entity in question</reflect>"
+
+    prefixes, failures = m.generate_teacher_prefixes(specs, chat_fn, max_workers=1)
+    assert set(prefixes) == {0, 1, 2}
+    assert not failures
+    assert order == ["0", "1", "2"]
+
+
+# ---------------------------------------------------------------------------
+# bucket_specs_by_replay_length
+# ---------------------------------------------------------------------------
+
+def test_buckets_group_by_replay_length_and_drop_missing_prefix():
+    specs = [
+        _one_spec(replay_actions=["a"]),                 # 0 -> len 1
+        _one_spec(replay_actions=["a", "b"]),            # 1 -> len 2
+        _one_spec(replay_actions=["c"]),                 # 2 -> len 1
+        _one_spec(replay_actions=["a", "b", "c"]),       # 3 -> dropped (no a_T)
+    ]
+    buckets = m.bucket_specs_by_replay_length(specs, {0: PREFIX, 1: PREFIX, 2: PREFIX})
+    assert buckets == [[0, 2], [1]]  # ordered by replay length, original order kept
+
+
+def test_buckets_empty_when_no_prefix():
+    assert m.bucket_specs_by_replay_length([_one_spec()], {}) == []
+
+
+# ---------------------------------------------------------------------------
+# run_branch_rollout_batched (fake batched env + fake batched policy)
+# ---------------------------------------------------------------------------
+
+class FakeBatchedEnv:
+    """Batched Search-like env; one instance serves every bucket in lockstep."""
+
+    def __init__(self, steps_to_answer=2):
+        self.steps_to_answer = steps_to_answer
+        self.start_calls = []
+        self.step_calls = []
+        self._n = 0
+
+    def start_batch(self, specs):
+        self.start_calls.append([list(s.replay_actions) for s in specs])
+        self._n = 0
+        return [f"obs@branch:{s.branch_step_num}" for s in specs]
+
+    def step_batch(self, specs, actions):
+        self.step_calls.append(list(actions))
+        self._n += 1
+        obs, rewards, dones, infos = [], [], [], []
+        for action in actions:
+            done = "<answer>" in action or self._n >= self.steps_to_answer
+            obs.append("terminal" if done else f"obs@{self._n}")
+            rewards.append(1.0 if done else 0.0)
+            dones.append(done)
+            infos.append({"is_action_valid": True})
+        return obs, rewards, dones, infos
+
+
+def scripted_generate_batch(obs_texts, prefixes, spec_indices, step_num):
+    out = []
+    for obs_text, prefix in zip(obs_texts, prefixes):
+        if prefix is not None:
+            out.append(prefix + "need the official name</think><search>official name</search>")
+        else:
+            out.append("<think><verify>result matches all constraints</verify></think><answer>X</answer>")
+    return out
+
+
+def test_batched_rollout_matches_serial_rollout():
+    spec = _one_spec()
+    serial_env = FakeSearchEnv(steps_to_answer=2)
+    serial = m.run_branch_rollout(
+        [spec], {0: PREFIX},
+        env_start=serial_env.start, env_step=serial_env.step,
+        generate=scripted_generate, max_steps=4,
+    )
+    batched_env = FakeBatchedEnv(steps_to_answer=2)
+    batched = m.run_branch_rollout_batched(
+        [spec], {0: PREFIX},
+        env_start_batch=batched_env.start_batch,
+        env_step_batch=batched_env.step_batch,
+        generate_batch=scripted_generate_batch,
+        max_steps=4,
+    )
+    assert len(batched) == len(serial) == 1
+    assert batched[0].episode_reward == serial[0].episode_reward
+    assert batched[0].episode_length == serial[0].episode_length
+    assert batched[0].done == serial[0].done
+    keys = ("uid", "step_num", "step_id", "rewards", "branch_prefix_text", "tag_final_answer")
+    for got, want in zip(batched[0].rows, serial[0].rows):
+        assert {k: got[k] for k in keys} == {k: want[k] for k in keys}
+
+
+def test_batched_rollout_one_generate_call_per_step_per_bucket():
+    specs = [_one_spec(), _one_spec(parent_traj_uid="t1", sample_id=1)]
+    env = FakeBatchedEnv(steps_to_answer=2)
+    calls = []
+
+    def counting_generate(obs_texts, prefixes, spec_indices, step_num):
+        calls.append((step_num, list(spec_indices), list(prefixes)))
+        return scripted_generate_batch(obs_texts, prefixes, spec_indices, step_num)
+
+    trajs = m.run_branch_rollout_batched(
+        specs, {0: PREFIX, 1: PREFIX},
+        env_start_batch=env.start_batch,
+        env_step_batch=env.step_batch,
+        generate_batch=counting_generate,
+        max_steps=4,
+    )
+    assert len(trajs) == 2
+    # same replay length -> one bucket -> 2 steps -> 2 batched calls of width 2
+    assert len(env.start_calls) == 1
+    assert [c[0] for c in calls] == [1, 2]
+    assert [c[1] for c in calls] == [[0, 1], [0, 1]]
+    assert calls[0][2] == [PREFIX, PREFIX]  # a_T only on the branch step
+    assert calls[1][2] == [None, None]
+
+
+def test_batched_rollout_splits_buckets_by_replay_length():
+    specs = [
+        _one_spec(replay_actions=["a"], branch_step_num=1),
+        _one_spec(parent_traj_uid="t1", replay_actions=["a", "b"], branch_step_num=2),
+    ]
+    env = FakeBatchedEnv(steps_to_answer=1)
+    widths = []
+
+    def counting_generate(obs_texts, prefixes, spec_indices, step_num):
+        widths.append(len(obs_texts))
+        return scripted_generate_batch(obs_texts, prefixes, spec_indices, step_num)
+
+    trajs = m.run_branch_rollout_batched(
+        specs, {0: PREFIX, 1: PREFIX},
+        env_start_batch=env.start_batch,
+        env_step_batch=env.step_batch,
+        generate_batch=counting_generate,
+        max_steps=4,
+    )
+    assert len(env.start_calls) == 2  # one reset+replay per bucket
+    assert env.start_calls == [[["a"]], [["a", "b"]]]
+    assert widths == [1, 1]
+    assert {t.spec.branch_step_num for t in trajs} == {1, 2}
+
+
+def test_batched_rollout_masks_finished_branches():
+    """A branch that finishes early contributes no further rows."""
+    specs = [_one_spec(), _one_spec(parent_traj_uid="t1", sample_id=1)]
+    env = FakeBatchedEnv(steps_to_answer=3)
+
+    def generate(obs_texts, prefixes, spec_indices, step_num):
+        out = []
+        for i, prefix in zip(spec_indices, prefixes):
+            body = "<search>official name</search>"
+            if i == 0 and step_num >= 2:
+                body = "<answer>early</answer>"  # spec 0 stops at step 2
+            out.append((prefix or "") + body)
+        return out
+
+    trajs = m.run_branch_rollout_batched(
+        specs, {0: PREFIX, 1: PREFIX},
+        env_start_batch=env.start_batch,
+        env_step_batch=env.step_batch,
+        generate_batch=generate,
+        max_steps=4,
+    )
+    by_traj = {t.spec.parent_traj_uid: t for t in trajs}
+    assert len(by_traj["t0"].rows) == 2  # steps 1, 2 then done
+    assert by_traj["t0"].done
+    assert len(by_traj["t1"].rows) == 3  # keeps going to the step budget
+    assert by_traj["t0"].episode_length == 1 + 2
+
+
+def test_batched_rollout_respects_max_steps_budget():
+    spec = _one_spec(replay_actions=["a", "b"], branch_step_num=2)
+    env = FakeBatchedEnv(steps_to_answer=99)  # never terminates
+    trajs = m.run_branch_rollout_batched(
+        [spec], {0: PREFIX},
+        env_start_batch=env.start_batch,
+        env_step_batch=env.step_batch,
+        generate_batch=lambda o, p, s, n: [(p[0] or "") + "<search>q</search>"],
+        max_steps=4,
+    )
+    assert len(trajs[0].rows) == 2  # max_steps 4 - 2 replayed
+    assert not trajs[0].done
+
+
+def test_batched_rollout_rejects_generate_dropping_prefix():
+    spec = _one_spec()
+    env = FakeBatchedEnv()
+    with pytest.raises(ValueError):
+        m.run_branch_rollout_batched(
+            [spec], {0: PREFIX},
+            env_start_batch=env.start_batch,
+            env_step_batch=env.step_batch,
+            generate_batch=lambda o, p, s, n: ["<think>fresh</think><answer>X</answer>"],
+            max_steps=4,
+        )
+
+
+def test_batched_rollout_rejects_width_mismatch():
+    spec = _one_spec()
+    env = FakeBatchedEnv()
+    with pytest.raises(ValueError):
+        m.run_branch_rollout_batched(
+            [spec], {0: PREFIX},
+            env_start_batch=lambda specs: [],  # wrong width
+            env_step_batch=env.step_batch,
+            generate_batch=scripted_generate_batch,
+            max_steps=4,
+        )

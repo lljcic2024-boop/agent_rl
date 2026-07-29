@@ -271,16 +271,45 @@ def parse_teacher_prefix_response(
     return f"{_THINK_OPEN}\n{content}\n"
 
 
+def _generate_one_prefix(
+    spec: BranchSpec,
+    chat_fn: Callable[[List[Dict[str, str]]], str],
+    *,
+    tag_instruction: Optional[str],
+    max_retries: int,
+) -> Tuple[Optional[str], str]:
+    """Request a_T for one spec. Returns (prefix or None, error message)."""
+    messages = build_teacher_prefix_messages(
+        spec.branch_observation, tag_instruction=tag_instruction
+    )
+    last_error = "no attempt made"
+    for _ in range(max(1, int(max_retries))):
+        try:
+            reply = chat_fn(messages)
+            return parse_teacher_prefix_response(reply), ""
+        except TeacherPrefixParseError as exc:
+            last_error = str(exc)
+        except Exception as exc:  # transport errors: retry, then drop
+            last_error = f"teacher call failed: {exc}"
+    return None, last_error
+
+
 def generate_teacher_prefixes(
     specs: Sequence[BranchSpec],
     chat_fn: Callable[[List[Dict[str, str]]], str],
     *,
     tag_instruction: Optional[str] = None,
     max_retries: int = 2,
+    max_workers: int = 1,
 ) -> Tuple[Dict[int, str], Dict[int, str]]:
     """
     Request a_T for every spec through `chat_fn` (an OpenAI-compatible chat
     call returning the assistant message content, e.g. the analyzer client).
+
+    `max_workers > 1` issues the teacher calls from a thread pool; the teacher
+    is a remote HTTP server, so this is the difference between one training step
+    waiting seconds and waiting minutes. `chat_fn` must then be thread-safe
+    (the OpenAI client is).
 
     Returns:
         (prefixes, failures): spec index -> prefix text, spec index -> error.
@@ -288,23 +317,43 @@ def generate_teacher_prefixes(
     """
     prefixes: Dict[int, str] = {}
     failures: Dict[int, str] = {}
-    for i, spec in enumerate(specs):
-        messages = build_teacher_prefix_messages(
-            spec.branch_observation, tag_instruction=tag_instruction
-        )
-        last_error = "no attempt made"
-        for _ in range(max(1, int(max_retries))):
+
+    def record(index: int, result: Tuple[Optional[str], str]) -> None:
+        prefix, error = result
+        if prefix is None:
+            failures[index] = error
+        else:
+            prefixes[index] = prefix
+
+    workers = max(1, int(max_workers))
+    if workers == 1 or len(specs) <= 1:
+        for i, spec in enumerate(specs):
+            record(
+                i,
+                _generate_one_prefix(
+                    spec, chat_fn, tag_instruction=tag_instruction, max_retries=max_retries
+                ),
+            )
+        return prefixes, failures
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(specs))) as pool:
+        futures = {
+            pool.submit(
+                _generate_one_prefix,
+                spec,
+                chat_fn,
+                tag_instruction=tag_instruction,
+                max_retries=max_retries,
+            ): i
+            for i, spec in enumerate(specs)
+        }
+        for future, index in futures.items():
             try:
-                reply = chat_fn(messages)
-                prefixes[i] = parse_teacher_prefix_response(reply)
-                last_error = ""
-                break
-            except TeacherPrefixParseError as exc:
-                last_error = str(exc)
-            except Exception as exc:  # transport errors: retry, then drop
-                last_error = f"teacher call failed: {exc}"
-        if last_error:
-            failures[i] = last_error
+                record(index, future.result())
+            except Exception as exc:  # pragma: no cover - defensive
+                failures[index] = f"teacher call failed: {exc}"
     return prefixes, failures
 
 
@@ -451,6 +500,147 @@ def run_branch_rollout(
                 done=bool(done),
             )
         )
+    return trajectories
+
+
+def bucket_specs_by_replay_length(
+    specs: Sequence[BranchSpec],
+    prefix_texts: Dict[int, str],
+) -> List[List[int]]:
+    """
+    Group spec indices by replay length so each bucket can be driven in lockstep.
+
+    All specs in one bucket need the same number of replayed parent actions,
+    which is what lets a single batched environment replay them together and
+    then continue every branch with one `generate_batch` call per step.
+    Specs without a teacher prefix are dropped (no branch for that point).
+
+    Returns:
+        Buckets ordered by replay length; indices inside a bucket keep the
+        original `specs` order.
+    """
+    buckets: Dict[int, List[int]] = {}
+    for i, spec in enumerate(specs):
+        if prefix_texts.get(i) is None:
+            continue
+        buckets.setdefault(len(spec.replay_actions), []).append(i)
+    return [buckets[key] for key in sorted(buckets)]
+
+
+def run_branch_rollout_batched(
+    specs: Sequence[BranchSpec],
+    prefix_texts: Dict[int, str],
+    *,
+    env_start_batch: Callable[[List[BranchSpec]], List[str]],
+    env_step_batch: Callable[
+        [List[BranchSpec], List[str]],
+        Tuple[List[str], List[float], List[bool], List[Dict[str, Any]]],
+    ],
+    generate_batch: Callable[[List[str], List[Optional[str]], List[int], int], List[str]],
+    max_steps: int,
+) -> List[BranchTrajectory]:
+    """
+    Batched counterpart of `run_branch_rollout`, one generate call per step.
+
+    Same row/episode contract as `run_branch_rollout` (rows come from the shared
+    `_make_branch_row`), but branches are processed in replay-length buckets and
+    every step of a bucket issues a single batched policy call, which is what
+    the cluster rollout worker needs to stay efficient.
+
+    Injected hooks (bucket-wide, all lists aligned with the bucket order):
+    - `env_start_batch(specs)`: reset the batched env for these specs and replay
+      `spec.replay_actions`; return the observation text at each branch step.
+    - `env_step_batch(specs, action_texts)` -> (next_obs, rewards, dones, infos);
+      finished branches are still stepped (like the main rollout loop does) and
+      simply masked out here.
+    - `generate_batch(obs_texts, prefix_texts, spec_indices, step_num)` -> full
+      response text per row. `prefix_texts[i]` is non-None only on the branch
+      step, where the returned text must start with that prefix. `spec_indices`
+      are indices into `specs`, so the cluster glue can stash the token-level
+      tensors it produced for each row.
+    """
+    trajectories: List[BranchTrajectory] = []
+    for bucket in bucket_specs_by_replay_length(specs, prefix_texts):
+        bucket_specs = [specs[i] for i in bucket]
+        obs_texts = list(env_start_batch(bucket_specs))
+        if len(obs_texts) != len(bucket_specs):
+            raise ValueError(
+                f"env_start_batch returned {len(obs_texts)} observations for {len(bucket_specs)} specs"
+            )
+
+        branch_step_num = bucket_specs[0].branch_step_num
+        remaining_steps = max(0, int(max_steps) - len(bucket_specs[0].replay_actions))
+        n = len(bucket_specs)
+        rows: List[List[Dict[str, Any]]] = [[] for _ in range(n)]
+        branch_rewards = [0.0] * n
+        steps_taken = [0] * n
+        prev_action_invalid = [False] * n
+        active = [True] * n
+        done_flags = [False] * n
+
+        for offset in range(remaining_steps):
+            step_num = branch_step_num + offset
+            step_prefixes: List[Optional[str]] = [
+                prefix_texts[bucket[i]] if offset == 0 else None for i in range(n)
+            ]
+            response_texts = list(generate_batch(obs_texts, step_prefixes, bucket, step_num))
+            if len(response_texts) != n:
+                raise ValueError(f"generate_batch returned {len(response_texts)} responses for {n} rows")
+            for i in range(n):
+                expected_prefix = step_prefixes[i]
+                if expected_prefix is not None and not str(response_texts[i]).startswith(expected_prefix):
+                    raise ValueError(
+                        "generate_batch() must return the full response including the a_T prefix "
+                        "for the branch step"
+                    )
+
+            next_obs, rewards, dones, infos = env_step_batch(bucket_specs, response_texts)
+            infos = list(infos or [{} for _ in range(n)])
+
+            for i in range(n):
+                if not active[i]:
+                    continue
+                info = infos[i] or {}
+                is_action_valid = bool(info.get("is_action_valid", True))
+                rows[i].append(
+                    _make_branch_row(
+                        bucket_specs[i],
+                        step_num=step_num,
+                        obs_text=obs_texts[i],
+                        response_text=response_texts[i],
+                        reward=float(rewards[i]),
+                        done=bool(dones[i]),
+                        is_action_valid=is_action_valid,
+                        prev_action_invalid=prev_action_invalid[i],
+                        prefix_text=step_prefixes[i],
+                    )
+                )
+                branch_rewards[i] += float(rewards[i])
+                steps_taken[i] += 1
+                prev_action_invalid[i] = not is_action_valid
+                if bool(dones[i]):
+                    done_flags[i] = True
+                    active[i] = False
+
+            obs_texts = list(next_obs)
+            if not any(active):
+                break
+
+        for i, spec in enumerate(bucket_specs):
+            episode_reward = spec.prefix_reward + branch_rewards[i]
+            episode_length = spec.branch_step_num + steps_taken[i]
+            for row in rows[i]:
+                row["episode_rewards"] = episode_reward
+                row["episode_lengths"] = episode_length
+            trajectories.append(
+                BranchTrajectory(
+                    spec=spec,
+                    rows=rows[i],
+                    episode_reward=episode_reward,
+                    episode_length=episode_length,
+                    done=done_flags[i],
+                )
+            )
     return trajectories
 
 

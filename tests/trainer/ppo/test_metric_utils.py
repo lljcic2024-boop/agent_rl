@@ -107,7 +107,17 @@ class TestComputeDataMetrics(unittest.TestCase):
             ]),
             "values": torch.tensor([[0.9, 1.0], [1.1, 1.2]]),
         }
-    
+        # collate_fn stores every non-tensor column as dtype=object, so the
+        # episode columns can hold mixed scalar types: np.float32 from the main
+        # rollout path and a plain Python float/int from a teacher-branch row.
+        # The fixture mixes both on purpose so the reduction stays type-agnostic.
+        self.batch.non_tensor_batch = {
+            "traj_uid": np.array(["t0", "t1"], dtype=object),
+            "episode_rewards": np.array([np.float32(1.0), 2.0], dtype=object),
+            "episode_lengths": np.array([np.float32(3.0), 5], dtype=object),
+            "tool_callings": np.array([np.float32(1.0), 2.0], dtype=object),
+        }
+
     def test_compute_data_metrics_with_critic(self):
         """Test compute_data_metrics with critic enabled."""
         metrics = compute_data_metrics(self.batch, use_critic=True)
@@ -125,6 +135,13 @@ class TestComputeDataMetrics(unittest.TestCase):
         # Check some specific values
         self.assertAlmostEqual(metrics["critic/score/mean"], 5.0)  # Sum of token_level_scores
         self.assertAlmostEqual(metrics["critic/rewards/mean"], 2.5)  # Sum of token_level_rewards
+
+        # Mixed np.float32 / plain-Python scalars in the object-dtype episode
+        # columns must still reduce to a float.
+        self.assertAlmostEqual(metrics["episode/reward/mean"], 1.5)
+        self.assertAlmostEqual(metrics["episode/reward/max"], 2.0)
+        self.assertAlmostEqual(metrics["episode/length/max"], 5.0)
+        self.assertIsInstance(metrics["episode/reward/max"], float)
     
     def test_compute_data_metrics_without_critic(self):
         """Test compute_data_metrics with critic disabled."""

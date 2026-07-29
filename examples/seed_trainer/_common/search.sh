@@ -41,8 +41,26 @@ SEED_OPD_FKL_LOSS_COEF=${SEED_OPD_FKL_LOSS_COEF:-0.0}
 SEED_EXTERNAL_TEACHER_ENABLE=${SEED_EXTERNAL_TEACHER_ENABLE:-False}
 SEED_EXTERNAL_TEACHER_BASE_URL=${SEED_EXTERNAL_TEACHER_BASE_URL:-http://127.0.0.1:8100/v1}
 SEED_EXTERNAL_TEACHER_MODEL=${SEED_EXTERNAL_TEACHER_MODEL:-Qwen3-30B-A3B}
+# Scoring concurrency. Each request makes the teacher materialize prompt logprobs
+# for the whole sequence, so 8 in flight OOMs a TP=4 30B server on 80G cards.
+SEED_EXTERNAL_TEACHER_CONCURRENCY=${SEED_EXTERNAL_TEACHER_CONCURRENCY:-2}
 SEED_STEP_SELECTOR=${SEED_STEP_SELECTOR:-trajectory}
 SEARCH_USE_FUNCTION_TAGS=${SEARCH_USE_FUNCTION_TAGS:-False}
+
+# Teacher-prefix (a_T) branch rollout: needs opd_fkl_loss_coef > 0 to have any
+# effect, since a_T tokens are excluded from the PG loss_mask by construction.
+SEED_TEACHER_BRANCH_ENABLE=${SEED_TEACHER_BRANCH_ENABLE:-False}
+SEED_TEACHER_BRANCH_MAX_PER_TRAJ=${SEED_TEACHER_BRANCH_MAX_PER_TRAJ:-1}
+SEED_TEACHER_BRANCH_MAX_TOTAL=${SEED_TEACHER_BRANCH_MAX_TOTAL:-null}
+SEED_TEACHER_BRANCH_REQUIRE_ERROR_SIGNAL=${SEED_TEACHER_BRANCH_REQUIRE_ERROR_SIGNAL:-True}
+SEED_TEACHER_BRANCH_MAX_PREFIX_TOKENS=${SEED_TEACHER_BRANCH_MAX_PREFIX_TOKENS:-null}
+SEED_TEACHER_BRANCH_PREFIX_CONCURRENCY=${SEED_TEACHER_BRANCH_PREFIX_CONCURRENCY:-8}
+SEED_TEACHER_BRANCH_START_AFTER_STEPS=${SEED_TEACHER_BRANCH_START_AFTER_STEPS:-null}
+SEED_TEACHER_BRANCH_STOP_AFTER_STEPS=${SEED_TEACHER_BRANCH_STOP_AFTER_STEPS:-null}
+# Fail loudly when a scheduled-on branch step yields no rows, instead of quietly
+# training plain PPO with an empty FKL term. On for smoke runs; off for the long
+# job, where one bad step should not discard 150 steps of progress.
+SEED_TEACHER_BRANCH_STRICT=${SEED_TEACHER_BRANCH_STRICT:-False}
 
 # SEED episode filtering and teacher prompt construction.
 SEED_FAILED_ONLY=${SEED_FAILED_ONLY:-False}
@@ -131,7 +149,17 @@ python3 -m verl.trainer.main_ppo \
     algorithm.seed.external_teacher.enable=$SEED_EXTERNAL_TEACHER_ENABLE \
     algorithm.seed.external_teacher.base_url=$SEED_EXTERNAL_TEACHER_BASE_URL \
     algorithm.seed.external_teacher.model=$SEED_EXTERNAL_TEACHER_MODEL \
+    algorithm.seed.external_teacher.concurrency=$SEED_EXTERNAL_TEACHER_CONCURRENCY \
     algorithm.seed.step_selector=$SEED_STEP_SELECTOR \
+    algorithm.seed.teacher_branch.enable=$SEED_TEACHER_BRANCH_ENABLE \
+    algorithm.seed.teacher_branch.max_branches_per_traj=$SEED_TEACHER_BRANCH_MAX_PER_TRAJ \
+    algorithm.seed.teacher_branch.max_total_branches=$SEED_TEACHER_BRANCH_MAX_TOTAL \
+    algorithm.seed.teacher_branch.require_error_signal=$SEED_TEACHER_BRANCH_REQUIRE_ERROR_SIGNAL \
+    algorithm.seed.teacher_branch.max_prefix_tokens=$SEED_TEACHER_BRANCH_MAX_PREFIX_TOKENS \
+    algorithm.seed.teacher_branch.prefix_concurrency=$SEED_TEACHER_BRANCH_PREFIX_CONCURRENCY \
+    algorithm.seed.teacher_branch.start_after_steps=$SEED_TEACHER_BRANCH_START_AFTER_STEPS \
+    algorithm.seed.teacher_branch.stop_after_steps=$SEED_TEACHER_BRANCH_STOP_AFTER_STEPS \
+    algorithm.seed.teacher_branch.strict=$SEED_TEACHER_BRANCH_STRICT \
     algorithm.seed.analysis_num_workers=$SEED_ANALYSIS_NUM_WORKERS \
     algorithm.seed.analysis_context_length=$SEED_ANALYSIS_CONTEXT_LENGTH \
     algorithm.seed.analysis_max_completion_tokens=$SEED_ANALYSIS_MAX_COMPLETION_TOKENS \
