@@ -328,13 +328,28 @@ algorithm:
       enable: False
       max_branches_per_traj: 1 # branch points sampled per parent trajectory
       max_total_branches: null # null -> no global cap; otherwise cap branches per training step
-      require_error_signal: True # only branch at steps whose observation carried an anomaly (改造点 3 error-signal)
-      max_prefix_tokens: null # null -> data.max_response_length // 2; a_T is truncated to this many tokens
+      require_error_signal: True # legacy selector, used only when `selector` is null
+      # Pluggable branch-point condition (agent_system/multi_turn_rollout/branch_selectors.py).
+      # Spec string, parts joined with '&' (AND): error_signal | low_reward | kl_gap | any.
+      # Examples: "low_reward&kl_gap" (failed episodes, branch where the student diverges
+      # most from the teacher), "low_reward(threshold=0.5)", "error_signal".
+      # null -> fall back to require_error_signal.
+      selector: null
+      selector_kl_max_scored_rows: 512 # cap on rows scored by the external teacher for kl_gap
+      # "think_prefix": a_T is an unclosed thinking prefix, the student continues within the
+      # step. "full_step": the teacher writes the COMPLETE branch step (reasoning + one
+      # action, executed in the env); the student takes over from the next step.
+      prefix_mode: "think_prefix"
+      max_prefix_tokens: null # null -> data.max_response_length // 2; a_T is truncated to this many tokens (full_step mode caps at max_response_length instead)
       prefix_concurrency: 8 # parallel a_T requests to the teacher server
       prefix_max_retries: 2 # attempts per spec before the branch point is dropped
       start_after_steps: null # null -> branch from the first training step
       stop_after_steps: null # null -> keep branching; otherwise stop after this step
       strict: False # raise instead of silently training with an empty FKL term (use for smoke runs)
+    step_rm: # 创新点 1 infrastructure: step-level reward model dataset collection
+      dump_dataset: False # dump one parquet shard of step rows per training step
+      dump_dir: null # null -> ${trainer.default_local_dir}/step_rm_dataset
+      success_threshold: 0.5 # episode_return > threshold -> episode_success=1
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10

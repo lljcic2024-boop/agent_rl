@@ -550,7 +550,7 @@ def test_funnel_pins_the_prefix_rejection(monkeypatch):
     monkeypatch.setattr(runner, "_chat_fn", lambda: (lambda messages: ""))
     seen = {}
 
-    def _no_prefixes(specs, chat_fn, max_retries, max_workers):
+    def _no_prefixes(specs, chat_fn, max_retries, max_workers, **kwargs):
         seen["specs"] = len(specs)
         return {}, {i: "rejected by the quality gate" for i in range(len(specs))}
 

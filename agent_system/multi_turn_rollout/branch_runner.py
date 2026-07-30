@@ -151,11 +151,24 @@ def attach_default_masks(batch: DataProto) -> DataProto:
 
 def branch_config(config) -> Dict[str, Any]:
     """Read the `algorithm.seed.teacher_branch` block with defaults."""
+    selector = _select(config, "algorithm.seed.teacher_branch.selector", None)
     return {
         "enable": bool(_select(config, "algorithm.seed.teacher_branch.enable", False)),
         "max_branches_per_traj": int(_select(config, "algorithm.seed.teacher_branch.max_branches_per_traj", 1)),
         "max_total_branches": _select(config, "algorithm.seed.teacher_branch.max_total_branches", None),
         "require_error_signal": bool(_select(config, "algorithm.seed.teacher_branch.require_error_signal", True)),
+        # Pluggable branch-point condition (branch_selectors.py), e.g.
+        # "error_signal", "low_reward", "kl_gap", "low_reward&kl_gap".
+        # None/empty -> legacy require_error_signal behaviour.
+        "selector": None if selector in (None, "", "null") else str(selector),
+        # Cap on rows sent to the external teacher for kl_gap selection.
+        "selector_kl_max_scored_rows": int(
+            _select(config, "algorithm.seed.teacher_branch.selector_kl_max_scored_rows", 512)
+        ),
+        # "think_prefix": a_T is an unclosed thinking prefix, student continues
+        # within the step. "full_step": teacher writes the complete step
+        # (reasoning + action); student takes over from the next step.
+        "prefix_mode": str(_select(config, "algorithm.seed.teacher_branch.prefix_mode", "think_prefix")),
         "prefix_concurrency": int(_select(config, "algorithm.seed.teacher_branch.prefix_concurrency", 8)),
         "prefix_max_retries": int(_select(config, "algorithm.seed.teacher_branch.prefix_max_retries", 2)),
         "start_after_steps": _select(config, "algorithm.seed.teacher_branch.start_after_steps", None),
@@ -187,6 +200,12 @@ def _init_funnel() -> Dict[str, float]:
         "seed/teacher_branch/num_trajectories": 0.0,
         "seed/teacher_branch/num_rows": 0.0,
         "seed/teacher_branch/prefix_failure_ratio": 0.0,
+        # kl_gap selector observability (all zero when the selector is not KL-based)
+        "seed/teacher_branch/selector_kl_scored_rows": 0.0,
+        "seed/teacher_branch/selector_kl_mean": 0.0,
+        "seed/teacher_branch/selector_kl_max": 0.0,
+        "seed/teacher_branch/selector_kl_true_kl": 0.0,  # 1 = true KL, 0 = CE proxy
+        "seed/teacher_branch/selector_kl_failed": 0.0,
     }
     for reason in _EXIT_REASONS:
         funnel[f"seed/teacher_branch/exit_{reason}"] = 0.0
@@ -311,6 +330,12 @@ class TeacherBranchRunner:
             )
         )
         self.env_max_steps = int(_select(config, "env.max_steps", 4))
+        # In full_step mode the "prefix" is the whole response, so the token
+        # cap is the response length, not the half-response a_T budget.
+        self.prefix_token_cap = (
+            self.response_length if self.cfg["prefix_mode"] == "full_step" else self.max_prefix_tokens
+        )
+        self._scoring_client = None  # lazy ExternalTeacherClient for kl_gap selection
         self._branch_env: Optional[SearchBranchEnv] = None
         # (spec index, step_num) -> assembled tensors for that branch row
         self._row_tensors: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
@@ -359,9 +384,113 @@ class TeacherBranchRunner:
 
         return chat_fn
 
+    # -- kl_gap selector scoring -------------------------------------------
+    def _get_scoring_client(self):
+        """External teacher log-prob client for kl_gap branch selection."""
+        if self._scoring_client is None:
+            from verl.trainer.ppo.seed_external_teacher import ExternalTeacherClient
+
+            api_key = _select(self.config, "algorithm.seed.external_teacher.api_key", None)
+            self._scoring_client = ExternalTeacherClient(
+                base_url=str(_select(self.config, "algorithm.seed.external_teacher.base_url", "")),
+                model=str(_select(self.config, "algorithm.seed.external_teacher.model", "")),
+                api_key=str(api_key) if api_key else None,
+                timeout=float(_select(self.config, "algorithm.seed.external_teacher.timeout", 600.0)),
+                max_retries=int(_select(self.config, "algorithm.seed.external_teacher.max_retries", 3)),
+                concurrency=int(_select(self.config, "algorithm.seed.external_teacher.concurrency", 16)),
+                batch_size=int(_select(self.config, "algorithm.seed.external_teacher.batch_size", 16)),
+            )
+        return self._scoring_client
+
+    def _inject_kl_scores(
+        self,
+        batch: DataProto,
+        rows: List[Dict[str, Any]],
+        condition,
+        metrics: Dict[str, float],
+    ) -> None:
+        """Fill `row[KL_ROW_KEY]` for the rows the kl_gap condition will judge.
+
+        Per-row score = mean over valid response tokens of
+        (student rollout logprob - teacher logprob)  -> single-sample estimate
+        of KL(student || teacher); when the batch has no rollout_log_probs the
+        cross-entropy proxy (-mean teacher logprob) is used instead.
+
+        Scoring failure leaves all rows unscored: the kl_gap condition then
+        selects nothing, the funnel reports it, and strict mode raises —
+        deliberately loud instead of silently picking random steps.
+        """
+        from agent_system.multi_turn_rollout.branch_selectors import KL_ROW_KEY, AndCondition
+
+        # Pre-filter with the cheap (non-KL) part of the condition, so the
+        # teacher only scores rows that can actually be selected.
+        cheap = condition.without_kl() if isinstance(condition, AndCondition) else None
+        if cheap is not None:
+            pre = cheap.evaluate(rows)
+            candidate_indices = [i for i, ok in enumerate(pre.eligible) if ok]
+        else:
+            candidate_indices = list(range(len(rows)))
+        candidate_indices = [
+            i for i in candidate_indices if bool(rows[i].get("active_masks", True))
+        ]
+        cap = max(1, int(self.cfg["selector_kl_max_scored_rows"]))
+        if len(candidate_indices) > cap:
+            module_logger.warning(
+                "kl_gap selector: %s candidate rows exceed selector_kl_max_scored_rows=%s; "
+                "scoring the first %s (raise the cap to score all).",
+                len(candidate_indices),
+                cap,
+                cap,
+            )
+            candidate_indices = candidate_indices[:cap]
+        if not candidate_indices:
+            return
+
+        index_tensor = torch.as_tensor(candidate_indices, dtype=torch.long)
+        input_ids = batch.batch["input_ids"][index_tensor]
+        attention_mask = batch.batch["attention_mask"][index_tensor]
+        responses = batch.batch["responses"][index_tensor]
+        response_length = responses.size(1)
+        response_masks = attention_mask[:, -response_length:]
+
+        try:
+            client = self._get_scoring_client()
+            teacher_log_prob = client.score_response_log_probs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                response_masks=response_masks,
+            )
+        except Exception as exc:  # noqa: BLE001 - selection must not kill the step here
+            metrics["seed/teacher_branch/selector_kl_failed"] = 1.0
+            module_logger.error(
+                "kl_gap selector: external teacher scoring failed, no rows scored "
+                "(the condition will select nothing this step): %s",
+                exc,
+            )
+            return
+
+        student_log_prob = None
+        if "rollout_log_probs" in batch.batch.keys():
+            student_log_prob = batch.batch["rollout_log_probs"][index_tensor]
+            metrics["seed/teacher_branch/selector_kl_true_kl"] = 1.0
+
+        valid = response_masks.to(torch.float32)
+        token_counts = valid.sum(dim=-1).clamp(min=1.0)
+        if student_log_prob is not None:
+            gap = (student_log_prob.to(torch.float32) - teacher_log_prob) * valid
+        else:
+            gap = (-teacher_log_prob) * valid
+        scores = (gap.sum(dim=-1) / token_counts).tolist()
+
+        for row_index, score in zip(candidate_indices, scores):
+            rows[row_index][KL_ROW_KEY] = float(score)
+        metrics["seed/teacher_branch/selector_kl_scored_rows"] = float(len(candidate_indices))
+        metrics["seed/teacher_branch/selector_kl_mean"] = float(sum(scores) / len(scores))
+        metrics["seed/teacher_branch/selector_kl_max"] = float(max(scores))
+
     def _prefix_token_ids(self, prefix_text: str) -> List[int]:
         ids = self.tokenizer.encode(prefix_text, add_special_tokens=False)
-        return list(ids[: self.max_prefix_tokens])
+        return list(ids[: self.prefix_token_cap])
 
     def _canonicalize_prefixes(self, prefix_texts: Dict[int, str]) -> Dict[int, str]:
         """
@@ -486,6 +615,59 @@ class TeacherBranchRunner:
 
         return response_texts
 
+    def _encode_teacher_step(
+        self,
+        obs_texts: List[str],
+        response_texts: List[str],
+        spec_indices: List[int],
+        step_num: int,
+    ) -> None:
+        """full_step mode: tokenize the teacher-written branch step (no policy call).
+
+        Mask contract for these rows: every valid response token is a teacher
+        token (`teacher_token_mask`=1, FKL) and none is student-sampled
+        (`loss_mask`=0 everywhere) — the mirror image of an ordinary row.
+        """
+        prompt_batch = self.collector.build_text_prompt_batch(obs_contents=list(obs_texts))
+        prompt_input_ids = prompt_batch.batch["input_ids"]
+        prompt_attention_mask = prompt_batch.batch["attention_mask"]
+        pad_token_id = self.tokenizer.pad_token_id
+        eos_token_id = self.tokenizer.eos_token_id
+        n = len(response_texts)
+
+        response_ids = torch.full(
+            (n, self.response_length), int(pad_token_id), dtype=prompt_input_ids.dtype
+        )
+        response_mask = torch.zeros((n, self.response_length), dtype=prompt_attention_mask.dtype)
+        for i, text in enumerate(response_texts):
+            ids = self.tokenizer.encode(str(text), add_special_tokens=False)[: self.response_length]
+            if eos_token_id is not None and len(ids) < self.response_length:
+                ids = ids + [int(eos_token_id)]
+            ids_tensor = torch.as_tensor(ids, dtype=prompt_input_ids.dtype)
+            response_ids[i, : len(ids)] = ids_tensor
+            response_mask[i, : len(ids)] = 1
+
+        full_input_ids = torch.cat([prompt_input_ids, response_ids], dim=-1)
+        full_attention_mask = torch.cat(
+            [prompt_attention_mask, response_mask.to(prompt_attention_mask.dtype)], dim=-1
+        )
+        from verl.utils.model import compute_position_id_with_mask
+
+        full_position_ids = compute_position_id_with_mask(full_attention_mask)
+
+        for i, spec_index in enumerate(spec_indices):
+            self._row_tensors[(spec_index, step_num)] = {
+                "prompts": prompt_input_ids[i],
+                "responses": response_ids[i],
+                "input_ids": full_input_ids[i],
+                "attention_mask": full_attention_mask[i],
+                "position_ids": full_position_ids[i],
+                "loss_mask": torch.zeros_like(full_attention_mask[i]),
+                "teacher_token_mask": response_mask[i],
+            }
+            if i < len(self._pending_anchors):
+                self._row_anchors[(spec_index, step_num)] = self._pending_anchors[i]
+
     # -- env replay --------------------------------------------------------
     def _ensure_env(self, capacity: int) -> SearchBranchEnv:
         if self._branch_env is None or self._branch_env.capacity < capacity:
@@ -586,6 +768,12 @@ class TeacherBranchRunner:
         if not rows:
             return _bail("no_rows", "the main-rollout batch is empty")
 
+        from agent_system.multi_turn_rollout.branch_selectors import condition_from_config
+
+        condition = condition_from_config(self.cfg["selector"], self.cfg["require_error_signal"])
+        if condition.requires_kl:
+            self._inject_kl_scores(batch, rows, condition, metrics)
+
         specs = select_branch_specs(
             rows,
             get_action_text=lambda row: self._decode_response(row),
@@ -595,8 +783,16 @@ class TeacherBranchRunner:
                 None if self.cfg["max_total_branches"] is None else int(self.cfg["max_total_branches"])
             ),
             require_error_signal=self.cfg["require_error_signal"],
+            condition=condition,
         )
         metrics["seed/teacher_branch/num_candidates"] = float(len(specs))
+        if specs:
+            priorities = [spec.selector_priority for spec in specs]
+            metrics["seed/teacher_branch/selected_priority_mean"] = float(
+                sum(priorities) / len(priorities)
+            )
+        else:
+            metrics["seed/teacher_branch/selected_priority_mean"] = 0.0
         specs = [spec for spec in specs if spec.env_kwargs is not None]
         metrics["seed/teacher_branch/num_specs_with_env_kwargs"] = float(len(specs))
         if not specs:
@@ -617,6 +813,7 @@ class TeacherBranchRunner:
             self._chat_fn(),
             max_retries=self.cfg["prefix_max_retries"],
             max_workers=self.cfg["prefix_concurrency"],
+            mode=self.cfg["prefix_mode"],
         )
         metrics["seed/teacher_branch/prefix_failure_ratio"] = (
             float(len(failures)) / max(1, len(specs))
@@ -641,6 +838,11 @@ class TeacherBranchRunner:
             env_step_batch=self._env_step_batch,
             generate_batch=self._generate_batch,
             max_steps=self.env_max_steps,
+            prefix_mode=self.cfg["prefix_mode"],
+            encode_teacher_step=self._encode_teacher_step,
+        )
+        metrics["seed/teacher_branch/prefix_mode_full_step"] = (
+            1.0 if self.cfg["prefix_mode"] == "full_step" else 0.0
         )
         metrics.update(summarize_branch_metrics(trajectories))
         metrics["seed/teacher_branch/num_trajectories"] = float(len(trajectories))

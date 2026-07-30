@@ -244,5 +244,6 @@ value = float(values.mean())
 | ~~中~~ | ~~抬并发~~ ~~teacher 请求合批~~ → 2026-07-30 已实现（见上），待集群验证 | 是 |
 | 中 | 缩 `prompt_logprobs` 作用范围（省 87% 浪费；先试缩短 teacher prompt） | 验证需要 |
 | 中 | 跨步滞后 OPD：teacher 冻结 + token 已定 → step t 的打分可与 t 的 update、t+1 的 gen 全重叠 | 否（改完再验） |
-| 低 | 改造点 3 Phase 2b critic-gap 选点 | 否 |
+| 低 | ~~改造点 3 Phase 2b critic-gap 选点~~ → 2026-07-30 已由选点条件框架覆盖（`low_reward`/`kl_gap`/组合，见 README 改造点 4 一节）；critic-gap 变体等 step RM 训出来后作为新条件加入 | 否 |
+| 低 | 攒够 step_rm_dataset 后第一次训 step RM（`scripts/step_rm/train_step_rm.py`），验证成功 AUC | 是 |
 | 低 | 产出真的 `Qwen3-8B-search-tag-sft` student | 是 |

@@ -49,6 +49,8 @@ SEED_EXTERNAL_TEACHER_MODEL=${SEED_EXTERNAL_TEACHER_MODEL:-Qwen3-30B-A3B}
 SEED_EXTERNAL_TEACHER_CONCURRENCY=${SEED_EXTERNAL_TEACHER_CONCURRENCY:-16}
 SEED_EXTERNAL_TEACHER_BATCH_SIZE=${SEED_EXTERNAL_TEACHER_BATCH_SIZE:-16}
 SEED_STEP_SELECTOR=${SEED_STEP_SELECTOR:-trajectory}
+# 创新点 1: dump per-step RM training rows alongside RL training.
+SEED_STEP_RM_DUMP=${SEED_STEP_RM_DUMP:-False}
 SEARCH_USE_FUNCTION_TAGS=${SEARCH_USE_FUNCTION_TAGS:-False}
 
 # Teacher-prefix (a_T) branch rollout: needs opd_fkl_loss_coef > 0 to have any
@@ -57,6 +59,13 @@ SEED_TEACHER_BRANCH_ENABLE=${SEED_TEACHER_BRANCH_ENABLE:-False}
 SEED_TEACHER_BRANCH_MAX_PER_TRAJ=${SEED_TEACHER_BRANCH_MAX_PER_TRAJ:-1}
 SEED_TEACHER_BRANCH_MAX_TOTAL=${SEED_TEACHER_BRANCH_MAX_TOTAL:-null}
 SEED_TEACHER_BRANCH_REQUIRE_ERROR_SIGNAL=${SEED_TEACHER_BRANCH_REQUIRE_ERROR_SIGNAL:-True}
+# Pluggable branch-point condition, e.g. error_signal / low_reward / kl_gap /
+# "low_reward&kl_gap". Empty -> legacy require_error_signal behaviour.
+SEED_TEACHER_BRANCH_SELECTOR=${SEED_TEACHER_BRANCH_SELECTOR:-null}
+SEED_TEACHER_BRANCH_KL_MAX_ROWS=${SEED_TEACHER_BRANCH_KL_MAX_ROWS:-512}
+# think_prefix: teacher writes an unclosed thinking prefix, student continues
+# the step. full_step: teacher writes the whole step (reasoning + action).
+SEED_TEACHER_BRANCH_PREFIX_MODE=${SEED_TEACHER_BRANCH_PREFIX_MODE:-think_prefix}
 SEED_TEACHER_BRANCH_MAX_PREFIX_TOKENS=${SEED_TEACHER_BRANCH_MAX_PREFIX_TOKENS:-null}
 SEED_TEACHER_BRANCH_PREFIX_CONCURRENCY=${SEED_TEACHER_BRANCH_PREFIX_CONCURRENCY:-8}
 SEED_TEACHER_BRANCH_START_AFTER_STEPS=${SEED_TEACHER_BRANCH_START_AFTER_STEPS:-null}
@@ -156,10 +165,14 @@ python3 -m verl.trainer.main_ppo \
     algorithm.seed.external_teacher.concurrency=$SEED_EXTERNAL_TEACHER_CONCURRENCY \
     algorithm.seed.external_teacher.batch_size=$SEED_EXTERNAL_TEACHER_BATCH_SIZE \
     algorithm.seed.step_selector=$SEED_STEP_SELECTOR \
+    algorithm.seed.step_rm.dump_dataset=$SEED_STEP_RM_DUMP \
     algorithm.seed.teacher_branch.enable=$SEED_TEACHER_BRANCH_ENABLE \
     algorithm.seed.teacher_branch.max_branches_per_traj=$SEED_TEACHER_BRANCH_MAX_PER_TRAJ \
     algorithm.seed.teacher_branch.max_total_branches=$SEED_TEACHER_BRANCH_MAX_TOTAL \
     algorithm.seed.teacher_branch.require_error_signal=$SEED_TEACHER_BRANCH_REQUIRE_ERROR_SIGNAL \
+    "algorithm.seed.teacher_branch.selector='$SEED_TEACHER_BRANCH_SELECTOR'" \
+    algorithm.seed.teacher_branch.selector_kl_max_scored_rows=$SEED_TEACHER_BRANCH_KL_MAX_ROWS \
+    algorithm.seed.teacher_branch.prefix_mode=$SEED_TEACHER_BRANCH_PREFIX_MODE \
     algorithm.seed.teacher_branch.max_prefix_tokens=$SEED_TEACHER_BRANCH_MAX_PREFIX_TOKENS \
     algorithm.seed.teacher_branch.prefix_concurrency=$SEED_TEACHER_BRANCH_PREFIX_CONCURRENCY \
     algorithm.seed.teacher_branch.start_after_steps=$SEED_TEACHER_BRANCH_START_AFTER_STEPS \

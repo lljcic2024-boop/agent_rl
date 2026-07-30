@@ -146,6 +146,52 @@ main rollout rows
 **状态**：代码完成，31 项单测全绿。**但集群上实际产出 0 个分支** ——
 已定位到症状但根因未确认，见 [open-issues.md](open-issues.md)。
 
+#### 选点条件框架（2026-07-30，「什么时候调用老师」可插拔）
+
+`agent_system/multi_turn_rollout/branch_selectors.py`。选点不再硬编码
+error-signal，而是一个 spec 字符串（`&` 连接为 AND），选出的点带 priority
+（组内排名 + 全局 cap 都按它排）：
+
+| spec | 含义 | priority |
+|---|---|---|
+| `error_signal` | 观测带异常信号（原 Phase 2a） | 0 |
+| `low_reward` | 该轨迹 episode return ≤ 阈值（默认 0 = 失败轨迹） | 阈值差 |
+| `kl_gap` | 学生与 teacher 的逐 token 归一化 KL 最大的步 | KL 值 |
+| `any` | 全部活跃步 | 0 |
+
+`kl_gap` 由 runner 在选点前调外接 teacher 打分算出（有 `rollout_log_probs`
+时是真 KL 单样本估计 `mean(student_lp - teacher_lp)`，否则退化为交叉熵
+`-mean(teacher_lp)`，`selector_kl_true_kl` 指标区分）；先用便宜条件预过滤、
+`selector_kl_max_scored_rows`（默认 512）封顶打分行数。打分失败 → 该条件选不出
+任何点 → 漏斗照常报告（strict 下直接抛），绝不静默乱选。
+
+配置：`SEED_TEACHER_BRANCH_SELECTOR="low_reward&kl_gap"`（默认 null = 沿用
+`require_error_signal`）。指标：`seed/teacher_branch/selector_kl_*`、
+`selected_priority_mean`。
+
+#### 前缀模式（2026-07-30，`SEED_TEACHER_BRANCH_PREFIX_MODE`）
+
+- `think_prefix`（默认，原行为）：teacher 写一段**未闭合**的思考开头，学生在
+  同一步内续写并选 action；
+- `full_step`：teacher **写完整个步**（闭合的 `<think>` + 恰好一个
+  `<search>/<answer>` action，质检门 `parse_teacher_full_step_response`），
+  action 直接进 env 执行，**学生从下一步接管**。该步不调 policy，
+  `_encode_teacher_step` 直接编码 teacher 文本 —— mask 契约是普通行的镜像：
+  整段响应 `teacher_token_mask=1`（FKL）、`loss_mask=0`（不进 PG）。
+
+### 创新点 1 基础设施：step 级 reward model
+
+以「节点」（一个轨迹步）为单位的 RM，为 step-wise PPO 做准备。三件套：
+
+| 组件 | 位置 | 说明 |
+|---|---|---|
+| 数据 | `seed/step_rm.py` + trainer hook | `SEED_STEP_RM_DUMP=True`（主实验 launcher 默认开）时每个训练步落一个 parquet 分片到 `$DEFAULT_LOCAL_DIR/step_rm_dataset/`，行 = (obs, response, step_reward, episode_return, return_to_go, episode_success, tag 列)，分支行也在内 —— 正常 RL 跑一遍就顺带把 RM 数据攒了 |
+| 训练 | `scripts/step_rm/train_step_rm.py` | `AutoModelForSequenceClassification(num_labels=1)` 回归 `return_to_go`（或 `--loss bt` 组内 Bradley-Terry：成功轨迹的步 > 失败轨迹的步）；按 uid 切 train/val 防泄漏；报 MSE/Spearman/成功 AUC |
+| 服务 | `scripts/step_rm/serve_step_rm.py` + `StepRewardModelClient` | FastAPI `/score`，客户端与外接 teacher 同款（合批/重试/多副本 failover），之后 step-wise PPO 直接调 |
+
+**状态**：三件套 + 选点框架 + full_step 共 32 项新单测，全绿（总 178）。
+数据攒够后（~几千步 × 每步几千行）即可第一次训 RM。
+
 ---
 
 ## 可观测性：exit 漏斗

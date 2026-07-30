@@ -99,7 +99,17 @@ export SEED_OPD_FKL_LOSS_COEF="${SEED_OPD_FKL_LOSS_COEF:-0.05}"
 export SEED_TEACHER_BRANCH_ENABLE="${SEED_TEACHER_BRANCH_ENABLE:-True}"
 export SEED_TEACHER_BRANCH_MAX_PER_TRAJ="${SEED_TEACHER_BRANCH_MAX_PER_TRAJ:-1}"
 export SEED_TEACHER_BRANCH_REQUIRE_ERROR_SIGNAL="${SEED_TEACHER_BRANCH_REQUIRE_ERROR_SIGNAL:-True}"
+# Branch-point condition + prefix contract (see branch_selectors.py):
+#   SELECTOR: error_signal | low_reward | kl_gap | combos ("low_reward&kl_gap");
+#             empty/null -> legacy require_error_signal.
+#   PREFIX_MODE: think_prefix (student continues the step) | full_step (teacher
+#                finishes the step, student takes over from the next one).
+export SEED_TEACHER_BRANCH_SELECTOR="${SEED_TEACHER_BRANCH_SELECTOR:-null}"
+export SEED_TEACHER_BRANCH_PREFIX_MODE="${SEED_TEACHER_BRANCH_PREFIX_MODE:-think_prefix}"
 export SEED_TEACHER_BRANCH_PREFIX_CONCURRENCY="${SEED_TEACHER_BRANCH_PREFIX_CONCURRENCY:-8}"
+# 创新点 1: collect step-RM training data during the run (parquet shards under
+# $DEFAULT_LOCAL_DIR/step_rm_dataset; train with scripts/step_rm/train_step_rm.py).
+export SEED_STEP_RM_DUMP="${SEED_STEP_RM_DUMP:-True}"
 
 # Step selection: error-signal steps only (modification 3, Phase 2a).
 export SEED_STEP_SELECTOR="${SEED_STEP_SELECTOR:-error_signal}"

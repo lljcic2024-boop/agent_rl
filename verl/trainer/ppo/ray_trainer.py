@@ -955,6 +955,43 @@ class RayPPOTrainer:
         metrics["seed/step_skill_teacher/step_skills_applied"] = 0.0
         return batch
 
+    def _maybe_dump_step_rm_dataset(self, batch: DataProto, metrics: Dict[str, float], timing_raw) -> None:
+        """创新点 1 data collection: dump per-step RM rows alongside training.
+
+        Enabled by algorithm.seed.step_rm.dump_dataset; every training step
+        appends one parquet shard (obs/response text + episode aggregates) so a
+        normal RL run doubles as step-RM data collection. Failures are loud
+        (metric + ERROR) but never kill the training step.
+        """
+        cfg = OmegaConf.select(self.config, "algorithm.seed.step_rm")
+        if cfg is None or not bool(cfg.get("dump_dataset", False)):
+            return
+        if getattr(self, "_step_rm_dumper", None) is None:
+            from seed.step_rm import StepDatasetDumper
+
+            dump_dir = cfg.get("dump_dir", None) or os.path.join(
+                self.config.trainer.default_local_dir, "step_rm_dataset"
+            )
+            self._step_rm_dumper = StepDatasetDumper(
+                str(dump_dir),
+                gamma=float(self.config.algorithm.gamma),
+                success_threshold=float(cfg.get("success_threshold", 0.5) or 0.5),
+            )
+            module_logger.info("SEED step-RM dataset dump enabled -> %s", dump_dir)
+        try:
+            with _timer("step_rm_dump", timing_raw):
+                num_rows = self._step_rm_dumper.dump_batch(
+                    batch, self.tokenizer, global_step=self.global_steps
+                )
+            metrics["seed/step_rm/rows_dumped"] = float(num_rows)
+            metrics["seed/step_rm/dump_failed"] = 0.0
+        except Exception:  # noqa: BLE001 - data dump must not kill training
+            metrics["seed/step_rm/rows_dumped"] = 0.0
+            metrics["seed/step_rm/dump_failed"] = 1.0
+            module_logger.error(
+                "SEED step-RM dataset dump failed at step %s", self.global_steps, exc_info=True
+            )
+
     def _get_seed_external_teacher_client(self):
         """Lazily build the external teacher scoring client (algorithm.seed.external_teacher)."""
         if self._seed_external_teacher_init_done:
@@ -3292,6 +3329,9 @@ class RayPPOTrainer:
                             gamma=self.config.algorithm.gamma
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
+
+                    # 创新点 1: step-RM 数据随训练顺带落盘（含分支行）
+                    self._maybe_dump_step_rm_dataset(batch, metrics, timing_raw)
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.SEED:
                         metrics["seed/teacher_enabled"] = 1.0 if seed_teacher_signal_enabled else 0.0
                         metrics["seed/teacher_signal_enabled"] = 1.0 if seed_teacher_signal_enabled else 0.0

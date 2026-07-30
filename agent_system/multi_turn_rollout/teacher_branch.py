@@ -74,6 +74,7 @@ class BranchSpec:
     branch_observation: str  # recorded observation text at the branch step
     env_kwargs: Any = None  # opaque env reset payload (e.g. the Search task)
     prefix_reward: float = 0.0  # reward accrued on parent steps < branch step
+    selector_priority: float = 0.0  # why this point was picked (condition priority)
     branch_traj_uid: str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
@@ -93,7 +94,8 @@ def select_branch_specs(
     max_branches_per_traj: int = 1,
     max_total_branches: Optional[int] = None,
     require_error_signal: bool = True,
-    rng: Optional[Any] = None,  # random.Random-like; None -> deterministic first-k
+    condition: Optional[Any] = None,  # BranchCondition; overrides require_error_signal
+    rng: Optional[Any] = None,  # random.Random-like; None -> deterministic ranking
 ) -> List[BranchSpec]:
     """
     Pick branch points from main-rollout step rows.
@@ -102,46 +104,53 @@ def select_branch_specs(
         step_rows: per-step row dicts as produced by the rollout loop /
             gather_rollout_data. Required keys: traj_uid, uid, sample_id,
             rollout_id, step_num, active_masks; optional: tag_error_signal,
-            rewards.
+            rewards, kl_to_teacher.
         get_action_text: decodes a row into the env action text (used to
             replay the trajectory up to the branch point).
         get_env_kwargs: extracts the env reset payload for the row's task.
         max_branches_per_traj: at most this many branch points per trajectory.
         max_total_branches: global cap across the batch (None = no cap).
-        require_error_signal: Phase 2a selector — only steps whose observation
-            carried an error signal (`tag_error_signal`) are candidates. When
-            False every active step is a candidate.
-        rng: random.Random-like sampler for candidate choice; None picks the
-            earliest candidates (deterministic).
+        require_error_signal: legacy Phase 2a selector, used only when
+            `condition` is None. True -> only error-signal steps; False -> all.
+        condition: a `branch_selectors.BranchCondition`; when given it decides
+            eligibility AND ranking (priority high -> picked first, both within
+            a trajectory and under the global cap).
+        rng: random.Random-like sampler for candidate choice; None ranks by
+            (priority desc, step asc) deterministically.
 
     Returns:
-        BranchSpecs ordered by (sample_id, rollout_id, branch_step_num).
+        BranchSpecs ordered by (sample_id, rollout_id, branch_step_num), each
+        carrying its `selector_priority`.
     """
-    by_traj: Dict[str, List[Dict[str, Any]]] = {}
-    for row in step_rows:
-        if not _row_bool(row, "active_masks", True):
-            continue
-        by_traj.setdefault(str(row["traj_uid"]), []).append(row)
+    if condition is None:
+        from agent_system.multi_turn_rollout.branch_selectors import condition_from_config
+
+        condition = condition_from_config(None, require_error_signal)
+
+    active_rows = [row for row in step_rows if _row_bool(row, "active_masks", True)]
+    decision = condition.evaluate(active_rows)
+
+    by_traj: Dict[str, List[Tuple[Dict[str, Any], bool, float]]] = {}
+    for row, ok, prio in zip(active_rows, decision.eligible, decision.priority):
+        by_traj.setdefault(str(row["traj_uid"]), []).append((row, ok, prio))
 
     specs: List[BranchSpec] = []
-    for traj_uid, rows in by_traj.items():
-        rows = sorted(rows, key=lambda r: int(r["step_num"]))
-        candidates = [
-            idx
-            for idx, row in enumerate(rows)
-            if (not require_error_signal) or _row_bool(row, "tag_error_signal")
-        ]
+    for traj_uid, entries in by_traj.items():
+        entries = sorted(entries, key=lambda e: int(e[0]["step_num"]))
+        candidates = [idx for idx, (_, ok, _) in enumerate(entries) if ok]
         if not candidates:
             continue
         if len(candidates) > max_branches_per_traj:
             if rng is not None:
                 candidates = sorted(rng.sample(candidates, max_branches_per_traj))
             else:
-                candidates = candidates[:max_branches_per_traj]
+                # priority desc, then earliest step; stable for equal priorities
+                candidates = sorted(candidates, key=lambda idx: (-entries[idx][2], idx))
+                candidates = sorted(candidates[:max_branches_per_traj])
 
         for idx in candidates:
-            row = rows[idx]
-            prior_rows = rows[:idx]
+            row, _, prio = entries[idx]
+            prior_rows = [e[0] for e in entries[:idx]]
             replay_actions = [get_action_text(r) for r in prior_rows]
             prefix_reward = 0.0
             for r in prior_rows:
@@ -160,6 +169,7 @@ def select_branch_specs(
                     branch_observation=str(row.get("obs_text", "")),
                     env_kwargs=None if get_env_kwargs is None else get_env_kwargs(row),
                     prefix_reward=prefix_reward,
+                    selector_priority=float(prio),
                 )
             )
 
@@ -171,7 +181,12 @@ def select_branch_specs(
                 key=lambda s: (s.sample_id, s.rollout_id, s.branch_step_num),
             )
         else:
-            specs = specs[:max_total_branches]
+            # keep the highest-priority branch points under the global cap
+            kept = sorted(
+                specs,
+                key=lambda s: (-s.selector_priority, s.sample_id, s.rollout_id, s.branch_step_num),
+            )[:max_total_branches]
+            specs = sorted(kept, key=lambda s: (s.sample_id, s.rollout_id, s.branch_step_num))
     return specs
 
 
@@ -226,6 +241,37 @@ def build_teacher_prefix_messages(
     ]
 
 
+TEACHER_FULL_STEP_SYSTEM_PROMPT = """You are an expert teacher demonstrating high-quality agent behaviour.
+You will be shown the exact observation an agent sees at one step of a multi-turn task. The agent's previous attempt at this step went in an unproductive direction.
+Write the COMPLETE ideal response for this single step: the full reasoning followed by exactly one action. A student model will take over from the NEXT step onward.
+
+{tag_instruction}
+
+Hard requirements for your reply:
+- Start with <think>, put the tagged reasoning segments inside, and close with </think>.
+- After </think>, output exactly ONE action: either <search>query</search> or <answer>final answer</answer>.
+- Do not add any commentary outside the thinking block and the single action."""
+
+
+def build_teacher_full_step_messages(
+    branch_observation: str,
+    *,
+    tag_instruction: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """Build chat messages asking the teacher to write one complete step."""
+    instruction = tag_instruction if tag_instruction is not None else _tag_think_instruction()
+    system = TEACHER_FULL_STEP_SYSTEM_PROMPT.format(tag_instruction=instruction)
+    user = (
+        "The agent's current observation (task, history, and instructions) is:\n\n"
+        f"{branch_observation}\n\n"
+        "Write the complete response for this step now (reasoning + one action)."
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
 class TeacherPrefixParseError(ValueError):
     """The teacher reply violates the a_T prefix contract."""
 
@@ -271,22 +317,89 @@ def parse_teacher_prefix_response(
     return f"{_THINK_OPEN}\n{content}\n"
 
 
+_FULL_STEP_ACTION_RE = re.compile(
+    r"<(search|answer)>(.*?)</\1>", re.IGNORECASE | re.DOTALL
+)
+
+
+def parse_teacher_full_step_response(
+    text: str,
+    *,
+    min_chars: int = 20,
+    max_chars: int = 6000,
+) -> str:
+    """
+    Quality-gate a full-step teacher reply: `<think>` tagged reasoning
+    `</think>` followed by exactly one `<search>`/`<answer>` action.
+
+    Returns the normalized complete response text (think block + action).
+
+    Raises:
+        TeacherPrefixParseError: missing/unclosed think block, zero or
+            multiple actions, missing function tags, out-of-bounds length.
+    """
+    content = str(text or "").strip()
+    if not content.lower().startswith(_THINK_OPEN):
+        content = f"{_THINK_OPEN}\n{content}"
+    if content.lower().count("</think>") != 1:
+        raise TeacherPrefixParseError("full-step reply must close the thinking block exactly once")
+    think_part, after = re.split(r"</think>", content, maxsplit=1, flags=re.IGNORECASE)
+    think_body = think_part[len(_THINK_OPEN):].strip() if think_part.lower().startswith(_THINK_OPEN) else think_part.strip()
+
+    open_tags = re.findall(r"<(plan|verify|reflect|backtrack)>", think_body, re.IGNORECASE)
+    if not open_tags:
+        raise TeacherPrefixParseError("full-step reply contains no function tag segment")
+    for tag in set(t.lower() for t in open_tags):
+        if think_body.lower().count(f"<{tag}>") != think_body.lower().count(f"</{tag}>"):
+            raise TeacherPrefixParseError(f"unbalanced <{tag}> tags in full-step reply")
+
+    actions = _FULL_STEP_ACTION_RE.findall(after)
+    if len(actions) != 1:
+        raise TeacherPrefixParseError(
+            f"full-step reply must contain exactly one <search>/<answer> action, found {len(actions)}"
+        )
+    action_tag, action_body = actions[0]
+    action_body = action_body.strip()
+    if not action_body:
+        raise TeacherPrefixParseError("full-step action is empty")
+    leftover = _FULL_STEP_ACTION_RE.sub("", after).strip()
+    if leftover:
+        raise TeacherPrefixParseError(f"unexpected text outside the action: {leftover[:80]!r}")
+
+    stripped = re.sub(r"</?(?:plan|verify|reflect|backtrack)>", "", think_body, flags=re.IGNORECASE)
+    if not (min_chars <= len(stripped.strip()) <= max_chars):
+        raise TeacherPrefixParseError(
+            f"full-step reasoning length {len(stripped.strip())} outside [{min_chars}, {max_chars}]"
+        )
+
+    tag = action_tag.lower()
+    return f"{_THINK_OPEN}\n{think_body}\n</think>\n<{tag}>{action_body}</{tag}>"
+
+
 def _generate_one_prefix(
     spec: BranchSpec,
     chat_fn: Callable[[List[Dict[str, str]]], str],
     *,
     tag_instruction: Optional[str],
     max_retries: int,
+    mode: str = "think_prefix",
 ) -> Tuple[Optional[str], str]:
     """Request a_T for one spec. Returns (prefix or None, error message)."""
-    messages = build_teacher_prefix_messages(
-        spec.branch_observation, tag_instruction=tag_instruction
-    )
+    if mode == "full_step":
+        messages = build_teacher_full_step_messages(
+            spec.branch_observation, tag_instruction=tag_instruction
+        )
+        parse = parse_teacher_full_step_response
+    else:
+        messages = build_teacher_prefix_messages(
+            spec.branch_observation, tag_instruction=tag_instruction
+        )
+        parse = parse_teacher_prefix_response
     last_error = "no attempt made"
     for _ in range(max(1, int(max_retries))):
         try:
             reply = chat_fn(messages)
-            return parse_teacher_prefix_response(reply), ""
+            return parse(reply), ""
         except TeacherPrefixParseError as exc:
             last_error = str(exc)
         except Exception as exc:  # transport errors: retry, then drop
@@ -301,10 +414,16 @@ def generate_teacher_prefixes(
     tag_instruction: Optional[str] = None,
     max_retries: int = 2,
     max_workers: int = 1,
+    mode: str = "think_prefix",
 ) -> Tuple[Dict[int, str], Dict[int, str]]:
     """
     Request a_T for every spec through `chat_fn` (an OpenAI-compatible chat
     call returning the assistant message content, e.g. the analyzer client).
+
+    `mode` selects the contract: "think_prefix" (default) asks for an unclosed
+    thinking prefix the student continues within the step; "full_step" asks for
+    the complete response of the branch step (closed thinking + one action) —
+    the student then takes over from the NEXT step.
 
     `max_workers > 1` issues the teacher calls from a thread pool; the teacher
     is a remote HTTP server, so this is the difference between one training step
@@ -315,6 +434,8 @@ def generate_teacher_prefixes(
         (prefixes, failures): spec index -> prefix text, spec index -> error.
         Failed specs should simply be dropped (no branch for that point).
     """
+    if mode not in ("think_prefix", "full_step"):
+        raise ValueError(f"unknown teacher prefix mode {mode!r}")
     prefixes: Dict[int, str] = {}
     failures: Dict[int, str] = {}
 
@@ -331,7 +452,11 @@ def generate_teacher_prefixes(
             record(
                 i,
                 _generate_one_prefix(
-                    spec, chat_fn, tag_instruction=tag_instruction, max_retries=max_retries
+                    spec,
+                    chat_fn,
+                    tag_instruction=tag_instruction,
+                    max_retries=max_retries,
+                    mode=mode,
                 ),
             )
         return prefixes, failures
@@ -346,6 +471,7 @@ def generate_teacher_prefixes(
                 chat_fn,
                 tag_instruction=tag_instruction,
                 max_retries=max_retries,
+                mode=mode,
             ): i
             for i, spec in enumerate(specs)
         }
@@ -538,6 +664,10 @@ def run_branch_rollout_batched(
     ],
     generate_batch: Callable[[List[str], List[Optional[str]], List[int], int], List[str]],
     max_steps: int,
+    prefix_mode: str = "think_prefix",
+    encode_teacher_step: Optional[
+        Callable[[List[str], List[str], List[int], int], None]
+    ] = None,
 ) -> List[BranchTrajectory]:
     """
     Batched counterpart of `run_branch_rollout`, one generate call per step.
@@ -558,7 +688,21 @@ def run_branch_rollout_batched(
       step, where the returned text must start with that prefix. `spec_indices`
       are indices into `specs`, so the cluster glue can stash the token-level
       tensors it produced for each row.
+
+    `prefix_mode`:
+    - "think_prefix" (default): a_T is an unclosed thinking prefix; the student
+      continues within the branch step via `generate_batch`.
+    - "full_step": a_T is the COMPLETE response of the branch step (teacher
+      picked the action and finished the step). No policy call is made at the
+      branch step; `encode_teacher_step(obs_texts, response_texts, spec_indices,
+      step_num)` is invoked instead so the cluster glue can tokenize the
+      teacher-written row (all its response tokens are teacher tokens). The
+      student takes over from the next step onward.
     """
+    if prefix_mode not in ("think_prefix", "full_step"):
+        raise ValueError(f"unknown prefix_mode {prefix_mode!r}")
+    if prefix_mode == "full_step" and encode_teacher_step is None:
+        raise ValueError("prefix_mode='full_step' requires the encode_teacher_step hook")
     trajectories: List[BranchTrajectory] = []
     for bucket in bucket_specs_by_replay_length(specs, prefix_texts):
         bucket_specs = [specs[i] for i in bucket]
@@ -583,16 +727,24 @@ def run_branch_rollout_batched(
             step_prefixes: List[Optional[str]] = [
                 prefix_texts[bucket[i]] if offset == 0 else None for i in range(n)
             ]
-            response_texts = list(generate_batch(obs_texts, step_prefixes, bucket, step_num))
-            if len(response_texts) != n:
-                raise ValueError(f"generate_batch returned {len(response_texts)} responses for {n} rows")
-            for i in range(n):
-                expected_prefix = step_prefixes[i]
-                if expected_prefix is not None and not str(response_texts[i]).startswith(expected_prefix):
+            if prefix_mode == "full_step" and offset == 0:
+                # The teacher already wrote the whole step: the prefix IS the
+                # response. Tokenize/bookkeep it, but do not call the policy.
+                response_texts = [str(step_prefixes[i]) for i in range(n)]
+                encode_teacher_step(obs_texts, response_texts, list(bucket), step_num)
+            else:
+                response_texts = list(generate_batch(obs_texts, step_prefixes, bucket, step_num))
+                if len(response_texts) != n:
                     raise ValueError(
-                        "generate_batch() must return the full response including the a_T prefix "
-                        "for the branch step"
+                        f"generate_batch returned {len(response_texts)} responses for {n} rows"
                     )
+                for i in range(n):
+                    expected_prefix = step_prefixes[i]
+                    if expected_prefix is not None and not str(response_texts[i]).startswith(expected_prefix):
+                        raise ValueError(
+                            "generate_batch() must return the full response including the a_T prefix "
+                            "for the branch step"
+                        )
 
             next_obs, rewards, dones, infos = env_step_batch(bucket_specs, response_texts)
             infos = list(infos or [{} for _ in range(n)])
