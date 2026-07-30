@@ -8,6 +8,7 @@ Student Qwen3-8B 在 Search QA 上向外接 Qwen3-30B-A3B teacher 学「工具�
 | 文档 | 内容 |
 |---|---|
 | 本文 | 四个改造点是什么、代码在哪、当前状态、怎么跑 |
+| [training-plan.md](training-plan.md) | **训练思路总纲**:科学问题、损失构成、实验矩阵 E0-E3、决策门、指标清单;配套一键脚本 [`scripts/experiments/run_stage.sh`](../../scripts/experiments/run_stage.sh) |
 | [cluster-runbook.md](cluster-runbook.md) | 集群拓扑、模型/数据/产出的存放位置、服务启动、踩过的接口坑 |
 | [open-issues.md](open-issues.md) | 尚未解决的问题、已定位但未修的 bug、性能瓶颈的实测数据 |
 | [../../ops/README.md](../../ops/README.md) | 一键开跑的运维脚本：同步、体检、起服务、冲烟、训练 |
