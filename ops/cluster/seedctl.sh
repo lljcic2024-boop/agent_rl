@@ -5,13 +5,23 @@
 # 「自包含、幂等、把该看的信息一次全打出来」，而不是让调用方分多次问。
 #
 #   bash seedctl.sh doctor     # 开跑前体检：模型/数据/服务/GPU/环境变量
-#   bash seedctl.sh services   # 起 teacher + retriever，等到健康为止
+#   bash seedctl.sh services   # 本机起 teacher 副本 + retriever，等到健康为止
+#   bash seedctl.sh teacher    # 本机只起 teacher 副本（纯 teacher 节点用）
 #   bash seedctl.sh smoke      # 冲烟一步（strict 开），跑完直接打漏斗
 #   bash seedctl.sh train      # 正式 150 步，setsid nohup 脱离连接
 #   bash seedctl.sh status     # 一次性体检报告：进程/步数/漏斗/耗时/报错
 #   bash seedctl.sh funnel     # 只看改造点 4 漏斗
 #   bash seedctl.sh stop       # 安全停训练（绝不用 pkill -f）
 #   bash seedctl.sh logs [n]   # 训练日志尾部 n 行（已去 ANSI）
+#
+# 多节点 teacher 部署（例：20 卡 = 5 副本 TP=4）：
+#   混合节点（teacher 4 卡 + retriever 4 卡）:  bash seedctl.sh services
+#   每个纯 teacher 节点（8 卡 = 2 副本）:
+#     TEACHER_REPLICAS=2 TEACHER_GPUS=0,1,2,3,4,5,6,7 bash seedctl.sh teacher
+#   训练节点 .env 里把所有副本写进一个逗号列表：
+#     SEED_EXTERNAL_TEACHER_BASE_URL=http://ip1:8100/v1,http://ip2:8100/v1,http://ip2:8101/v1,...
+#   打分客户端会把请求轮询到所有副本，坏一个自动跳过。
+#   doctor/status 里设 TEACHER_URLS=<同上列表> 可一次体检全部副本。
 #
 # 所有路径都可用环境变量覆盖，默认值对应当前千帆 CFS 布局。
 set -uo pipefail
@@ -24,7 +34,11 @@ LOG_ROOT="${LOG_ROOT:-$WORKSPACE/logs}"
 PYLIBS="${PYLIBS:-$WORKSPACE/pylibs}"
 
 TEACHER_HOST="${TEACHER_HOST:-127.0.0.1}"
-TEACHER_PORT="${TEACHER_PORT:-8100}"
+TEACHER_PORT="${TEACHER_PORT:-8100}"          # 第一个副本的端口，副本 i 用 PORT+i
+TEACHER_REPLICAS="${TEACHER_REPLICAS:-1}"     # 本机起几个 teacher 副本
+TEACHER_TP="${TEACHER_TP:-4}"                 # 每副本张数
+TEACHER_GPUS="${TEACHER_GPUS:-0,1,2,3}"       # 本机分给 teacher 的 GPU 列表（按副本切片）
+TEACHER_URLS="${TEACHER_URLS:-}"              # 逗号分隔的全部副本 URL；设了则 doctor/status 逐个体检
 RETRIEVER_HOST="${RETRIEVER_HOST:-127.0.0.1}"
 RETRIEVER_PORT="${RETRIEVER_PORT:-8000}"
 TEACHER_MODEL_DIR="${TEACHER_MODEL_DIR:-$MODELS_ROOT/Qwen3-30B-A3B-Instruct-2507}"
@@ -55,7 +69,34 @@ strip_ansi() { sed -e 's/\x1b\[[0-9;]*m//g'; }
 
 http_code() { curl -s -o /dev/null -m "${2:-8}" -w '%{http_code}' "$1" 2>/dev/null || echo 000; }
 
-teacher_up()   { [[ "$(http_code "http://$TEACHER_HOST:$TEACHER_PORT/v1/models")" == 200 ]]; }
+# 单副本健康检查（本机端口号），以及"全部副本"检查：
+# TEACHER_URLS 设了就逐个查列表，否则查本机 TEACHER_PORT 起的 TEACHER_REPLICAS 个端口。
+teacher_port_up() { [[ "$(http_code "http://$TEACHER_HOST:${1:-$TEACHER_PORT}/v1/models")" == 200 ]]; }
+teacher_url_up()  { [[ "$(http_code "${1%/}/models")" == 200 ]]; }
+teacher_up() {
+    if [[ -n "$TEACHER_URLS" ]]; then
+        local url
+        for url in ${TEACHER_URLS//,/ }; do teacher_url_up "$url" || return 1; done
+        return 0
+    fi
+    local i
+    for ((i = 0; i < TEACHER_REPLICAS; i++)); do teacher_port_up $((TEACHER_PORT + i)) || return 1; done
+}
+teacher_report() {
+    # 每个副本一行 OK/FAIL，doctor/status 共用
+    if [[ -n "$TEACHER_URLS" ]]; then
+        local url
+        for url in ${TEACHER_URLS//,/ }; do
+            teacher_url_up "$url" && ok "teacher $url" || bad "teacher 挂了：$url"
+        done
+    else
+        local i port
+        for ((i = 0; i < TEACHER_REPLICAS; i++)); do
+            port=$((TEACHER_PORT + i))
+            teacher_port_up "$port" && ok "teacher   :$port" || bad "teacher 不在 :$port（跑 seedctl services / teacher）"
+        done
+    fi
+}
 retriever_up() {
     # retriever 没有 health 端点，只能发一个真查询。注意 payload 是单数 query
     # 且值必须是 str —— 传 queries 或 list 都会被 pydantic 拒掉。
@@ -131,7 +172,7 @@ cmd_doctor_part2() {
         || bad "ray_trainer 缺 tag_error_signal —— 选点器会静默退化成轨迹级"
 
     hdr "服务"
-    teacher_up   && ok "teacher   :$TEACHER_PORT"   || bad "teacher 不在 :$TEACHER_PORT（跑 seedctl services）"
+    teacher_report
     retriever_up && ok "retriever :$RETRIEVER_PORT" || bad "retriever 不在 :$RETRIEVER_PORT（跑 seedctl services）"
 
     hdr "GPU"
@@ -153,29 +194,96 @@ cmd_doctor_part2() {
     printf '%s体检全过，可以 seedctl smoke。%s\n' "$GRN" "$RST"
 }
 
+# 起本机的第 $1 个 teacher 副本（0 起数）。GPU 从 TEACHER_GPUS 里按 TP 切片。
+start_teacher_replica() {
+    local idx="$1"
+    local port=$((TEACHER_PORT + idx))
+    local log="${TEACHER_LOG%.log}_$port.log"
+    local gpus
+    gpus=$(echo "$TEACHER_GPUS" | tr ',' '\n' | sed -n "$((idx * TEACHER_TP + 1)),$(((idx + 1) * TEACHER_TP))p" | paste -sd,)
+    if [[ -z "$gpus" || $(echo "$gpus" | tr ',' '\n' | wc -l) -lt $TEACHER_TP ]]; then
+        bad "副本 $idx 分不到 $TEACHER_TP 张卡（TEACHER_GPUS=$TEACHER_GPUS）"
+        return 1
+    fi
+    # 显存参数说明（都踩过 OOM，别随手改回去）：
+    # - prompt_logprobs 要求对每个 prompt 位置物化全词表 logits。vLLM V1 的
+    #   chunked prefill 下，这个瞬时峰值 ≈ max-num-batched-tokens × 词表(15万) ×
+    #   ~6B/位置，且集中在 TP rank0 —— 峰值只由 batched-tokens 决定，与并发无关。
+    # - 所以治 OOM 的旋钮是 --max-num-batched-tokens（4096 ≈ 4GB 峰值），
+    #   而 --max-num-seqs 和客户端并发可以放开（多的只是很小的 GQA KV cache）。
+    # - 0.85 util 时代的 OOM -> EngineDeadError -> server 永久挂掉，训练侧只看到
+    #   Connection refused；现在多副本 + 客户端 failover，坏一个不再是全局事故。
+    CUDA_VISIBLE_DEVICES="$gpus" \
+    setsid nohup python3 -m vllm.entrypoints.openai.api_server \
+        --model "$TEACHER_MODEL_DIR" \
+        --served-model-name "$TEACHER_MODEL_NAME" \
+        --port "$port" \
+        --tensor-parallel-size "$TEACHER_TP" \
+        --gpu-memory-utilization "${TEACHER_GPU_UTIL:-0.72}" \
+        --max-model-len 16384 \
+        --max-logprobs 40 \
+        --max-num-batched-tokens "${TEACHER_MAX_BATCHED_TOKENS:-4096}" \
+        --max-num-seqs "${TEACHER_MAX_SEQS:-64}" \
+        > "$log" 2>&1 < /dev/null &
+    echo "  副本 $idx: 端口 $port GPU $gpus 日志 -> $log"
+}
+
+start_teacher_replicas() {
+    local i port started=0
+    for ((i = 0; i < TEACHER_REPLICAS; i++)); do
+        port=$((TEACHER_PORT + i))
+        if teacher_port_up "$port"; then
+            ok "teacher 已在 :$port，跳过"
+        else
+            [[ $started -eq 0 ]] && hdr "起 teacher vLLM（$TEACHER_REPLICAS 副本 × TP=$TEACHER_TP）"
+            start_teacher_replica "$i" || return 1
+            started=1
+        fi
+    done
+}
+
+wait_local_teachers() {
+    hdr "等 teacher 副本就绪（最多 ${SERVICE_WAIT:-600} 秒；30B 加载要几分钟）"
+    local waited=0 step=10 i port up total
+    while [[ $waited -lt ${SERVICE_WAIT:-600} ]]; do
+        up=0; total=$TEACHER_REPLICAS
+        for ((i = 0; i < TEACHER_REPLICAS; i++)); do
+            teacher_port_up $((TEACHER_PORT + i)) && up=$((up + 1))
+        done
+        printf '\r  %3ds  teacher %d/%d' "$waited" "$up" "$total"
+        [[ $up -eq $total ]] && { printf '\n'; ok "全部 teacher 副本就绪"; return 0; }
+        sleep $step; waited=$((waited + step))
+    done
+    printf '\n'
+    bad "等超时。第一个未就绪副本的日志尾部："
+    for ((i = 0; i < TEACHER_REPLICAS; i++)); do
+        port=$((TEACHER_PORT + i))
+        if ! teacher_port_up "$port"; then
+            tail -20 "${TEACHER_LOG%.log}_$port.log" 2>/dev/null | strip_ansi | sed 's/^/    /'
+            break
+        fi
+    done
+    return 1
+}
+
+# 纯 teacher 节点入口：只起副本，不管 retriever。
+# 例：8 卡节点起 2 副本 -> TEACHER_REPLICAS=2 TEACHER_GPUS=0,1,2,3,4,5,6,7 bash seedctl.sh teacher
+cmd_teacher() {
+    mkdir -p "$LOG_ROOT"
+    start_teacher_replicas || return 1
+    wait_local_teachers || return 1
+    echo
+    echo "  把这台机器的副本加进训练节点 .env 的 SEED_EXTERNAL_TEACHER_BASE_URL："
+    local i self_ip
+    self_ip=$(hostname -i 2>/dev/null | awk '{print $1}')
+    for ((i = 0; i < TEACHER_REPLICAS; i++)); do
+        echo "    http://${self_ip:-<本机IP>}:$((TEACHER_PORT + i))/v1"
+    done
+}
+
 cmd_services() {
     mkdir -p "$LOG_ROOT"
-    if teacher_up; then
-        ok "teacher 已在 :$TEACHER_PORT，跳过"
-    else
-        hdr "起 teacher vLLM"
-        # gpu-memory-utilization 0.72 不是随手填的：prompt_logprobs 要为整段 prompt
-        # 物化 logits（vocab 15 万 × 数千 token），0.85 时并发一上来就 OOM ->
-        # EngineDeadError -> 整个 server 永久挂掉，训练侧只看到 Connection refused。
-        CUDA_VISIBLE_DEVICES="${TEACHER_GPUS:-0,1,2,3}" \
-        setsid nohup python3 -m vllm.entrypoints.openai.api_server \
-            --model "$TEACHER_MODEL_DIR" \
-            --served-model-name "$TEACHER_MODEL_NAME" \
-            --port "$TEACHER_PORT" \
-            --tensor-parallel-size "${TEACHER_TP:-4}" \
-            --gpu-memory-utilization "${TEACHER_GPU_UTIL:-0.72}" \
-            --max-model-len 16384 \
-            --max-logprobs 40 \
-            --max-num-batched-tokens 8192 \
-            --max-num-seqs "${TEACHER_MAX_SEQS:-16}" \
-            > "$TEACHER_LOG" 2>&1 < /dev/null &
-        echo "  日志 -> $TEACHER_LOG"
-    fi
+    start_teacher_replicas || return 1
 
     if retriever_up; then
         ok "retriever 已在 :$RETRIEVER_PORT，跳过"
@@ -193,18 +301,26 @@ cmd_services() {
 
     # 2100 万条语料建索引要 1-2 分钟，30B 加载也要几分钟，别以为卡死了
     hdr "等服务就绪（最多 ${SERVICE_WAIT:-600} 秒）"
-    local waited=0 step=10
+    local waited=0 step=10 i t_up
     while [[ $waited -lt ${SERVICE_WAIT:-600} ]]; do
-        local t=no r=no
-        teacher_up && t=yes
+        local r=no
+        t_up=0
+        for ((i = 0; i < TEACHER_REPLICAS; i++)); do
+            teacher_port_up $((TEACHER_PORT + i)) && t_up=$((t_up + 1))
+        done
         retriever_up && r=yes
-        printf '\r  %3ds  teacher=%-3s retriever=%-3s' "$waited" "$t" "$r"
-        [[ "$t" == yes && "$r" == yes ]] && { printf '\n'; ok "两个服务都就绪"; return 0; }
+        printf '\r  %3ds  teacher=%d/%d retriever=%-3s' "$waited" "$t_up" "$TEACHER_REPLICAS" "$r"
+        [[ $t_up -eq $TEACHER_REPLICAS && "$r" == yes ]] && { printf '\n'; ok "全部服务就绪"; return 0; }
         sleep $step; waited=$((waited+step))
     done
     printf '\n'
-    bad "等超时。teacher 尾部："
-    tail -20 "$TEACHER_LOG" 2>/dev/null | strip_ansi | sed 's/^/    /'
+    bad "等超时。第一个未就绪 teacher 副本的日志尾部："
+    for ((i = 0; i < TEACHER_REPLICAS; i++)); do
+        if ! teacher_port_up $((TEACHER_PORT + i)); then
+            tail -20 "${TEACHER_LOG%.log}_$((TEACHER_PORT + i)).log" 2>/dev/null | strip_ansi | sed 's/^/    /'
+            break
+        fi
+    done
     return 1
 }
 
@@ -316,7 +432,7 @@ cmd_status() {
     hdr "进程"
     local pids; pids=$(train_pids)
     [[ -n "$pids" ]] && ok "训练在跑：$pids" || warn "没有训练进程（跑完了 or 死了）"
-    teacher_up   && ok "teacher   :$TEACHER_PORT"   || bad "teacher 挂了"
+    teacher_report
     retriever_up && ok "retriever :$RETRIEVER_PORT" || bad "retriever 挂了"
 
     hdr "进度（$log）"
@@ -330,9 +446,18 @@ cmd_status() {
     cmd_funnel
 
     hdr "一步耗时分解"
-    # 82 秒里 teacher 打分占 44.5 秒（54%），这是当前首要性能瓶颈
     grep -oE "timing_s/[a-z_]+':? [0-9.]+" "$log" 2>/dev/null | tail -12 | sed 's/^/  /' \
         || echo "  还没有 timing 数据"
+
+    hdr "teacher 打分吞吐（最近一步）"
+    # 客户端每次打分都报 elapsed_s / prefill tok/s / 重试 / 副本故障数；
+    # endpoint_failures > 0 说明有副本在丢请求（failover 兜住了，但要去修）
+    grep -oE "seed/external_teacher/[a-z_]+/(elapsed_s|prefill_tokens_per_s|rows_scored|num_batches|retries|endpoint_failures)':? [0-9.]+" \
+        "$log" 2>/dev/null | tail -12 | sed 's/^/  /' \
+        || echo "  还没有打分统计（外接 teacher 未启用或第一步未完成）"
+    if grep -q "seed/teacher_signal_failed':? 1" "$log" 2>/dev/null; then
+        bad "出现过 teacher_signal_failed=1 —— 有训练步的 OPD 项是空的，查 teacher 副本"
+    fi
 
     hdr "报错扫描"
     grep -nE "Error|Traceback|RayTaskError|OutOfMemory|EngineDead|Connection refused" \
@@ -361,6 +486,7 @@ cmd_stop() {
 case "${1:-}" in
     doctor)   cmd_doctor ;;
     services) cmd_services ;;
+    teacher)  cmd_teacher ;;
     smoke)    cmd_smoke ;;
     train)    cmd_train ;;
     status)   cmd_status ;;

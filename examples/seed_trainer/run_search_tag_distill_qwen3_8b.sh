@@ -64,14 +64,17 @@ fi
 export HF_MODEL_PATH
 export MODEL_PATH="${MODEL_PATH:-$HF_MODEL_PATH}"
 
-# Teacher server (single endpoint for analyzer + external log-prob scoring).
+# Teacher server(s). TEACHER_BASE_URL may be a comma-separated replica list:
+# log-prob scoring spreads batches across all of them; the analyzer (chat
+# completions, writes a_T) is a single-endpoint client and defaults to the
+# FIRST replica — override OPENAI_BASE_URL to pin it elsewhere.
 TEACHER_BASE_URL="${TEACHER_BASE_URL:-http://127.0.0.1:8100/v1}"
 TEACHER_MODEL="${TEACHER_MODEL:-Qwen3-30B-A3B}"
 TEACHER_API_KEY="${TEACHER_API_KEY:-EMPTY}"
 
 # Analyzer -> external 30B teacher (writes thinking segments / a_T).
 export SEED_ANALYSIS_BACKEND="${SEED_ANALYSIS_BACKEND:-openai}"
-export OPENAI_BASE_URL="${OPENAI_BASE_URL:-$TEACHER_BASE_URL}"
+export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${TEACHER_BASE_URL%%,*}}"
 export OPENAI_MODEL="${OPENAI_MODEL:-$TEACHER_MODEL}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-$TEACHER_API_KEY}"
 

@@ -76,7 +76,31 @@
 **A800 显存不是约束**：训练卡占 41651-43085 MiB / 81920 MiB，每卡还剩约 39 GB。
 压力全在 teacher server 侧。
 
-### 三条对症的改法，按性价比排
+### 2026-07-30 更新：机制修正 + 改法 (2)(3) 已实现
+
+**机制修正（推翻了当初压并发的依据）**：vLLM 0.11 只有 V1 引擎，chunked prefill
+默认开。`prompt_logprobs` 的 logits 物化是**按 chunk 增量做**的，瞬时显存峰值 ≈
+`max-num-batched-tokens × 词表(15万) × ~6B/位置`（集中在 TP rank0），
+**只由 chunk 预算决定，与在跑的请求数无关**。并发多了只多 GQA 的 KV cache（很小）。
+所以当初 OOM 后压并发到 2、max-num-seqs 到 16 是拧错了旋钮 —— 该压的是
+`--max-num-batched-tokens`（8192→4096，峰值 7.5GB→4GB）。
+
+**已实现**（本地 146 项单测全绿，待集群实测）：
+
+- 客户端合批：`seed_external_teacher.py` 每个 HTTP 请求打包
+  `batch_size`（默认 16）条 token-id prompt，vLLM 服务端连续批处理。
+- 多副本轮询：`base_url` 接受逗号分隔的副本列表，batch 轮询分发，
+  重试自动跳到下一个副本（单副本挂掉降速不断训）。
+- 并发默认 2 → 16（`SEED_EXTERNAL_TEACHER_CONCURRENCY`），
+  服务端 `--max-num-batched-tokens 4096`、`--max-num-seqs 64`
+  （`seedctl services` / `seedctl teacher` 已带上）。
+- 每次打分报 `seed/external_teacher/<label>/{elapsed_s, prefill_tokens_per_s,
+  rows_scored, num_batches, retries, endpoint_failures}`，`seedctl status` 直接打印。
+- 打分异步失败不再静默：`seed/teacher_signal_failed=1` + ERROR 级完整 traceback。
+
+**20 卡 teacher 部署**（5 副本 × TP=4）见 cluster-runbook「多副本 teacher」一节。
+
+### 三条对症的改法（原始分析，保留供参考），按性价比排
 
 **（1）别再要用不到的东西 —— 最该改**
 
@@ -215,8 +239,10 @@ value = float(values.mean())
 |---|---|---|
 | 高 | 开 `strict=True` 跑一步，读漏斗定位问题 1 根因 | 是 |
 | 高 | 查上次训练的真实死因 | 是 |
-| 中 | 抬并发到 8，测 OOM 边界，量新的 `seed_teacher` 秒数 | 是 |
-| 中 | 缩 `prompt_logprobs` 作用范围（省 87% 浪费） | 验证需要 |
-| 中 | teacher 请求合批 | 否（改完再验） |
+| 高 | 按新参数重启 teacher（多副本），实测新的 `seed_teacher` 秒数与 `prefill_tokens_per_s` | 是 |
+| 高 | 正式规模（128×8）跑一步拿完整 timing 分解，校准总时长估算 | 是 |
+| ~~中~~ | ~~抬并发~~ ~~teacher 请求合批~~ → 2026-07-30 已实现（见上），待集群验证 | 是 |
+| 中 | 缩 `prompt_logprobs` 作用范围（省 87% 浪费；先试缩短 teacher prompt） | 验证需要 |
+| 中 | 跨步滞后 OPD：teacher 冻结 + token 已定 → step t 的打分可与 t 的 update、t+1 的 gen 全重叠 | 否（改完再验） |
 | 低 | 改造点 3 Phase 2b critic-gap 选点 | 否 |
 | 低 | 产出真的 `Qwen3-8B-search-tag-sft` student | 是 |

@@ -5,13 +5,36 @@
 
 ## 拓扑
 
+### 32 卡目标拓扑（2026-07-30 起，20 卡 teacher）
+
+| 角色 | GPU | 说明 |
+|---|---|---|
+| 训练 | worker-0，8× A800 | student Qwen3-8B |
+| retriever `:8000` | worker-1，GPU 4-7 | faiss GPU 分片，61 GB 索引不搬家 |
+| teacher 副本 0 `:8100` | worker-1，GPU 0-3，TP=4 | `seedctl services` 顺带起 |
+| teacher 副本 1-2 `:8100/:8101` | worker-2，GPU 0-7，2 副本 | `TEACHER_REPLICAS=2 TEACHER_GPUS=0,1,2,3,4,5,6,7 bash seedctl.sh teacher` |
+| teacher 副本 3-4 `:8100/:8101` | worker-3，GPU 0-7，2 副本 | 同上 |
+
+共 5 个 teacher 副本。训练节点 `.env` 把全部副本写成逗号列表：
+
+```bash
+SEED_EXTERNAL_TEACHER_BASE_URL="http://<w1>:8100/v1,http://<w2>:8100/v1,http://<w2>:8101/v1,http://<w3>:8100/v1,http://<w3>:8101/v1"
+```
+
+打分客户端把 batch 轮询到所有副本，某个副本挂掉时重试自动跳下一个（降速不断训）。
+analyzer（写 a_T 的 chat 客户端）只用**列表第一个**；建议想清楚哪个副本最闲再用
+`OPENAI_BASE_URL` 单独指过去 —— 打分是 prefill 型、写 a_T 是 decode 型，
+分开互不拖慢。
+
+### 旧 12 卡拓扑（保留参考）
+
 | 角色 | GPU | 说明 |
 |---|---|---|
 | 训练 | worker-0，8× A800 全部 | student Qwen3-8B |
 | teacher vLLM `:8100` | worker-1，`CUDA_VISIBLE_DEVICES=0,1,2,3`，TP=4 | analyzer + 打分共用一个 server |
 | retriever `:8000` | worker-1，`CUDA_VISIBLE_DEVICES=4,5,6,7` | faiss GPU 分片 |
 
-两个 worker pod 同 namespace，**ping 通、TCP 通，直接用 pod IP，不用建 Service**。
+worker pod 同 namespace，**ping 通、TCP 通，直接用 pod IP，不用建 Service**。
 
 ---
 
@@ -68,7 +91,7 @@ wandb 用 `WANDB_MODE=offline`，pod 连不上外网。
 
 统一用 `setsid nohup bash <script> > <log> 2>&1 < /dev/null &`。
 
-### teacher vLLM
+### teacher vLLM（用 `seedctl services` / `seedctl teacher` 起，参数已内置）
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
@@ -78,22 +101,26 @@ python -m vllm.entrypoints.openai.api_server \
   --gpu-memory-utilization 0.72 \
   --max-model-len 16384 \
   --max-logprobs 40 \
-  --max-num-batched-tokens 8192 \
-  --max-num-seqs 16
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 64
 ```
 
-三个参数是踩出来的，不是抄的：
+参数是踩出来的，不是抄的（2026-07-30 修正了旋钮归因）：
 
 - **`--max-logprobs 40`**：外接打分要 `prompt_logprobs`，默认上限太小直接拒绝请求。
-- **`--gpu-memory-utilization 0.72`**：`prompt_logprobs` 要为**整段 prompt** 物化
-  logits（vocab 15 万 × 数千 token，单请求量级 GB）。0.85 时 KV cache 吃太满，
-  并发一上来就 `torch.OutOfMemoryError` → `EngineDeadError`，**整个 server 永久挂掉**。
-  之后所有请求 500，训练侧表现为 `Connection refused` +
-  「falling back to zero teacher signals」—— **极容易误判成网络问题**。
-- **`--max-num-seqs 16`**：同样是当初为保命压低的。
+- **`--max-num-batched-tokens 4096`**：**这才是治 OOM 的旋钮**。vLLM 0.11（V1 引擎、
+  chunked prefill）下 `prompt_logprobs` 的 logits 物化按 chunk 增量做，瞬时峰值 ≈
+  chunk 预算 × 词表 15 万 × ~6B/位置 ≈ 8192 时 7.5GB、4096 时 4GB，集中在 TP rank0。
+  **峰值与并发无关** —— 当初 0.85 util OOM → `EngineDeadError` → server 永久挂掉
+  （之后所有请求 500，训练侧表现为 `Connection refused`，极易误判成网络问题）之后
+  压并发到 2、max-num-seqs 到 16，是拧错了旋钮。
+- **`--max-num-seqs 64`**：并发请求只多占 GQA 的 KV cache（4k token 序列约几十 MB），
+  可以放开让调度器凑满 batch。
+- **`--gpu-memory-utilization 0.72`** 先不动，多副本稳定跑通后可试 0.80。
 
-客户端侧要同步压并发：`SEED_EXTERNAL_TEACHER_CONCURRENCY=2`（详见
-[open-issues.md](open-issues.md)，这是当前主要性能瓶颈）。
+客户端并发同步放开：`SEED_EXTERNAL_TEACHER_CONCURRENCY=16`（每副本 4-8 路在途合适），
+合批 `SEED_EXTERNAL_TEACHER_BATCH_SIZE=16`。若报 prompt_logprobs 与 prefix caching
+冲突，给 server 加 `--no-enable-prefix-caching`。
 
 ### retriever
 

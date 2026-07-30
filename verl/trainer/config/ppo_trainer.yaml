@@ -314,12 +314,16 @@ algorithm:
     clip_teacher_adv: null
     external_teacher: # 改造点 2: score student tokens with an external teacher server instead of policy self-scoring
       enable: False
-      base_url: "http://127.0.0.1:8100/v1" # OpenAI-compatible vLLM server of the teacher (e.g. Qwen3-30B-A3B); must support prompt_logprobs
+      # Comma-separated list of teacher replicas; batches are spread round-robin and
+      # retries fail over to the next endpoint. Each must be an OpenAI-compatible
+      # vLLM server (e.g. Qwen3-30B-A3B) that supports prompt_logprobs.
+      base_url: "http://127.0.0.1:8100/v1"
       model: "Qwen3-30B-A3B"
       api_key: null
       timeout: 600.0
       max_retries: 3
-      concurrency: 8 # parallel HTTP scoring requests
+      concurrency: 16 # HTTP requests kept in flight (server-side memory spike is bounded by --max-num-batched-tokens, not by this)
+      batch_size: 16 # rows (token-id prompts) packed into one HTTP request; vLLM batches them server-side
     teacher_branch: # 改造点 4: replay a step with a teacher-written thinking prefix (a_T) and let the student continue
       enable: False
       max_branches_per_traj: 1 # branch points sampled per parent trajectory

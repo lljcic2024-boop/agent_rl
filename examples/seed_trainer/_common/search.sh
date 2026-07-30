@@ -39,11 +39,15 @@ SEED_OPD_LOSS_MODE=${SEED_OPD_LOSS_MODE:-gate}
 SEED_OPD_RKL_ADV_CLIP=${SEED_OPD_RKL_ADV_CLIP:-null}
 SEED_OPD_FKL_LOSS_COEF=${SEED_OPD_FKL_LOSS_COEF:-0.0}
 SEED_EXTERNAL_TEACHER_ENABLE=${SEED_EXTERNAL_TEACHER_ENABLE:-False}
+# Comma-separated replica list is supported; batches round-robin across them.
 SEED_EXTERNAL_TEACHER_BASE_URL=${SEED_EXTERNAL_TEACHER_BASE_URL:-http://127.0.0.1:8100/v1}
 SEED_EXTERNAL_TEACHER_MODEL=${SEED_EXTERNAL_TEACHER_MODEL:-Qwen3-30B-A3B}
-# Scoring concurrency. Each request makes the teacher materialize prompt logprobs
-# for the whole sequence, so 8 in flight OOMs a TP=4 30B server on 80G cards.
-SEED_EXTERNAL_TEACHER_CONCURRENCY=${SEED_EXTERNAL_TEACHER_CONCURRENCY:-2}
+# Scoring concurrency + rows per HTTP request. The old OOM was caused by the
+# per-forward logits spike, which is bounded by the server's
+# --max-num-batched-tokens (vLLM V1 chunked prefill), NOT by how many requests
+# are in flight — so concurrency is safe to raise once the server caps that.
+SEED_EXTERNAL_TEACHER_CONCURRENCY=${SEED_EXTERNAL_TEACHER_CONCURRENCY:-16}
+SEED_EXTERNAL_TEACHER_BATCH_SIZE=${SEED_EXTERNAL_TEACHER_BATCH_SIZE:-16}
 SEED_STEP_SELECTOR=${SEED_STEP_SELECTOR:-trajectory}
 SEARCH_USE_FUNCTION_TAGS=${SEARCH_USE_FUNCTION_TAGS:-False}
 
@@ -147,9 +151,10 @@ python3 -m verl.trainer.main_ppo \
     algorithm.seed.selector=$SEED_SELECTOR \
     algorithm.seed.analysis_backend=$SEED_ANALYSIS_BACKEND \
     algorithm.seed.external_teacher.enable=$SEED_EXTERNAL_TEACHER_ENABLE \
-    algorithm.seed.external_teacher.base_url=$SEED_EXTERNAL_TEACHER_BASE_URL \
+    "algorithm.seed.external_teacher.base_url='$SEED_EXTERNAL_TEACHER_BASE_URL'" \
     algorithm.seed.external_teacher.model=$SEED_EXTERNAL_TEACHER_MODEL \
     algorithm.seed.external_teacher.concurrency=$SEED_EXTERNAL_TEACHER_CONCURRENCY \
+    algorithm.seed.external_teacher.batch_size=$SEED_EXTERNAL_TEACHER_BATCH_SIZE \
     algorithm.seed.step_selector=$SEED_STEP_SELECTOR \
     algorithm.seed.teacher_branch.enable=$SEED_TEACHER_BRANCH_ENABLE \
     algorithm.seed.teacher_branch.max_branches_per_traj=$SEED_TEACHER_BRANCH_MAX_PER_TRAJ \

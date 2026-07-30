@@ -89,7 +89,15 @@ token 挤，打分整段一次前向算完。所以「等 teacher rollout」这�
 
 损失侧：`SEED_OPD_LOSS_MODE=gate`、`SEED_OPD_LOSS_COEF=0.01`、`SEED_OPD_GATE_BETA=5.0`。
 
-**状态**：跑通并实测有输出。**性能是主要瓶颈**，见 [open-issues.md](open-issues.md)。
+**吞吐设计（2026-07-30）**：客户端支持**多副本 + 合批 + 观测**——
+`base_url` 接受逗号分隔的副本列表（轮询分发、重试自动换端点），每个 HTTP 请求打包
+`batch_size=16` 条 prompt，并发默认 16。每次打分报
+`seed/external_teacher/<label>/*` 吞吐指标（elapsed_s / prefill_tokens_per_s /
+retries / endpoint_failures），打分异步失败时 `seed/teacher_signal_failed=1` +
+ERROR 级 traceback，不再静默退化。
+
+**状态**：跑通并实测有输出。合批 + 多副本已实现（146 项单测），
+集群实测吞吐待验，见 [open-issues.md](open-issues.md)。
 
 ### 改造点 3：选点
 
@@ -179,13 +187,17 @@ warning。
 # 本地 -> CFS 同步代码（堡垒机不支持 scp，走 base64 灌 pty）
 bash ops/local/push_to_cluster.sh
 
-# 集群侧：体检 -> 起服务 -> 冲烟一步（strict 开，漏斗直接打出来）
+# 每个纯 teacher 节点（8 卡 = 2 副本 TP=4）各起一次；20 卡 = 5 副本布局见 cluster-runbook
+qf -c 'TEACHER_REPLICAS=2 TEACHER_GPUS=0,1,2,3,4,5,6,7 bash $SEED_ROOT/ops/cluster/seedctl.sh teacher'
+
+# 混合节点（teacher 副本 0 + retriever）+ 训练节点体检 -> 冲烟一步（strict 开，漏斗直接打出来）
+# 前提：.env 里 SEED_EXTERNAL_TEACHER_BASE_URL 已写全副本逗号列表
 qf -c 'bash $SEED_ROOT/ops/cluster/seedctl.sh all'
 
 # 漏斗健康就起正式 150 步（setsid nohup，脱离连接独立存活）
 qf -c 'bash $SEED_ROOT/ops/cluster/seedctl.sh train'
 
-# 断线重连后看进度：进程/步数/漏斗/耗时/报错一次全给
+# 断线重连后看进度：进程/步数/漏斗/耗时/打分吞吐/报错一次全给
 qf -c 'bash $SEED_ROOT/ops/cluster/seedctl.sh status'
 ```
 
@@ -210,11 +222,8 @@ SEED_TEACHER_BRANCH_STRICT=True TRAIN_DATA_SIZE=8 GROUP_SIZE=4 TOTAL_TRAINING_ST
 环境都是 stub。
 
 ```bash
-python3 -m pytest tests/agent_system/test_branch_runner.py \
-                  tests/agent_system/test_teacher_branch.py \
-                  tests/trainer/ppo/test_teacher_branch_gating.py \
-                  tests/trainer/ppo/test_metric_utils.py -q
+python3 -m pytest tests/agent_system/ tests/trainer/ppo/ -q
 ```
 
-当前 **70 passed**。分层设计（文本级编排与 verl 运行时对象分离）就是为了让绝大部分
-逻辑能脱离集群验证。
+当前 **146 passed**（含外接 teacher 客户端的合批/多副本轮询/failover/统计 9 项）。
+分层设计（文本级编排与 verl 运行时对象分离）就是为了让绝大部分逻辑能脱离集群验证。

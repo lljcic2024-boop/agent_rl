@@ -973,11 +973,16 @@ class RayPPOTrainer:
             timeout=float(cfg.get("timeout", 600.0) or 600.0),
             max_retries=int(cfg.get("max_retries", 3) or 3),
             concurrency=int(cfg.get("concurrency", 8) or 8),
+            batch_size=int(cfg.get("batch_size", 16) or 16),
         )
         module_logger.info(
-            "SEED external teacher scoring enabled: %s (model=%s). teacher_log_prob now comes from the external server.",
-            cfg.get("base_url"),
+            "SEED external teacher scoring enabled: %s endpoint(s) %s (model=%s, concurrency=%s, batch_size=%s). "
+            "teacher_log_prob now comes from the external server.",
+            len(self._seed_external_teacher_client.base_urls),
+            self._seed_external_teacher_client.base_urls,
             cfg.get("model"),
+            self._seed_external_teacher_client.concurrency,
+            self._seed_external_teacher_client.batch_size,
         )
         return self._seed_external_teacher_client
 
@@ -2914,11 +2919,17 @@ class RayPPOTrainer:
                     attention_mask=teacher_attention_mask,
                     response_masks=response_masks,
                 )
+                # Per-call throughput stats -> metrics, so scoring regressions
+                # show up on the dashboard instead of only in wall-clock time.
+                for stat_key, stat_value in external_teacher_client.last_stats.items():
+                    metrics[f"seed/external_teacher/{label}/{stat_key}"] = float(stat_value)
                 module_logger.info(
-                    "SEED %s external-teacher scored %s sequences (token_mean=%.6f).",
+                    "SEED %s external-teacher scored %s sequences (token_mean=%.6f, %.1fs, %.0f prefill tok/s).",
                     label,
                     teacher_log_prob_cpu.size(0),
                     float(teacher_log_prob_cpu.sum() / response_masks.detach().cpu().sum().clamp(min=1)),
+                    external_teacher_client.last_stats.get("elapsed_s", 0.0),
+                    external_teacher_client.last_stats.get("prefill_tokens_per_s", 0.0),
                 )
                 return teacher_log_prob_cpu.to(device=responses.device)
 
@@ -3385,6 +3396,9 @@ class RayPPOTrainer:
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.SEED:
                         with _timer("seed_teacher", timing_raw):
+                            # Pre-seed to 0 so "signal lost" and "metric missing" are
+                            # distinguishable on the dashboard (funnel lesson).
+                            metrics["seed/teacher_signal_failed"] = 0.0
                             if seed_teacher_future is None and seed_teacher_snapshot is None:
                                 module_logger.info(
                                     "SEED analysis is disabled; using zero teacher signals for this batch."
@@ -3420,10 +3434,19 @@ class RayPPOTrainer:
                                         == "seed_visual"
                                     ):
                                         raise
-                                    module_logger.warning(
-                                        "Asynchronous SEED teacher signal preparation failed; falling back to zero teacher signals for this batch: %s",
-                                        exc,
+                                    # Loud on purpose: a silent fallback here means the whole
+                                    # run can finish with the OPD term empty (same failure mode
+                                    # as the teacher-branch silent exits). Metric + stderr +
+                                    # full traceback, so `seedctl status` and the dashboard
+                                    # both catch it.
+                                    module_logger.error(
+                                        "SEED TEACHER SIGNALS LOST for step %s: async preparation failed; "
+                                        "falling back to zero teacher signals (OPD term is EMPTY this step). "
+                                        "If this repeats, check the teacher server (seedctl status).",
+                                        self.global_steps,
+                                        exc_info=exc,
                                     )
+                                    metrics["seed/teacher_signal_failed"] = 1.0
                                     batch.non_tensor_batch.pop("_batch_source_idx", None)
                                     batch = self._set_zero_seed_teacher_signals(batch=batch, metrics=metrics)
 

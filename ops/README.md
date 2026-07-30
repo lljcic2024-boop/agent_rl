@@ -19,8 +19,11 @@ bash ops/local/push_to_cluster.sh
 # 2. 开跑前体检：模型/数据/服务/GPU/补丁 一次全查
 qf -c 'bash /mnt/cfs_algo_bj/workspace/lijiachun/SEED/ops/cluster/seedctl.sh doctor'
 
-# 3. 起 teacher + retriever（幂等，已在就跳过；等到健康为止）
+# 3. 起 teacher 副本 + retriever（幂等，已在就跳过；等到健康为止）
 qf -c 'bash .../seedctl.sh services'
+#    纯 teacher 节点（8 卡 = 2 副本 TP=4）另起：
+qf -c 'TEACHER_REPLICAS=2 TEACHER_GPUS=0,1,2,3,4,5,6,7 bash .../seedctl.sh teacher'
+#    全部副本 URL 写进训练节点 .env 的 SEED_EXTERNAL_TEACHER_BASE_URL（逗号分隔）
 
 # 4. 冲烟一步，strict 开着，跑完直接打漏斗
 qf -c 'bash .../seedctl.sh smoke'

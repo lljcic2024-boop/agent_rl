@@ -21,6 +21,19 @@ long as student and teacher share a tokenizer (e.g. Qwen3-8B vs Qwen3-30B-A3B).
 Per-token log-probs come back via vLLM's `prompt_logprobs` extra parameter on
 the /v1/completions route.
 
+Throughput design (the scoring call sits on the training step's critical path):
+
+- `base_url` accepts a comma-separated list of teacher replicas. Batches are
+  spread round-robin; a failed attempt retries on the *next* endpoint, so a
+  single dead replica degrades throughput instead of killing the step.
+- Rows are packed `batch_size` prompts per HTTP request (vLLM's /completions
+  accepts a list of token-id arrays and schedules them with continuous
+  batching), so 149 rows are a handful of requests instead of 149 round trips.
+- `concurrency` HTTP requests are kept in flight so the server-side scheduler
+  always has work queued.
+- Every call records `last_stats` (rows/batches/tokens/elapsed/tok-per-s/
+  retries/per-endpoint failures) for the trainer to emit as metrics.
+
 Notes / assumptions:
 - Returned log-probs are raw model log-probs (temperature 1). If the student's
   log-probs were computed with a different temperature, the OPD gap is biased;
@@ -30,10 +43,12 @@ Notes / assumptions:
   left-padded-prompt / right-padded-response layout.
 """
 
+import itertools
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -41,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 
 class ExternalTeacherClient:
-    """Scores student-sampled tokens with an external teacher server."""
+    """Scores student-sampled tokens with one or more external teacher replicas."""
 
     def __init__(
         self,
@@ -52,17 +67,28 @@ class ExternalTeacherClient:
         max_retries: int = 3,
         retry_backoff_s: float = 2.0,
         concurrency: int = 8,
+        batch_size: int = 16,
     ):
-        self.base_url = str(base_url).rstrip("/")
+        self.base_urls = [u.strip().rstrip("/") for u in str(base_url).split(",") if u.strip()]
+        if not self.base_urls:
+            raise ValueError(f"external teacher base_url is empty: {base_url!r}")
         self.model = str(model)
         self.api_key = api_key
         self.timeout = float(timeout)
         self.max_retries = max(1, int(max_retries))
         self.retry_backoff_s = float(retry_backoff_s)
         self.concurrency = max(1, int(concurrency))
+        self.batch_size = max(1, int(batch_size))
+        # Stats of the most recent score_response_log_probs() call, flat floats
+        # so the trainer can dump them straight into the metrics dict.
+        self.last_stats: Dict[str, float] = {}
+        self._rr_counter = itertools.count()
+        self._rr_lock = threading.Lock()
         import requests  # local import: keep module importable without requests
 
         self._requests = requests
+        # One session per client; requests.Session is thread-safe for our use
+        # (independent POSTs, no cookies).
         self._session = requests.Session()
 
     # ------------------------------------------------------------------ HTTP
@@ -73,50 +99,84 @@ class ExternalTeacherClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def _request_prompt_logprobs(self, token_ids: List[int]) -> List[Optional[dict]]:
-        """One completions call; returns vLLM prompt_logprobs (list, [0] is None)."""
+    def _next_endpoint_offset(self) -> int:
+        with self._rr_lock:
+            return next(self._rr_counter)
+
+    def _request_prompt_logprobs_batch(
+        self,
+        prompts: Sequence[List[int]],
+        endpoint_failures: Dict[str, int],
+    ) -> Tuple[List[List[Optional[dict]]], int]:
+        """One /completions call scoring several token-id prompts at once.
+
+        Returns (per-prompt prompt_logprobs lists, retry count). Attempts rotate
+        through the endpoint list starting at a round-robin offset, so load is
+        spread across replicas and a dead replica is skipped on retry.
+        """
         payload = {
             "model": self.model,
-            "prompt": token_ids,
+            "prompt": [list(p) for p in prompts],
             "max_tokens": 1,
             "temperature": 0.0,
             "prompt_logprobs": 0,
         }
+        offset = self._next_endpoint_offset()
         last_error = None
         for attempt in range(self.max_retries):
+            base_url = self.base_urls[(offset + attempt) % len(self.base_urls)]
             try:
                 response = self._session.post(
-                    f"{self.base_url}/completions",
+                    f"{base_url}/completions",
                     json=payload,
                     headers=self._headers(),
                     timeout=self.timeout,
                 )
                 response.raise_for_status()
                 data = response.json()
-                prompt_logprobs = data["choices"][0].get("prompt_logprobs")
-                if prompt_logprobs is None:
+                choices = data.get("choices")
+                if not choices or len(choices) != len(prompts):
                     raise RuntimeError(
-                        "Teacher server response has no 'prompt_logprobs'. The endpoint must be a "
-                        "vLLM OpenAI-compatible server that supports the prompt_logprobs extra parameter."
+                        f"expected {len(prompts)} choices, got {0 if not choices else len(choices)}"
                     )
-                if len(prompt_logprobs) != len(token_ids):
-                    raise RuntimeError(
-                        f"prompt_logprobs length {len(prompt_logprobs)} != prompt token count {len(token_ids)}"
-                    )
-                return prompt_logprobs
+                # vLLM tags each choice with the index of its prompt; don't
+                # assume the list comes back ordered.
+                by_index: List[Optional[List[Optional[dict]]]] = [None] * len(prompts)
+                for position, choice in enumerate(choices):
+                    index = int(choice.get("index", position))
+                    prompt_logprobs = choice.get("prompt_logprobs")
+                    if prompt_logprobs is None:
+                        raise RuntimeError(
+                            "Teacher server response has no 'prompt_logprobs'. The endpoint must be a "
+                            "vLLM OpenAI-compatible server that supports the prompt_logprobs extra parameter."
+                        )
+                    if len(prompt_logprobs) != len(prompts[index]):
+                        raise RuntimeError(
+                            f"prompt_logprobs length {len(prompt_logprobs)} != prompt token count "
+                            f"{len(prompts[index])} (choice {index})"
+                        )
+                    by_index[index] = prompt_logprobs
+                if any(entry is None for entry in by_index):
+                    raise RuntimeError("duplicate/missing choice indices in teacher response")
+                return by_index, attempt  # type: ignore[return-value]
             except Exception as error:  # noqa: BLE001 - retry then re-raise
                 last_error = error
+                endpoint_failures[base_url] = endpoint_failures.get(base_url, 0) + 1
                 if attempt < self.max_retries - 1:
                     sleep_s = self.retry_backoff_s * (2**attempt)
                     logger.warning(
-                        "External teacher scoring attempt %s/%s failed (%s); retrying in %.1fs.",
+                        "External teacher scoring attempt %s/%s on %s failed (%s); retrying on next endpoint in %.1fs.",
                         attempt + 1,
                         self.max_retries,
+                        base_url,
                         error,
                         sleep_s,
                     )
                     time.sleep(sleep_s)
-        raise RuntimeError(f"External teacher scoring failed after {self.max_retries} attempts: {last_error}")
+        raise RuntimeError(
+            f"External teacher scoring failed after {self.max_retries} attempts across "
+            f"{len(self.base_urls)} endpoint(s) {self.base_urls}: {last_error}"
+        )
 
     @staticmethod
     def _entry_logprob(entry: Optional[dict], token_id: int) -> float:
@@ -155,44 +215,90 @@ class ExternalTeacherClient:
             (bsz, response_len) float32 tensor of teacher log-probs, zeros at
             invalid positions. Always returned on CPU; caller moves to device.
         """
+        start_time = time.perf_counter()
         input_ids = input_ids.detach().cpu()
         attention_mask = attention_mask.detach().cpu()
         response_masks = response_masks.detach().cpu()
         bsz, response_length = response_masks.shape
         output = torch.zeros((bsz, response_length), dtype=torch.float32)
 
-        jobs = []
+        jobs = []  # (row index, token_ids, response_positions)
+        rows_skipped = 0
         for i in range(bsz):
             valid = attention_mask[i].bool()
             token_ids = input_ids[i][valid].tolist()
             response_positions = torch.nonzero(response_masks[i].bool(), as_tuple=False).flatten().tolist()
-            jobs.append((token_ids, response_positions))
-
-        def _run(job):
-            token_ids, response_positions = job
-            num_response_tokens = len(response_positions)
-            if num_response_tokens == 0:
-                return None
-            if num_response_tokens >= len(token_ids):
-                raise RuntimeError(
-                    f"Response token count {num_response_tokens} >= total valid tokens {len(token_ids)}; "
-                    "the teacher prompt appears to be empty."
-                )
-            prompt_logprobs = self._request_prompt_logprobs(token_ids)
-            tail_entries = prompt_logprobs[-num_response_tokens:]
-            tail_token_ids = token_ids[-num_response_tokens:]
-            return [self._entry_logprob(entry, token_id) for entry, token_id in zip(tail_entries, tail_token_ids)]
-
-        if len(jobs) == 1:
-            results = [_run(jobs[0])]
-        else:
-            with ThreadPoolExecutor(max_workers=min(self.concurrency, len(jobs))) as pool:
-                results = list(pool.map(_run, jobs))
-
-        for i, ((_, response_positions), result) in enumerate(zip(jobs, results)):
-            if result is None:
+            if not response_positions:
+                rows_skipped += 1
                 continue
-            output[i, torch.as_tensor(response_positions, dtype=torch.long)] = torch.tensor(
-                result, dtype=torch.float32
-            )
+            if len(response_positions) >= len(token_ids):
+                raise RuntimeError(
+                    f"Response token count {len(response_positions)} >= total valid tokens {len(token_ids)} "
+                    f"(row {i}); the teacher prompt appears to be empty."
+                )
+            jobs.append((i, token_ids, response_positions))
+
+        chunks = [jobs[i : i + self.batch_size] for i in range(0, len(jobs), self.batch_size)]
+        endpoint_failures: Dict[str, int] = {}
+        retries_total = 0
+        retries_lock = threading.Lock()
+
+        def _run_chunk(chunk):
+            nonlocal retries_total
+            prompts = [token_ids for _, token_ids, _ in chunk]
+            per_prompt_logprobs, retries = self._request_prompt_logprobs_batch(prompts, endpoint_failures)
+            with retries_lock:
+                retries_total += retries
+            results = []
+            for (row, token_ids, response_positions), prompt_logprobs in zip(chunk, per_prompt_logprobs):
+                num_response_tokens = len(response_positions)
+                tail_entries = prompt_logprobs[-num_response_tokens:]
+                tail_token_ids = token_ids[-num_response_tokens:]
+                values = [
+                    self._entry_logprob(entry, token_id)
+                    for entry, token_id in zip(tail_entries, tail_token_ids)
+                ]
+                results.append((row, response_positions, values))
+            return results
+
+        if len(chunks) <= 1:
+            chunk_results = [_run_chunk(chunk) for chunk in chunks]
+        else:
+            with ThreadPoolExecutor(max_workers=min(self.concurrency, len(chunks))) as pool:
+                chunk_results = list(pool.map(_run_chunk, chunks))
+
+        for results in chunk_results:
+            for row, response_positions, values in results:
+                output[row, torch.as_tensor(response_positions, dtype=torch.long)] = torch.tensor(
+                    values, dtype=torch.float32
+                )
+
+        elapsed = time.perf_counter() - start_time
+        tokens_sent = float(sum(len(token_ids) for _, token_ids, _ in jobs))
+        tokens_scored = float(sum(len(positions) for _, _, positions in jobs))
+        self.last_stats = {
+            "rows_scored": float(len(jobs)),
+            "rows_skipped": float(rows_skipped),
+            "num_batches": float(len(chunks)),
+            "num_endpoints": float(len(self.base_urls)),
+            "tokens_sent": tokens_sent,
+            "tokens_scored": tokens_scored,
+            "elapsed_s": float(elapsed),
+            "prefill_tokens_per_s": tokens_sent / elapsed if elapsed > 0 else 0.0,
+            "retries": float(retries_total),
+            "endpoint_failures": float(sum(endpoint_failures.values())),
+        }
+        if endpoint_failures:
+            logger.warning("External teacher endpoint failures this call: %s", endpoint_failures)
+        logger.info(
+            "External teacher scored %d rows (%d skipped) in %d batch(es) across %d endpoint(s): "
+            "%.1fs, %.0f prefill tok/s, %d retries.",
+            len(jobs),
+            rows_skipped,
+            len(chunks),
+            len(self.base_urls),
+            elapsed,
+            self.last_stats["prefill_tokens_per_s"],
+            retries_total,
+        )
         return output
