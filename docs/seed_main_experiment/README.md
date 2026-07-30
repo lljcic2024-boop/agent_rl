@@ -10,6 +10,8 @@ Student Qwen3-8B 在 Search QA 上向外接 Qwen3-30B-A3B teacher 学「工具�
 | 本文 | 四个改造点是什么、代码在哪、当前状态、怎么跑 |
 | [cluster-runbook.md](cluster-runbook.md) | 集群拓扑、模型/数据/产出的存放位置、服务启动、踩过的接口坑 |
 | [open-issues.md](open-issues.md) | 尚未解决的问题、已定位但未修的 bug、性能瓶颈的实测数据 |
+| [../../ops/README.md](../../ops/README.md) | 一键开跑的运维脚本：同步、体检、起服务、冲烟、训练 |
+
 
 ---
 
@@ -171,24 +173,36 @@ warning。
 
 ## 怎么跑
 
+集群上用 [`ops/`](../../ops/) 里的两个脚本，一条命令一个阶段：
+
 ```bash
-# 1. 配置：复制模板并按集群实际情况填写
-cp examples/seed_trainer/env.cfs.example .env
+# 本地 -> CFS 同步代码（堡垒机不支持 scp，走 base64 灌 pty）
+bash ops/local/push_to_cluster.sh
 
-# 2. 起服务（见 cluster-runbook.md，在 worker-1 上）
-setsid nohup bash start_teacher.sh   > teacher.log   2>&1 < /dev/null &
-setsid nohup bash start_retriever.sh > retriever.log 2>&1 < /dev/null &
+# 集群侧：体检 -> 起服务 -> 冲烟一步（strict 开，漏斗直接打出来）
+qf -c 'bash $SEED_ROOT/ops/cluster/seedctl.sh all'
 
-# 3. 冲烟一步，strict 开着，让漏斗把问题喊出来
+# 漏斗健康就起正式 150 步（setsid nohup，脱离连接独立存活）
+qf -c 'bash $SEED_ROOT/ops/cluster/seedctl.sh train'
+
+# 断线重连后看进度：进程/步数/漏斗/耗时/报错一次全给
+qf -c 'bash $SEED_ROOT/ops/cluster/seedctl.sh status'
+```
+
+细节和设计理由见 [ops/README.md](../../ops/README.md)。
+
+底层 launcher 也可以直接调：
+
+```bash
+cp examples/seed_trainer/env.cfs.example .env   # 按集群实际情况填
 SEED_TEACHER_BRANCH_STRICT=True TRAIN_DATA_SIZE=8 GROUP_SIZE=4 TOTAL_TRAINING_STEPS=1 \
   bash examples/seed_trainer/run_search_tag_distill_qwen3_8b.sh
-
-# 4. 正式训练
-bash examples/seed_trainer/run_search_tag_distill_qwen3_8b.sh
 ```
 
 **必须 `setsid nohup`**：本地到集群的连接会周期性断开（见
 [open-issues.md](open-issues.md) 的 VPN 黑洞一节），任务必须脱离连接独立存活。
+`seedctl train` 已经替你做了这件事。
+
 
 ## 测试
 
